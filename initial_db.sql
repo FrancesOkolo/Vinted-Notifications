@@ -104,4 +104,11 @@ VALUES ('telegram_enabled', 'False'),
        ('proxy_list_link', ''),
        ('check_proxies', 'False'),
        ('last_proxy_check_time', '0'),
-       ('banwords', '');
+       ('banwords', ''),
+       ('message_template', '🆕 Title : {title}
+💶 Price : {price}
+🛍️ Brand : {brand}
+Condition : {condition}
+<a href="{image}">&#8205;</a>
+Description : {description}'),
+       ('message_template_v2_migrated', 'True');

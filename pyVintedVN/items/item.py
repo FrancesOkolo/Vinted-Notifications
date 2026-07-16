@@ -13,6 +13,8 @@ class Item:
         id (str): The unique identifier of the item.
         title (str): The title of the item.
         brand_title (str): The brand of the item.
+        condition (str): The condition reported by Vinted.
+        description (str): The description when included in the response.
         size_title (str): The size of the item, or None if not available.
         currency (str): The currency code of the item's price.
         price (float): The price of the item.
@@ -33,6 +35,12 @@ class Item:
         self.id = data["id"]
         self.title = data["title"]
         self.brand_title = data["brand_title"]
+        status = data.get("status")
+        if isinstance(status, dict):
+            self.condition = status.get("title") or status.get("name")
+        else:
+            self.condition = data.get("status_title") or status
+        self.description = data.get("description")
         try:
             self.size_title = data["size_title"]
         except KeyError:

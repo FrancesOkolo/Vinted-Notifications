@@ -1,8 +1,11 @@
 import db
+import html
+import json
 import random
 import requests
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from email.utils import parsedate_to_datetime
 from pyVintedVN import Vinted, requester
@@ -482,6 +485,111 @@ def process_items(queue):
             jittered_spacing = base_spacing * random.uniform(0.85, 1.15)
             time.sleep(jittered_spacing)
 
+
+class _ProductJsonLdParser(HTMLParser):
+    """Collect JSON-LD documents embedded in an item page."""
+
+    def __init__(self):
+        super().__init__()
+        self.documents = []
+        self._capturing = False
+        self._chunks = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "script":
+            return
+
+        attributes = {
+            str(name).lower(): value or ""
+            for name, value in attrs
+        }
+        if attributes.get("type", "").lower() == "application/ld+json":
+            self._capturing = True
+            self._chunks = []
+
+    def handle_data(self, data):
+        if self._capturing:
+            self._chunks.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "script" and self._capturing:
+            self.documents.append("".join(self._chunks))
+            self._capturing = False
+            self._chunks = []
+
+
+def _find_product_description(value):
+    if isinstance(value, dict):
+        item_type = value.get("@type", [])
+        item_types = item_type if isinstance(item_type, list) else [item_type]
+        if any(str(name).lower() == "product" for name in item_types):
+            description = value.get("description")
+            if description:
+                return str(description).strip()
+
+        for child in value.values():
+            description = _find_product_description(child)
+            if description:
+                return description
+
+    elif isinstance(value, list):
+        for child in value:
+            description = _find_product_description(child)
+            if description:
+                return description
+
+    return None
+
+
+def _description_from_item_page(page_html):
+    parser = _ProductJsonLdParser()
+    parser.feed(page_html)
+
+    for document in parser.documents:
+        try:
+            data = json.loads(html.unescape(document))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+        description = _find_product_description(data)
+        if description:
+            return description
+
+    return None
+
+
+def _get_item_description(item):
+    description = getattr(item, "description", None)
+    if description:
+        return str(description).strip()
+
+    try:
+        # Reuse the catalogue session and its current proxy/cookies, but make
+        # only one page request. Description enrichment must never amplify a
+        # Vinted rate limit or delay the notification through automatic retries.
+        with requester.session.get(item.url, timeout=20) as response:
+            response.raise_for_status()
+            return _description_from_item_page(response.text)
+    except requests.exceptions.RequestException as error:
+        logger.warning(
+            "Could not load the description for Vinted item %s: %s",
+            item.id,
+            error,
+        )
+        return None
+
+
+def _notification_value(value, fallback="Not provided", max_length=None):
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        text = fallback
+
+    if max_length and len(text) > max_length:
+        text = text[: max_length - 1].rstrip() + "…"
+
+    return html.escape(text, quote=False)
+
+
 def clear_item_queue(items_queue, new_items_queue):
     """
     Process items from the items_queue.
@@ -518,12 +626,38 @@ def clear_item_queue(items_queue, new_items_queue):
                 pass
             else:
                 # We create the message
-                message_template = db.get_parameter("message_template")
+                message_template = (
+                    db.get_parameter("message_template")
+                    or db.DEFAULT_MESSAGE_TEMPLATE
+                )
+                description = (
+                    _get_item_description(item)
+                    if "{description}" in message_template
+                    else getattr(item, "description", None)
+                )
                 content = message_template.format(
-                    title=item.title,
-                    price=str(item.price) + " " + item.currency,
-                    brand=item.brand_title,
-                    image=None if item.photo is None else item.photo,
+                    title=_notification_value(item.title),
+                    price=_notification_value(
+                        str(item.price) + " " + item.currency
+                    ),
+                    brand=_notification_value(
+                        item.brand_title,
+                        fallback="Not specified",
+                    ),
+                    condition=_notification_value(
+                        getattr(item, "condition", None),
+                        fallback="Not specified",
+                        max_length=200,
+                    ),
+                    description=_notification_value(
+                        description,
+                        max_length=1800,
+                    ),
+                    image=(
+                        ""
+                        if item.photo is None
+                        else html.escape(str(item.photo), quote=True)
+                    ),
                 )
                 # Route this alert only to approved subscribers of the
                 # matching query. One query may notify several accounts.

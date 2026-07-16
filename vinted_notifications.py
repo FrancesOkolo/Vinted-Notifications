@@ -18,6 +18,9 @@ if not os.path.exists("./data/vinted_notifications.db"):
     logger.info("Database created successfully")
 
 # Safe, idempotent migration for existing and new installations.
+if not db.migrate_message_template():
+    raise RuntimeError("Failed to initialise the notification message template.")
+
 if not db.migrate_multi_user_schema():
     raise RuntimeError("Failed to initialise multi-user Telegram support.")
 
