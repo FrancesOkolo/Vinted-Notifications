@@ -269,3 +269,18 @@ def test_message_template_rejects_unknown_fields(database):
     web._validate_message_template("{title} {description}")
     with pytest.raises(ValueError, match="Unsupported"):
         web._validate_message_template("{title} {private_value}")
+
+
+def test_dashboard_query_table_has_accessible_sort_controls():
+    template = (ROOT / "web_ui_plugin" / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'id="dashboardQueriesTable"' in template
+    assert 'data-sort-key="query"' in template
+    assert 'data-sort-key="lastFound"' in template
+    assert 'aria-sort="descending"' in template
+    assert 'id="querySortStatus" aria-live="polite"' in template
+    assert "localeCompare" in template
+    assert "rows.sort" in template
+    assert 'shown as "Never"' in template

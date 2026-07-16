@@ -182,12 +182,14 @@ def index():
 
         # last_item is already included in db.get_queries().
         last_timestamp = query[2]
+        last_found_timestamp = None
         if last_timestamp is None:
             last_found_item = "Never"
         else:
             try:
+                last_found_timestamp = float(last_timestamp)
                 last_found_item = datetime.fromtimestamp(
-                    float(last_timestamp)
+                    last_found_timestamp
                 ).strftime("%Y-%m-%d %H:%M:%S")
             except (TypeError, ValueError, OSError, OverflowError) as error:
                 logger.warning(
@@ -205,6 +207,7 @@ def index():
                 "query": query[1],
                 "display": query_name if query_name else query[1],
                 "last_found_item": last_found_item,
+                "last_found_timestamp": last_found_timestamp,
             }
         )
 

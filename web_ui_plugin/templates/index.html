@@ -267,20 +267,38 @@
             </div>
             <div class="card-body p-0">
                 <div class="table-responsive">
-                    <table class="table table-hover mb-0">
+                    <table class="table table-hover mb-0 sortable-query-table" id="dashboardQueriesTable">
+                        <caption class="visually-hidden">
+                            Active queries. Use the Query and Last Found Item column buttons to change the sort order.
+                        </caption>
                         <thead>
                         <tr>
-                            <th>#</th>
-                            <th>Query</th>
-                            <th>Last Found Item</th>
+                            <th scope="col" class="query-row-number">#</th>
+                            <th scope="col" aria-sort="none" data-sort-header="query">
+                                <button type="button" class="table-sort-button" data-sort-key="query"
+                                        data-sort-label="Query" aria-label="Sort by Query ascending">
+                                    <span>Query</span>
+                                    <span class="sort-indicator" aria-hidden="true">&#8597;</span>
+                                </button>
+                            </th>
+                            <th scope="col" class="last-found-column" aria-sort="descending"
+                                data-sort-header="lastFound">
+                                <button type="button" class="table-sort-button" data-sort-key="lastFound"
+                                        data-sort-label="Last Found Item"
+                                        aria-label="Last Found Item, sorted descending. Activate to sort ascending">
+                                    <span>Last Found Item</span>
+                                    <span class="sort-indicator is-active" aria-hidden="true">&#8595;</span>
+                                </button>
+                            </th>
                         </tr>
                         </thead>
                         <tbody>
                         {% for query in queries %}
-                        <tr>
-                            <td>{{ query.id }}</td>
+                        <tr data-query-row data-query="{{ query.display|e }}"
+                            data-last-found="{{ query.last_found_timestamp if query.last_found_timestamp is not none else '' }}">
+                            <td data-row-number>{{ query.id }}</td>
                             <td>{{ query.display }}</td>
-                            <td>{{ query.last_found_item }}</td>
+                            <td class="last-found-cell">{{ query.last_found_item }}</td>
                         </tr>
                         {% else %}
                         <tr>
@@ -290,6 +308,7 @@
                         </tbody>
                     </table>
                 </div>
+                <span class="visually-hidden" id="querySortStatus" aria-live="polite"></span>
             </div>
         </div>
     </div>
@@ -415,6 +434,90 @@
         listViewBtn.addEventListener('click', function () {
             setActiveView('list');
         });
+
+        // Sort the dashboard query table without a page reload.
+        const queryTable = document.getElementById('dashboardQueriesTable');
+        if (queryTable) {
+            const queryTableBody = queryTable.querySelector('tbody');
+            const sortHeaders = Array.from(queryTable.querySelectorAll('[data-sort-header]'));
+            const sortStatus = document.getElementById('querySortStatus');
+
+            function compareQueryRows(leftRow, rightRow, sortKey, direction) {
+                let comparison = 0;
+
+                if (sortKey === 'lastFound') {
+                    const leftValue = leftRow.dataset.lastFound;
+                    const rightValue = rightRow.dataset.lastFound;
+
+                    // Missing timestamps (shown as "Never") stay at the bottom in either direction.
+                    if (!leftValue && !rightValue) {
+                        return 0;
+                    }
+                    if (!leftValue) {
+                        return 1;
+                    }
+                    if (!rightValue) {
+                        return -1;
+                    }
+                    comparison = Number(leftValue) - Number(rightValue);
+                } else {
+                    comparison = leftRow.dataset.query.localeCompare(
+                        rightRow.dataset.query,
+                        undefined,
+                        {numeric: true, sensitivity: 'base'}
+                    );
+                }
+
+                return direction === 'ascending' ? comparison : -comparison;
+            }
+
+            function sortQueryTable(sortKey, direction) {
+                const rows = Array.from(queryTableBody.querySelectorAll('[data-query-row]'));
+                rows.sort((leftRow, rightRow) => compareQueryRows(leftRow, rightRow, sortKey, direction));
+
+                rows.forEach((row, index) => {
+                    row.querySelector('[data-row-number]').textContent = index + 1;
+                    queryTableBody.appendChild(row);
+                });
+
+                sortHeaders.forEach(header => {
+                    const button = header.querySelector('.table-sort-button');
+                    const indicator = header.querySelector('.sort-indicator');
+                    const isActive = header.dataset.sortHeader === sortKey;
+                    const label = button.dataset.sortLabel;
+
+                    header.setAttribute('aria-sort', isActive ? direction : 'none');
+                    indicator.classList.toggle('is-active', isActive);
+                    indicator.textContent = isActive
+                        ? (direction === 'ascending' ? '\u2191' : '\u2193')
+                        : '\u2195';
+
+                    if (isActive) {
+                        const nextDirection = direction === 'ascending' ? 'descending' : 'ascending';
+                        button.setAttribute(
+                            'aria-label',
+                            `${label}, sorted ${direction}. Activate to sort ${nextDirection}`
+                        );
+                    } else {
+                        button.setAttribute('aria-label', `Sort by ${label} ascending`);
+                    }
+                });
+
+                if (sortStatus) {
+                    const activeButton = queryTable.querySelector(`[data-sort-key="${sortKey}"]`);
+                    sortStatus.textContent = `Sorted by ${activeButton.dataset.sortLabel}, ${direction}`;
+                }
+            }
+
+            sortHeaders.forEach(header => {
+                const button = header.querySelector('.table-sort-button');
+                button.addEventListener('click', function () {
+                    const currentDirection = header.getAttribute('aria-sort');
+                    const nextDirection = currentDirection === 'ascending' ? 'descending' : 'ascending';
+                    sortQueryTable(this.dataset.sortKey, nextDirection);
+                });
+            });
+        }
     });
 </script>
 {% endblock %}
