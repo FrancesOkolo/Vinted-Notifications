@@ -1,0 +1,2 @@
+# Optional on Linux, recommended on Windows for IANA timezone support.
+tzdata>=2024.1

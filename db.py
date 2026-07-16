@@ -315,11 +315,19 @@ def get_parameter(key):
 
 
 def set_parameter(key, value):
+    """Create or update a configuration parameter."""
     conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("UPDATE parameters SET value=? WHERE key=?", (value, key))
+        cursor.execute(
+            """
+            INSERT INTO parameters (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
         conn.commit()
     except Exception:
         print_exc()
@@ -455,6 +463,615 @@ def get_items_per_day():
     except Exception:
         print_exc()
         return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# Quiet-hours configuration
+# ============================================================
+
+
+def migrate_quiet_hours_schema():
+    """
+    Add quiet-hours settings to existing installations.
+
+    The migration is idempotent and preserves any values already chosen
+    by the user. Quiet hours are enabled by default from 01:00 to 06:00
+    in Europe/London, so remote servers follow UK local time correctly.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.executemany(
+            "INSERT OR IGNORE INTO parameters (key, value) VALUES (?, ?)",
+            [
+                ("quiet_hours_enabled", "True"),
+                ("quiet_hours_start", "01:00"),
+                ("quiet_hours_end", "06:00"),
+                ("quiet_hours_timezone", "Europe/London"),
+            ],
+        )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# Multi-user Telegram support
+# ============================================================
+
+def migrate_multi_user_schema():
+    """
+    Create the multi-user Telegram tables for an existing installation.
+
+    The configured telegram_chat_id is treated as the administrator and
+    is subscribed to every existing query that currently has no subscribers.
+    This migration is idempotent and may be run safely on every start.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_users
+            (
+                chat_id      TEXT PRIMARY KEY,
+                display_name TEXT,
+                status       TEXT NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'approved', 'revoked')),
+                is_admin     INTEGER NOT NULL DEFAULT 0
+                             CHECK (is_admin IN (0, 1)),
+                created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS query_subscriptions
+            (
+                query_id   INTEGER NOT NULL,
+                chat_id    TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (query_id, chat_id),
+                FOREIGN KEY (query_id) REFERENCES queries (id) ON DELETE CASCADE,
+                FOREIGN KEY (chat_id) REFERENCES telegram_users (chat_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_query_subscriptions_chat
+                ON query_subscriptions (chat_id);
+
+            CREATE INDEX IF NOT EXISTS idx_query_subscriptions_query
+                ON query_subscriptions (query_id);
+            """
+        )
+
+        cursor.execute(
+            "SELECT value FROM parameters WHERE key='telegram_chat_id'"
+        )
+        row = cursor.fetchone()
+        admin_chat_id = str(row[0]).strip() if row and row[0] is not None else ""
+
+        if admin_chat_id:
+            cursor.execute(
+                """
+                INSERT INTO telegram_users
+                    (chat_id, display_name, status, is_admin)
+                VALUES (?, 'Primary user', 'approved', 1)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    status='approved',
+                    is_admin=1,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (admin_chat_id,),
+            )
+
+            # Preserve all existing searches by assigning otherwise-unowned
+            # queries to the configured primary Telegram account.
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO query_subscriptions (query_id, chat_id)
+                SELECT q.id, ?
+                FROM queries q
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM query_subscriptions s
+                    WHERE s.query_id = q.id
+                )
+                """,
+                (admin_chat_id,),
+            )
+
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def register_telegram_user(chat_id, display_name=None):
+    """
+    Register a Telegram account as pending without changing an existing
+    approved or revoked status.
+    """
+    chat_id = str(chat_id)
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO telegram_users
+                (chat_id, display_name, status, is_admin)
+            VALUES (?, ?, 'pending', 0)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                display_name=COALESCE(excluded.display_name, telegram_users.display_name),
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (chat_id, display_name),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def approve_telegram_user(chat_id, display_name=None):
+    chat_id = str(chat_id)
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO telegram_users
+                (chat_id, display_name, status, is_admin)
+            VALUES (?, ?, 'approved', 0)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                display_name=COALESCE(excluded.display_name, telegram_users.display_name),
+                status='approved',
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (chat_id, display_name),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def revoke_telegram_user(chat_id):
+    chat_id = str(chat_id)
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE telegram_users
+            SET status='revoked', updated_at=CURRENT_TIMESTAMP
+            WHERE chat_id=? AND is_admin=0
+            """,
+            (chat_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_telegram_user(chat_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT chat_id, display_name, status, is_admin
+            FROM telegram_users
+            WHERE chat_id=?
+            """,
+            (str(chat_id),),
+        )
+        return cursor.fetchone()
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_telegram_users():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT chat_id, display_name, status, is_admin
+            FROM telegram_users
+            ORDER BY is_admin DESC, status, display_name, chat_id
+            """
+        )
+        return cursor.fetchall()
+    except Exception:
+        print_exc()
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def is_telegram_user_approved(chat_id):
+    user = get_telegram_user(chat_id)
+    return bool(user and user[2] == "approved")
+
+
+def is_telegram_user_admin(chat_id):
+    user = get_telegram_user(chat_id)
+    return bool(user and user[2] == "approved" and int(user[3]) == 1)
+
+
+def get_queries(chat_id=None):
+    """
+    Return all queries, or only those subscribed to by chat_id.
+
+    Tuple layout remains compatible with the original application:
+    (id, query, last_item, query_name)
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if chat_id is None:
+            cursor.execute(
+                """
+                SELECT id, query, last_item, query_name
+                FROM queries
+                ORDER BY id
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT q.id, q.query, q.last_item, q.query_name
+                FROM queries q
+                JOIN query_subscriptions s ON s.query_id=q.id
+                WHERE s.chat_id=?
+                ORDER BY s.created_at, q.id
+                """,
+                (str(chat_id),),
+            )
+
+        return cursor.fetchall()
+    except Exception:
+        print_exc()
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_query_by_url(processed_query):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, query, last_item, query_name
+            FROM queries
+            WHERE query=?
+            """,
+            (processed_query,),
+        )
+        return cursor.fetchone()
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def is_query_in_db(processed_query, chat_id=None):
+    query = get_query_by_url(processed_query)
+    if not query:
+        return False
+
+    if chat_id is None:
+        return True
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT 1
+            FROM query_subscriptions
+            WHERE query_id=? AND chat_id=?
+            """,
+            (query[0], str(chat_id)),
+        )
+        return cursor.fetchone() is not None
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def add_query_to_db(query, name=None, chat_id=None):
+    """
+    Add a shared query and subscribe chat_id to it.
+
+    Returns:
+        (query_id, query_created, subscription_created)
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id FROM queries WHERE query=?",
+            (query,),
+        )
+        row = cursor.fetchone()
+        query_created = row is None
+
+        if query_created:
+            cursor.execute(
+                """
+                INSERT INTO queries (query, last_item, query_name)
+                VALUES (?, NULL, ?)
+                """,
+                (query, name),
+            )
+            query_id = cursor.lastrowid
+        else:
+            query_id = row[0]
+            if name:
+                cursor.execute(
+                    """
+                    UPDATE queries
+                    SET query_name=COALESCE(query_name, ?)
+                    WHERE id=?
+                    """,
+                    (name, query_id),
+                )
+
+        subscription_created = False
+        if chat_id is not None:
+            chat_id = str(chat_id)
+            cursor.execute(
+                """
+                SELECT 1
+                FROM telegram_users
+                WHERE chat_id=? AND status='approved'
+                """,
+                (chat_id,),
+            )
+            if cursor.fetchone() is None:
+                conn.rollback()
+                return query_id, query_created, False
+
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO query_subscriptions (query_id, chat_id)
+                VALUES (?, ?)
+                """,
+                (query_id, chat_id),
+            )
+            subscription_created = cursor.rowcount > 0
+
+        conn.commit()
+        return query_id, query_created, subscription_created
+    except Exception:
+        print_exc()
+        return None, False, False
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_query_subscribers(query_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT s.chat_id
+            FROM query_subscriptions s
+            JOIN telegram_users u ON u.chat_id=s.chat_id
+            WHERE s.query_id=? AND u.status='approved'
+            ORDER BY u.is_admin DESC, s.created_at
+            """,
+            (query_id,),
+        )
+        return [row[0] for row in cursor.fetchall()]
+    except Exception:
+        print_exc()
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_query_id_by_rowid(rowid, chat_id=None):
+    """
+    Resolve the displayed 1-based query number safely.
+    """
+    try:
+        row_number = int(rowid)
+    except (TypeError, ValueError):
+        return None
+
+    if row_number < 1:
+        return None
+
+    queries = get_queries(chat_id=chat_id)
+    if row_number > len(queries):
+        return None
+
+    return queries[row_number - 1][0]
+
+
+def remove_query_subscription(query_id, chat_id):
+    """
+    Unsubscribe one user. If no subscribers remain, delete the query and
+    its stored items to avoid continuing to scrape an unused search.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            DELETE FROM query_subscriptions
+            WHERE query_id=? AND chat_id=?
+            """,
+            (query_id, str(chat_id)),
+        )
+        removed = cursor.rowcount > 0
+
+        if removed:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM query_subscriptions
+                WHERE query_id=?
+                """,
+                (query_id,),
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("DELETE FROM items WHERE query_id=?", (query_id,))
+                cursor.execute("DELETE FROM queries WHERE id=?", (query_id,))
+
+        conn.commit()
+        return removed
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def remove_all_query_subscriptions(chat_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        chat_id = str(chat_id)
+
+        cursor.execute(
+            """
+            SELECT query_id
+            FROM query_subscriptions
+            WHERE chat_id=?
+            """,
+            (chat_id,),
+        )
+        query_ids = [row[0] for row in cursor.fetchall()]
+
+        cursor.execute(
+            "DELETE FROM query_subscriptions WHERE chat_id=?",
+            (chat_id,),
+        )
+
+        for query_id in query_ids:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM query_subscriptions
+                WHERE query_id=?
+                """,
+                (query_id,),
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("DELETE FROM items WHERE query_id=?", (query_id,))
+                cursor.execute("DELETE FROM queries WHERE id=?", (query_id,))
+
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def remove_query_from_db(query_number):
+    """
+    Administrative/global delete used by the web interface.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM query_subscriptions WHERE query_id=?",
+            (query_number,),
+        )
+        cursor.execute("DELETE FROM items WHERE query_id=?", (query_number,))
+        cursor.execute("DELETE FROM queries WHERE id=?", (query_number,))
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def remove_all_queries_from_db():
+    """
+    Administrative/global delete used by the web interface.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM query_subscriptions")
+        cursor.execute("DELETE FROM items")
+        cursor.execute("DELETE FROM queries")
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
     finally:
         if conn:
             conn.close()

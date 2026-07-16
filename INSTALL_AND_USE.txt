@@ -1,0 +1,91 @@
+VINTED NOTIFICATIONS: SAFE MULTI-USER TELEGRAM UPGRADE
+=======================================================
+
+WHAT THIS ADDS
+--------------
+* One Telegram bot can serve several approved Telegram accounts.
+* Each user sees and removes only their own query subscriptions.
+* Alerts go only to the accounts subscribed to the matching query.
+* Identical searches are scraped once and shared between subscribers.
+* Existing searches are automatically assigned to the currently configured
+  telegram_chat_id, which becomes the administrator.
+* Unknown Telegram accounts cannot add, list or remove searches.
+* The administrator controls access with /approve_user and /revoke_user.
+* The paced ten-minute scraper and 429 handling are included.
+* Brand URLs and temporary Vinted URL parameters are cleaned centrally.
+
+SAFE INSTALLATION
+-----------------
+1. Stop Vinted Notifications with Ctrl+C.
+2. Extract this entire folder.
+3. Right-click install_multi_user.ps1 and choose Run with PowerShell.
+
+If Windows blocks the script:
+1. Open PowerShell in this extracted folder.
+2. Run:
+   powershell -ExecutionPolicy Bypass -File .\install_multi_user.ps1
+
+The installer checks that Vinted Notifications is stopped, creates a timestamped
+backup inside your project folder, backs up the live SQLite database, and only
+then replaces the files.
+
+MANUAL LOCATIONS
+----------------
+db.py
+core.py
+initial_db.sql
+vinted_notifications.py
+url_normalizer.py
+
+go in:
+C:\Users\Awele\Documents\Vinted-Notifications\
+
+telegram_bot.py goes in:
+C:\Users\Awele\Documents\Vinted-Notifications\telegram_bot_plugin\
+
+FIRST START
+-----------
+Run:
+cd C:\Users\Awele\Documents\Vinted-Notifications
+python vinted_notifications.py
+
+On first start, the migration creates telegram_users and query_subscriptions.
+It does not delete existing queries or items.
+
+ADDING YOUR SISTER
+------------------
+1. Your sister opens your Telegram bot and sends:
+   /hello
+
+2. The bot replies with her chat ID and records her as pending.
+
+3. From your own administrator Telegram account, send:
+   /approve_user HER_CHAT_ID Sister
+
+Example:
+   /approve_user 123456789 Sister
+
+4. Your sister can then send:
+   /add_query URL
+   /add_query SearchName=URL
+   /queries
+   /remove_query 1
+   /remove_query all
+
+ADMIN COMMANDS
+--------------
+/users
+/approve_user CHAT_ID optional name
+/revoke_user CHAT_ID
+
+SECURITY
+--------
+Do not approve an ID unless your sister has given it to you directly.
+The configured telegram_chat_id is protected as the administrator and cannot be
+revoked through the bot.
+
+ROLLBACK
+--------
+Stop the application. Open the timestamped backup folder created by the
+installer and copy its files, including data\vinted_notifications.db, back into
+the project folder.

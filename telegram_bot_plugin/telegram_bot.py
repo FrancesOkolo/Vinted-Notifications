@@ -11,19 +11,49 @@ logger = get_logger(__name__)
 
 
 async def hello(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Register unknown accounts as pending and show their access status.
+    """
     try:
-        ver = db.get_parameter("version")
-        await update.message.reply_text(
-            f"Hello {update.effective_user.first_name}! Vinted-Notifications is running under version {ver}.\n"
+        chat_id = str(update.effective_chat.id)
+        display_name = (
+            update.effective_user.full_name
+            if update.effective_user
+            else None
         )
-    except Exception as e:
-        logger.error(f"Error in hello command: {str(e)}", exc_info=True)
+
+        db.register_telegram_user(chat_id, display_name)
+        user = db.get_telegram_user(chat_id)
+        version = db.get_parameter("version")
+
+        if user and user[2] == "approved":
+            role = "administrator" if int(user[3]) == 1 else "approved user"
+            await update.message.reply_text(
+                f"Hello {update.effective_user.first_name}! "
+                f"Vinted-Notifications {version} is running.\n"
+                f"Your Telegram chat ID is {chat_id}.\n"
+                f"Access: {role}."
+            )
+        else:
+            await update.message.reply_text(
+                "Your access request has been recorded.\n"
+                f"Your Telegram chat ID is {chat_id}.\n"
+                "Ask the administrator to approve this ID using:\n"
+                f"/approve_user {chat_id}"
+            )
+    except Exception as error:
+        logger.error(
+            f"Error in hello command: {str(error)}",
+            exc_info=True,
+        )
         try:
             await update.message.reply_text(
                 "An error occurred. Please try again later."
             )
-        except Exception as e2:
-            logger.error(f"Error sending error message: {str(e2)}")
+        except Exception as reply_error:
+            logger.error(
+                f"Error sending error message: {str(reply_error)}"
+            )
 
 
 class LeRobot:
@@ -47,6 +77,14 @@ class LeRobot:
             self.app.add_handler(CommandHandler("add_query", self.add_query))
             self.app.add_handler(CommandHandler("remove_query", self.remove_query))
             self.app.add_handler(CommandHandler("queries", self.queries))
+            self.app.add_handler(CommandHandler("my_id", self.my_id))
+            self.app.add_handler(
+                CommandHandler("approve_user", self.approve_user)
+            )
+            self.app.add_handler(
+                CommandHandler("revoke_user", self.revoke_user)
+            )
+            self.app.add_handler(CommandHandler("users", self.users))
             # Allowlist handlers
             self.app.add_handler(
                 CommandHandler("clear_allowlist", self.clear_allowlist)
@@ -71,98 +109,288 @@ class LeRobot:
         except Exception as e:
             logger.error(f"Error initializing bot: {str(e)}", exc_info=True)
 
+    async def require_approved(self, update: Update) -> bool:
+        chat_id = str(update.effective_chat.id)
+        display_name = (
+            update.effective_user.full_name
+            if update.effective_user
+            else None
+        )
+        db.register_telegram_user(chat_id, display_name)
+
+        if db.is_telegram_user_approved(chat_id):
+            return True
+
+        await update.message.reply_text(
+            "This Telegram account is not approved yet.\n"
+            f"Your chat ID is {chat_id}. Send /hello for instructions."
+        )
+        return False
+
+    async def require_admin(self, update: Update) -> bool:
+        if not await self.require_approved(update):
+            return False
+
+        chat_id = str(update.effective_chat.id)
+        if db.is_telegram_user_admin(chat_id):
+            return True
+
+        await update.message.reply_text(
+            "This command is restricted to the administrator."
+        )
+        return False
+
+    async def my_id(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        chat_id = str(update.effective_chat.id)
+        await update.message.reply_text(
+            f"Your Telegram chat ID is {chat_id}."
+        )
+
+    async def approve_user(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self.require_admin(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /approve_user CHAT_ID optional name"
+            )
+            return
+
+        chat_id = context.args[0]
+        display_name = " ".join(context.args[1:]).strip() or None
+
+        if not chat_id.lstrip("-").isdigit():
+            await update.message.reply_text("Invalid Telegram chat ID.")
+            return
+
+        if db.approve_telegram_user(chat_id, display_name):
+            await update.message.reply_text(
+                f"Approved Telegram account {chat_id}."
+            )
+            try:
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "Your Vinted Notifications access has been approved.\n"
+                        "Use /add_query, /queries and /remove_query."
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "User approved, but the approval message could not be "
+                    "delivered to chat %s.",
+                    chat_id,
+                    exc_info=True,
+                )
+        else:
+            await update.message.reply_text(
+                "The account could not be approved."
+            )
+
+    async def revoke_user(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self.require_admin(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /revoke_user CHAT_ID"
+            )
+            return
+
+        chat_id = context.args[0]
+        if db.revoke_telegram_user(chat_id):
+            await update.message.reply_text(
+                f"Revoked Telegram account {chat_id}."
+            )
+        else:
+            await update.message.reply_text(
+                "Account not found, already revoked, or is the administrator."
+            )
+
+    async def users(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self.require_admin(update):
+            return
+
+        users = db.get_telegram_users()
+        if not users:
+            await update.message.reply_text("No Telegram users registered.")
+            return
+
+        lines = []
+        for chat_id, name, status, is_admin in users:
+            role = "admin" if int(is_admin) == 1 else "user"
+            lines.append(
+                f"{chat_id} | {name or 'Unnamed'} | {status} | {role}"
+            )
+
+        await update.message.reply_text(
+            "Telegram users:\n" + "\n".join(lines)
+        )
+
     ### QUERIES ###
 
     # Add a query to the db
     async def add_query(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
+        if not await self.require_approved(update):
+            return
+
         try:
-            query = context.args
-            if not query:
-                await update.message.reply_text("No query provided.")
+            if not context.args:
+                await update.message.reply_text(
+                    "No query provided.\n"
+                    "Usage: /add_query URL\n"
+                    "or /add_query Name=URL"
+                )
                 return
 
-            # Split the message into name=query if it contains an equal sign before the url. Store them separately
-            if "=http" in query[0]:
-                name, url = query[0].split("=", 1)
+            supplied = " ".join(context.args).strip()
+            if "=http" in supplied:
+                name, url = supplied.split("=", 1)
+                name = name.strip() or None
             else:
                 name = None
-                url = query[0]
-            # Process the query using the core function
-            message, is_new_query = core.process_query(url, name)
+                url = supplied
+
+            chat_id = str(update.effective_chat.id)
+            message, is_new_query = core.process_query(
+                url,
+                name=name,
+                chat_id=chat_id,
+            )
 
             if is_new_query:
-                # Create a string with all the keywords
-                query_list = core.get_formatted_query_list()
+                query_list = core.get_formatted_query_list(
+                    chat_id=chat_id
+                )
                 await update.message.reply_text(
-                    f"{message} \nCurrent queries: \n{query_list}"
+                    f"{message}\nYour current queries:\n{query_list}"
                 )
             else:
                 await update.message.reply_text(message)
-        except Exception as e:
-            logger.error(f"Error adding query: {str(e)}", exc_info=True)
-            try:
-                await update.message.reply_text(
-                    "An error occurred while adding the query. Please try again later."
-                )
-            except Exception as e2:
-                logger.error(f"Error sending error message: {str(e2)}")
+
+        except (ValueError, TypeError) as error:
+            await update.message.reply_text(str(error))
+        except Exception as error:
+            logger.error(
+                f"Error adding query: {str(error)}",
+                exc_info=True,
+            )
+            await update.message.reply_text(
+                "An error occurred while adding the query."
+            )
 
     # Remove a query from the db
     async def remove_query(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
+        if not await self.require_approved(update):
+            return
+
         try:
-            number = context.args
-            if not number:
-                await update.message.reply_text("No number provided.")
+            if not context.args:
+                await update.message.reply_text(
+                    "No number provided. Use /queries first."
+                )
                 return
 
-            # Process the removal using the core function
-            if number[0] != "all":
-                number[0] = db.get_query_id_by_rowid(number[0])
-            message, success = core.process_remove_query(str(number[0]))
+            requested = context.args[0].lower()
+            chat_id = str(update.effective_chat.id)
+
+            if requested == "all":
+                message, success = core.process_remove_query(
+                    "all",
+                    chat_id=chat_id,
+                )
+            else:
+                query_id = db.get_query_id_by_rowid(
+                    requested,
+                    chat_id=chat_id,
+                )
+                if query_id is None:
+                    await update.message.reply_text(
+                        "That query number is not in your list."
+                    )
+                    return
+
+                message, success = core.process_remove_query(
+                    str(query_id),
+                    chat_id=chat_id,
+                )
 
             if success:
-                if number[0] == "all":
-                    await update.message.reply_text(message)
-                else:
-                    # Get the updated list of queries
-                    query_list = core.get_formatted_query_list()
-                    await update.message.reply_text(
-                        f"{message} \nCurrent queries: \n{query_list}"
-                    )
+                query_list = core.get_formatted_query_list(
+                    chat_id=chat_id
+                )
+                await update.message.reply_text(
+                    f"{message}\nYour current queries:\n{query_list}"
+                )
             else:
                 await update.message.reply_text(message)
-        except Exception as e:
-            logger.error(f"Error removing query: {str(e)}", exc_info=True)
-            try:
-                await update.message.reply_text(
-                    "An error occurred while removing the query. Please try again later."
-                )
-            except Exception as e2:
-                logger.error(f"Error sending error message: {str(e2)}")
+
+        except Exception as error:
+            logger.error(
+                f"Error removing query: {str(error)}",
+                exc_info=True,
+            )
+            await update.message.reply_text(
+                "An error occurred while removing the query."
+            )
 
     # get all queries from the db
-    async def queries(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def queries(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self.require_approved(update):
+            return
+
         try:
-            query_list = core.get_formatted_query_list()
-            await update.message.reply_text(f"Current queries: \n{query_list}")
-        except Exception as e:
-            logger.error(f"Error retrieving queries: {str(e)}", exc_info=True)
-            try:
-                await update.message.reply_text(
-                    "An error occurred while retrieving the queries. Please try again later."
-                )
-            except Exception as e2:
-                logger.error(f"Error sending error message: {str(e2)}")
+            chat_id = str(update.effective_chat.id)
+            query_list = core.get_formatted_query_list(
+                chat_id=chat_id
+            )
+            await update.message.reply_text(
+                f"Your current queries:\n{query_list}"
+            )
+        except Exception as error:
+            logger.error(
+                f"Error retrieving queries: {str(error)}",
+                exc_info=True,
+            )
+            await update.message.reply_text(
+                "An error occurred while retrieving your queries."
+            )
 
     ### ALLOWLIST ###
 
     async def clear_allowlist(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if not await self.require_admin(update):
+            return
         try:
             db.clear_allowlist()
             await update.message.reply_text(
@@ -180,6 +408,8 @@ class LeRobot:
     async def add_country(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if not await self.require_admin(update):
+            return
         try:
             country = context.args
             if not country:
@@ -204,6 +434,8 @@ class LeRobot:
     async def remove_country(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if not await self.require_admin(update):
+            return
         try:
             country = context.args
             if not country:
@@ -230,6 +462,8 @@ class LeRobot:
     async def allowlist(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if not await self.require_admin(update):
+            return
         try:
             if db.get_allowlist() == 0:
                 await update.message.reply_text(
@@ -250,70 +484,155 @@ class LeRobot:
 
     ### TELEGRAM SPECIFIC FUNCTIONS ###
 
-    async def send_new_post(self, content, url, text, buy_url=None, buy_text=None):
-        try:
-            async with self.bot:
-                chat_ID = str(db.get_parameter("telegram_chat_id"))
-                buttons = [[InlineKeyboardButton(text=text, url=url)]]
-                if buy_url and buy_text:
-                    buttons.append([InlineKeyboardButton(text=buy_text, url=buy_url)])
+    async def send_new_post(
+        self,
+        content,
+        url,
+        text,
+        buy_url=None,
+        buy_text=None,
+        chat_ids=None,
+    ):
+        if chat_ids is None:
+            configured_chat_id = db.get_parameter("telegram_chat_id")
+            chat_ids = [configured_chat_id] if configured_chat_id else []
+
+        if isinstance(chat_ids, (str, int)):
+            chat_ids = [chat_ids]
+
+        buttons = [[InlineKeyboardButton(text=text, url=url)]]
+        if buy_url and buy_text:
+            buttons.append(
+                [InlineKeyboardButton(text=buy_text, url=buy_url)]
+            )
+        markup = InlineKeyboardMarkup(buttons)
+
+        for chat_id in {
+            str(value).strip()
+            for value in chat_ids
+            if value is not None and str(value).strip()
+        }:
+            if not db.is_telegram_user_approved(chat_id):
+                logger.info(
+                    "Skipping alert for unapproved Telegram chat %s.",
+                    chat_id,
+                )
+                continue
+
+            try:
                 await self.bot.send_message(
-                    chat_ID,
-                    content,
+                    chat_id=chat_id,
+                    text=content,
                     parse_mode="HTML",
                     read_timeout=40,
                     write_timeout=40,
-                    reply_markup=InlineKeyboardMarkup(buttons),
+                    reply_markup=markup,
                 )
-        except RetryAfter as e:
-            retry_after = e.retry_after
-            logger.error(
-                f"Flood control exceeded. Retrying in {retry_after + 2} seconds"
-            )
-            await asyncio.sleep(retry_after + 2)
-            # Retry sending the message
-            await self.send_new_post(content, url, text, buy_url, buy_text)
-        except Exception as e:
-            logger.error(f"Error sending new post: {str(e)}", exc_info=True)
+            except RetryAfter as error:
+                retry_after = error.retry_after
+                logger.error(
+                    "Telegram flood control for chat %s. Retrying in %s seconds.",
+                    chat_id,
+                    retry_after + 2,
+                )
+                await asyncio.sleep(retry_after + 2)
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=content,
+                    parse_mode="HTML",
+                    read_timeout=40,
+                    write_timeout=40,
+                    reply_markup=markup,
+                )
+            except Exception as error:
+                logger.error(
+                    "Error sending new post to chat %s: %s",
+                    chat_id,
+                    str(error),
+                    exc_info=True,
+                )
 
-    async def check_version(self, context: ContextTypes.DEFAULT_TYPE):
+    async def check_version(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
         try:
-            # get latest version from the repository
-            should_update, VER, latest_version, url = core.check_version()
+            should_update, current_version, latest_version, url = (
+                core.check_version()
+            )
 
             if not should_update:
+                admin_chat_id = db.get_parameter("telegram_chat_id")
                 await self.send_new_post(
-                    f"Version {latest_version} is now available. Please update the bot.",
+                    (
+                        f"Version {latest_version} is now available. "
+                        "Please update the bot."
+                    ),
                     url,
-                    "Open Github",
+                    "Open GitHub",
+                    chat_ids=[admin_chat_id],
                 )
-        except Exception as e:
-            logger.error(f"Error checking for new version: {str(e)}", exc_info=True)
+        except Exception as error:
+            logger.error(
+                f"Error checking for new version: {str(error)}",
+                exc_info=True,
+            )
 
-    async def check_telegram_queue(self, context: ContextTypes.DEFAULT_TYPE):
+    async def check_telegram_queue(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
         try:
-            while 1:
-                if not self.new_items_queue.empty():
-                    content, url, text, buy_url, buy_text = self.new_items_queue.get()
-                    await self.send_new_post(content, url, text, buy_url, buy_text)
-                else:
+            while True:
+                if self.new_items_queue.empty():
                     await asyncio.sleep(0.1)
-                    pass
-        except Exception as e:
-            logger.error(f"Error checking telegram queue: {str(e)}", exc_info=True)
+                    continue
+
+                item = self.new_items_queue.get()
+
+                if len(item) == 6:
+                    (
+                        content,
+                        url,
+                        text,
+                        buy_url,
+                        buy_text,
+                        chat_ids,
+                    ) = item
+                else:
+                    content, url, text, buy_url, buy_text = item
+                    chat_ids = None
+
+                await self.send_new_post(
+                    content,
+                    url,
+                    text,
+                    buy_url,
+                    buy_text,
+                    chat_ids=chat_ids,
+                )
+        except Exception as error:
+            logger.error(
+                f"Error checking Telegram queue: {str(error)}",
+                exc_info=True,
+            )
 
     async def set_commands(self, context: ContextTypes.DEFAULT_TYPE):
         try:
             await self.bot.set_my_commands(
                 [
-                    ("hello", "Verify if bot is running"),
-                    ("add_query", "Add a keyword to the bot"),
-                    ("remove_query", "Remove a keyword from the bot"),
-                    ("queries", "List all queries"),
-                    ("clear_allowlist", "Clear the allowlist"),
-                    ("add_country", "Add a country to the allowlist"),
-                    ("remove_country", "Remove a country from the allowlist"),
-                    ("allowlist", "List all countries in the allowlist"),
+                    ("hello", "Show access status"),
+                    ("my_id", "Show your Telegram chat ID"),
+                    ("add_query", "Add a Vinted search"),
+                    ("remove_query", "Remove one of your searches"),
+                    ("queries", "List your searches"),
+                    ("approve_user", "Admin: approve an account"),
+                    ("revoke_user", "Admin: revoke an account"),
+                    ("users", "Admin: list bot accounts"),
+                    ("clear_allowlist", "Admin: clear country allowlist"),
+                    ("add_country", "Admin: add an allowed country"),
+                    ("remove_country", "Admin: remove an allowed country"),
+                    ("allowlist", "Admin: list allowed countries"),
                 ]
             )
             logger.info("Bot commands set successfully")

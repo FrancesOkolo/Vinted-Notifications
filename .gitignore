@@ -1,6 +1,36 @@
+/.idea/
+.vscode/
 
-/.idea
-vinted.db
-/__pycache__
-/logs/vinted.log
-/vinted_notifications.db
+# Runtime data, logs, and credentials stored by the application
+data/
+logs/
+*.log
+.env
+.env.*
+!.env.example
+
+# Databases and their SQLite sidecar files
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local backups, archives, and duplicate working copies
+backup*/
+*backup*/
+*.bak
+*.backup
+*.zip
+/Vinted-Notifications-Multi-User/
+
+# Python-generated files and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/

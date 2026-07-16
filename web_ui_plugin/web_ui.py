@@ -1,11 +1,14 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 import db
 import core
+import html
 import os
 import re
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from logger import get_logger
+from url_normalizer import normalise_vinted_url
 
 # Get logger for this module
 logger = get_logger(__name__)
@@ -39,13 +42,38 @@ def inject_current_year():
     return {"current_year": datetime.now().year}
 
 
+def _query_last_found_sort_key(query):
+    """Sort newest successful match first, with Never rows at the end."""
+    last_item = query[2]
+
+    if last_item is None:
+        return (1, 0.0, int(query[0]))
+
+    try:
+        timestamp = float(last_item)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid last_item timestamp %r for query %s; treating it as Never.",
+            last_item,
+            query[0],
+        )
+        return (1, 0.0, int(query[0]))
+
+    return (0, -timestamp, int(query[0]))
+
+
+def _queries_newest_first(queries):
+    """Return query rows ordered by Last Found Item, descending."""
+    return sorted(queries, key=_query_last_found_sort_key)
+
+
 @app.route("/")
 def index():
     # Get parameters
     params = db.get_all_parameters()
 
-    # Get queries
-    queries = db.get_queries()
+    # Get queries, newest Last Found Item first; Never entries last.
+    queries = _queries_newest_first(db.get_queries())
     formatted_queries = []
     for i, query in enumerate(queries):
         parsed_query = urlparse(query[1])
@@ -56,15 +84,23 @@ def index():
             else query_params.get("search_text", [None])[0]
         )
 
-        # Get the last timestamp for this query
-        try:
-            last_timestamp = db.get_last_timestamp(query[0])
-            last_found_item = datetime.fromtimestamp(last_timestamp).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        except Exception as e:
-            logger.debug(f"Error getting last timestamp for query {query[0]}: {e}")
+        # last_item is already included in db.get_queries().
+        last_timestamp = query[2]
+        if last_timestamp is None:
             last_found_item = "Never"
+        else:
+            try:
+                last_found_item = datetime.fromtimestamp(
+                    float(last_timestamp)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError, OSError, OverflowError) as error:
+                logger.warning(
+                    "Could not format last_item %r for query %s: %s",
+                    last_timestamp,
+                    query[0],
+                    error,
+                )
+                last_found_item = "Never"
 
         formatted_queries.append(
             {
@@ -135,8 +171,8 @@ def index():
 
 @app.route("/queries")
 def queries():
-    # Get queries
-    all_queries = db.get_queries()
+    # Get queries, newest Last Found Item first; Never entries last.
+    all_queries = _queries_newest_first(db.get_queries())
     formatted_queries = []
     for i, query in enumerate(all_queries):
         parsed_query = urlparse(query[1])
@@ -147,15 +183,23 @@ def queries():
             else query_params.get("search_text", [None])[0]
         )
 
-        # Get the last timestamp for this query
-        try:
-            last_timestamp = db.get_last_timestamp(query[0])
-            last_found_item = datetime.fromtimestamp(last_timestamp).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        except Exception as e:
-            logger.debug(f"Error getting last timestamp for query {query[0]}: {e}")
+        # last_item is already included in db.get_queries().
+        last_timestamp = query[2]
+        if last_timestamp is None:
             last_found_item = "Never"
+        else:
+            try:
+                last_found_item = datetime.fromtimestamp(
+                    float(last_timestamp)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError, OSError, OverflowError) as error:
+                logger.warning(
+                    "Could not format last_item %r for query %s: %s",
+                    last_timestamp,
+                    query[0],
+                    error,
+                )
+                last_found_item = "Never"
 
         formatted_queries.append(
             {
@@ -174,14 +218,19 @@ def queries():
 def add_query():
     query = request.form.get("query")
     query_name = request.form.get("query_name", "").strip()
+
     if query:
-        message, is_new_query = core.process_query(
-            query, name=query_name if query_name != "" else None
-        )
-        if is_new_query:
-            flash(f"Query added: {query}", "success")
-        else:
-            flash(message, "warning")
+        try:
+            query = normalise_vinted_url(query)
+            message, is_new_query = core.process_query(
+                query, name=query_name if query_name != "" else None
+            )
+            if is_new_query:
+                flash(f"Query added: {query}", "success")
+            else:
+                flash(message, "warning")
+        except (ValueError, TypeError) as error:
+            flash(str(error), "error")
     else:
         flash("No query provided", "error")
 
@@ -216,13 +265,17 @@ def update_query(query_id):
     query_name = request.form.get("query_name", "").strip()
 
     if query:
-        message, success = core.process_update_query(
-            query_id, query, name=query_name if query_name != "" else None
-        )
-        if success:
-            flash("Query updated", "success")
-        else:
-            flash(message, "error")
+        try:
+            query = normalise_vinted_url(query)
+            message, success = core.process_update_query(
+                query_id, query, name=query_name if query_name != "" else None
+            )
+            if success:
+                flash("Query updated", "success")
+            else:
+                flash(message, "error")
+        except (ValueError, TypeError) as error:
+            flash(str(error), "error")
     else:
         flash("No query provided", "error")
 
@@ -296,14 +349,104 @@ def items():
     )
 
 
+def _quiet_hours_panel(params):
+    """Render quiet-hours controls inside the existing configuration form."""
+    enabled = params.get("quiet_hours_enabled", "True") == "True"
+    start = html.escape(params.get("quiet_hours_start", "01:00"), quote=True)
+    end = html.escape(params.get("quiet_hours_end", "06:00"), quote=True)
+    timezone_name = html.escape(
+        params.get("quiet_hours_timezone", "Europe/London"),
+        quote=True,
+    )
+    checked = "checked" if enabled else ""
+
+    return f"""
+    <div id="quiet-hours-settings" class="card mb-4">
+        <div class="card-header">
+            <strong>Quiet hours</strong>
+        </div>
+        <div class="card-body">
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox"
+                       id="quiet_hours_enabled" name="quiet_hours_enabled" {checked}>
+                <label class="form-check-label" for="quiet_hours_enabled">
+                    Pause Vinted scraping during quiet hours
+                </label>
+            </div>
+            <div class="row g-3">
+                <div class="col-md-4">
+                    <label for="quiet_hours_start" class="form-label">Start</label>
+                    <input type="time" class="form-control" id="quiet_hours_start"
+                           name="quiet_hours_start" value="{start}" required>
+                </div>
+                <div class="col-md-4">
+                    <label for="quiet_hours_end" class="form-label">End</label>
+                    <input type="time" class="form-control" id="quiet_hours_end"
+                           name="quiet_hours_end" value="{end}" required>
+                </div>
+                <div class="col-md-4">
+                    <label for="quiet_hours_timezone" class="form-label">Timezone</label>
+                    <input type="text" class="form-control"
+                           id="quiet_hours_timezone" name="quiet_hours_timezone"
+                           value="{timezone_name}" required>
+                </div>
+            </div>
+            <div class="form-text mt-2">
+                Use an IANA timezone such as Europe/London. This remains correct when
+                the app runs on a UTC server and follows BST/GMT automatically. The
+                global quiet period applies to every Telegram account. Windows that
+                cross midnight are supported.
+            </div>
+            <button type="submit" class="btn btn-primary mt-3">
+                Save Configuration
+            </button>
+        </div>
+    </div>
+    """
+
+
 @app.route("/config")
 def config():
     params = db.get_all_parameters()
-    return render_template("config.html", params=params)
+    rendered = render_template("config.html", params=params)
+
+    if 'id="quiet-hours-settings"' not in rendered and "</form>" in rendered:
+        before, closing = rendered.rsplit("</form>", 1)
+        rendered = before + _quiet_hours_panel(params) + "</form>" + closing
+
+    return rendered
 
 
 @app.route("/update_config", methods=["POST"])
 def update_config():
+    quiet_start = request.form.get("quiet_hours_start", "01:00").strip()
+    quiet_end = request.form.get("quiet_hours_end", "06:00").strip()
+    quiet_timezone = (
+        request.form.get("quiet_hours_timezone", "Europe/London").strip()
+        or "Europe/London"
+    )
+
+    try:
+        datetime.strptime(quiet_start, "%H:%M")
+        datetime.strptime(quiet_end, "%H:%M")
+    except ValueError:
+        flash("Quiet-hours times must be valid 24-hour times.", "error")
+        return redirect(url_for("config"))
+
+    if quiet_start == quiet_end:
+        flash("Quiet-hours start and end times must be different.", "error")
+        return redirect(url_for("config"))
+
+    try:
+        ZoneInfo(quiet_timezone)
+    except ZoneInfoNotFoundError:
+        flash(
+            "Quiet-hours timezone is not recognised. Use an IANA name such as "
+            "Europe/London.",
+            "error",
+        )
+        return redirect(url_for("config"))
+
     # Update Telegram parameters
     telegram_enabled = "telegram_enabled" in request.form
     db.set_parameter("telegram_enabled", str(telegram_enabled))
@@ -322,6 +465,13 @@ def update_config():
         "query_refresh_delay", request.form.get("query_refresh_delay", "60")
     )
     db.set_parameter("banwords", request.form.get("banwords", ""))
+
+    # Update quiet-hours parameters
+    quiet_enabled = "quiet_hours_enabled" in request.form
+    db.set_parameter("quiet_hours_enabled", str(quiet_enabled))
+    db.set_parameter("quiet_hours_start", quiet_start)
+    db.set_parameter("quiet_hours_end", quiet_end)
+    db.set_parameter("quiet_hours_timezone", quiet_timezone)
 
     # Update Proxy parameters
     check_proxies = "check_proxies" in request.form

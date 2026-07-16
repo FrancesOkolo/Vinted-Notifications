@@ -79,6 +79,7 @@ class RSSFeed:
         self.items.append((title, url, content, datetime.datetime.now()))
 
         # Limit the number of items
+        self.max_items = int(self.max_items)
         if len(self.items) > self.max_items:
             self.items.pop(0)
 

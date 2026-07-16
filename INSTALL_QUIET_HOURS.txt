@@ -1,0 +1,68 @@
+VINTED NOTIFICATIONS: QUIET HOURS + QUERY SORTING UPGRADE
+=========================================================
+
+WHAT THIS ADDS
+--------------
+* Queries on the Dashboard and Queries page are ordered by Last Found Item,
+  newest first.
+* Queries that have never found an item remain at the bottom.
+* Quiet hours are configurable from the Configuration page.
+* Quiet hours use an explicit timezone, defaulting to Europe/London.
+* Europe/London automatically follows BST and GMT, even when the app runs on
+  a remote server whose system clock is UTC.
+* The scraper makes no Vinted catalogue requests during quiet hours.
+* If quiet hours begin during a long scrape, the current cycle stops safely.
+* Telegram remains running, so bot commands still work during quiet hours.
+* Multi-user subscriptions, URL cleaning, paced scraping and 429 handling are
+  retained.
+
+DEFAULTS
+--------
+Enabled:  Yes
+Start:    01:00
+End:      06:00
+Timezone: Europe/London
+
+SAFE INSTALLATION
+-----------------
+1. Stop Vinted Notifications completely.
+2. Extract this folder.
+3. Run the portable installer from inside the extracted folder:
+
+   Windows:
+       python install_upgrade.py
+
+   Linux/server:
+       python3 install_upgrade.py
+
+4. Enter the full Vinted-Notifications project folder when prompted.
+5. The installer creates a timestamped backup before replacing files.
+6. Restart the application.
+7. Open Configuration and confirm the quiet-hours settings.
+
+You may also use the Windows PowerShell installer if the project is still at:
+C:\Users\Awele\Documents\Vinted-Notifications
+
+    powershell -ExecutionPolicy Bypass -File .\install_quiet_hours.ps1
+
+EXPECTED QUERY ORDER
+--------------------
+A query with Last Found Item 2026-07-16 11:24 appears above one last found at
+2026-07-16 09:07. Rows marked Never appear after all dated rows.
+
+EXPECTED LOG DURING QUIET HOURS
+-------------------------------
+Quiet hours active (01:00-06:00, Europe/London); skipping this scrape cycle.
+
+TIMEZONE NOTE
+-------------
+Use an IANA timezone name. For the UK, keep Europe/London. On Windows, Python
+may require the optional tzdata package to load IANA timezones:
+
+    python -m pip install tzdata
+
+ROLLBACK
+--------
+Stop the application. Open the timestamped backup folder created by the
+installer and copy its files, including data/vinted_notifications.db, back into
+the project folder.

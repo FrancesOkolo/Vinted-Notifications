@@ -17,6 +17,13 @@ if not os.path.exists("./data/vinted_notifications.db"):
     db.create_or_update_sqlite_db("initial_db.sql")
     logger.info("Database created successfully")
 
+# Safe, idempotent migration for existing and new installations.
+if not db.migrate_multi_user_schema():
+    raise RuntimeError("Failed to initialise multi-user Telegram support.")
+
+if not db.migrate_quiet_hours_schema():
+    raise RuntimeError("Failed to initialise quiet-hours configuration.")
+
 import core
 from rss_feed_plugin.rss_feed import rss_feed_process
 from web_ui_plugin.web_ui import web_ui_process
@@ -71,9 +78,13 @@ def dispatcher_function(input_queue, rss_queue, telegram_queue):
         while True:
             # Get from input queue
             item = input_queue.get()
-            # Send to RSS queue
-            rss_queue.put(item)
-            #
+            # Telegram items may include a sixth field containing the
+            # destination chat IDs. RSS still expects the original five fields.
+            if isinstance(item, tuple) and len(item) == 6:
+                rss_queue.put(item[:5])
+            else:
+                rss_queue.put(item)
+
             telegram_queue.put(item)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Dispatcher process stopped")

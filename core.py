@@ -1,190 +1,130 @@
 import db
+import random
 import requests
+import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from email.utils import parsedate_to_datetime
 from pyVintedVN import Vinted, requester
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs
 from logger import get_logger
+from url_normalizer import normalise_vinted_url
 
 # Get logger for this module
 logger = get_logger(__name__)
 
 
-def process_query(query, name=None):
+def process_query(query, name=None, chat_id=None):
     """
-    Process a Vinted query URL by:
-    1. Checking if the URL is a brand URL and converting it to standard format if needed
-    2. Parsing the URL and extracting query parameters
-    3. Ensuring the order flag is set to "newest_first"
-    4. Removing time and search_id parameters
-    5. Rebuilding the query string and URL
-    6. Checking if the query already exists in the database
-    7. Adding the query to the database if it doesn't exist
+    Normalise a Vinted URL, create one shared query if necessary, and
+    subscribe the requesting Telegram account to it.
 
-    Args:
-        query (str): The Vinted query URL
-        name (str, optional): A name for the query. If provided, it will be used as the query name.
-
-    Returns:
-        tuple: (message, is_new_query)
-            - message (str): Status message
-            - is_new_query (bool): True if query was added, False if it already existed
+    When chat_id is omitted, the configured primary Telegram chat is used.
+    This keeps web-added queries routed to the primary account.
     """
-    # Check if the URL is a brand URL (format: url/brand/id-name)
-    parsed_url = urlparse(query)
-    path_parts = parsed_url.path.strip("/").split("/")
+    processed_query = normalise_vinted_url(query)
 
-    if len(path_parts) >= 2 and path_parts[0] == "brand":
-        # Extract the brand ID from the format "id-name"
-        brand_id_with_name = path_parts[1]
-        brand_id = brand_id_with_name.split("-")[0]
+    if chat_id is None:
+        configured_chat_id = db.get_parameter("telegram_chat_id")
+        chat_id = str(configured_chat_id).strip() if configured_chat_id else None
 
-        # Create a new URL with the standard format
-        new_path = "/catalog"
-        new_query_params = {"brand_ids[]": [brand_id]}
-        new_query_string = urlencode(new_query_params, doseq=True)
+    if chat_id is not None and not db.is_telegram_user_approved(chat_id):
+        return "This Telegram account is not approved.", False
 
-        # Rebuild the URL
-        query = urlunparse(
-            (parsed_url.scheme, parsed_url.netloc, new_path, "", new_query_string, "")
-        )
-        logger.info(f"Converted brand URL to standard format: {query}")
-
-        # Parse the URL and extract the query parameters
-        parsed_url = urlparse(query)
-
-    query_params = parse_qs(parsed_url.query)
-
-    # Ensure the order flag is set to newest_first
-    query_params["order"] = ["newest_first"]
-    # Remove time and search_id if provided
-    query_params.pop("time", None)
-    query_params.pop("search_id", None)
-    query_params.pop("disabled_personalization", None)
-    query_params.pop("page", None)
-
-    # Rebuild the query string and the entire URL
-    new_query = urlencode(query_params, doseq=True)
-    processed_query = urlunparse(
-        (
-            parsed_url.scheme,
-            parsed_url.netloc,
-            parsed_url.path,
-            parsed_url.params,
-            new_query,
-            parsed_url.fragment,
-        )
+    query_id, query_created, subscription_created = db.add_query_to_db(
+        processed_query,
+        name=name,
+        chat_id=chat_id,
     )
 
-    # Some queries are made with filters only, so we need to check if the search_text is present
-    if db.is_query_in_db(processed_query) is True:
-        return "Query already exists.", False
-    else:
-        # add the query to the db
-        db.add_query_to_db(processed_query, name)
+    if query_id is None:
+        return "Failed to add query.", False
+
+    if chat_id is not None and not subscription_created:
+        return "You already follow this query.", False
+
+    if query_created:
         return "Query added.", True
 
+    return "Query already existed; you are now subscribed to it.", True
 
-def get_formatted_query_list():
+def get_formatted_query_list(chat_id=None):
     """
-    Get a formatted list of all queries in the database.
-
-    Returns:
-        str: A formatted string with all queries, numbered
+    Return a numbered query list. Telegram users see only searches to
+    which their account is subscribed.
     """
-    all_queries = db.get_queries()
+    all_queries = db.get_queries(chat_id=chat_id)
     queries_keywords = []
+
     for query in all_queries:
         parsed_url = urlparse(query[1])
         query_params = parse_qs(parsed_url.query)
+        query_name = query[3] or query_params.get("search_text", [None])[0]
 
-        # Get the name or Extract the value of 'search_text'
-        query_name = (
-            query[3]
-            if query[3] is not None
-            else query_params.get("search_text", [None])[0]
-        )
+        if not query_name:
+            query_name = query[1]
 
-        if query_name[0] is None:
-            # Use query text instead of the whole query object
-            queries_keywords.append([query[1]])
-        else:
-            queries_keywords.append(query_name)
+        queries_keywords.append(str(query_name))
 
-    query_list = ("\n").join(
-        [str(i + 1) + ". " + j for i, j in enumerate(queries_keywords)]
+    if not queries_keywords:
+        return "No queries saved."
+
+    return "\n".join(
+        f"{index}. {query_name}"
+        for index, query_name in enumerate(queries_keywords, start=1)
     )
-    return query_list
 
-
-def process_remove_query(number):
+def process_remove_query(number, chat_id=None):
     """
-    Process the removal of a query from the database.
-
-    Args:
-        number (str): The number of the query to remove or "all" to remove all queries
-
-    Returns:
-        tuple: (message, success)
-            - message (str): Status message
-            - success (bool): True if query was removed successfully
+    Remove a query globally for web/admin calls, or unsubscribe only the
+    requesting Telegram user when chat_id is supplied.
     """
     if number == "all":
-        db.remove_all_queries_from_db()
-        return "All queries removed.", True
+        if chat_id is None:
+            success = db.remove_all_queries_from_db()
+            return (
+                ("All queries removed.", True)
+                if success
+                else ("Failed to remove queries.", False)
+            )
 
-    # Check if number is a valid digit
-    if number.isdigit():
-        # Remove the query from the database
-        db.remove_query_from_db(number)
-        return "Query removed.", True
-    else:
+        success = db.remove_all_query_subscriptions(chat_id)
+        return (
+            ("You have been unsubscribed from all queries.", True)
+            if success
+            else ("Failed to remove your queries.", False)
+        )
+
+    if not str(number).isdigit():
         return "Invalid number.", False
 
+    query_id = int(number)
+
+    if chat_id is None:
+        success = db.remove_query_from_db(query_id)
+        return (
+            ("Query removed.", True)
+            if success
+            else ("Failed to remove query.", False)
+        )
+
+    success = db.remove_query_subscription(query_id, chat_id)
+    return (
+        ("Query removed from your account.", True)
+        if success
+        else ("Query not found in your account.", False)
+    )
 
 def process_update_query(query_id, query, name):
     """
-    Process the update of a query in the database.
-
-    Args:
-        query_id (int): The ID of the query to update
-        query (str): The new Vinted query URL
-        name (str, optional): A new name for the query. If provided, it will be used as the query name.
-
-    Returns:
-        tuple: (message, success)
-            - message (str): Status message
-            - success (bool): True if query was updated successfully
+    Normalise and update a query from the web interface.
     """
-    # Parse the URL and extract the query parameters
-    parsed_url = urlparse(query)
-    query_params = parse_qs(parsed_url.query)
+    processed_query = normalise_vinted_url(query)
 
-    # Ensure the order flag is set to newest_first
-    query_params["order"] = ["newest_first"]
-    # Remove time and search_id if provided
-    query_params.pop("time", None)
-    query_params.pop("search_id", None)
-    query_params.pop("disabled_personalization", None)
-    query_params.pop("page", None)
-
-    # Rebuild the query string and the entire URL
-    new_query = urlencode(query_params, doseq=True)
-    processed_query = urlunparse(
-        (
-            parsed_url.scheme,
-            parsed_url.netloc,
-            parsed_url.path,
-            parsed_url.params,
-            new_query,
-            parsed_url.fragment,
-        )
-    )
-
-    # Update the query in the database
     if db.update_query_in_db(query_id, processed_query, name):
         return "Query updated.", True
-    else:
-        return "Failed to update query.", False
 
+    return "Failed to update query.", False
 
 def process_add_country(country):
     """
@@ -274,34 +214,273 @@ def get_user_country(profile_id):
     return user_country
 
 
+def _parse_quiet_time(value, fallback):
+    """Parse an HH:MM setting, returning the fallback on invalid data."""
+    try:
+        return datetime.strptime(str(value), "%H:%M").time()
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid quiet-hours time %r; using %s.",
+            value,
+            fallback,
+        )
+        return datetime.strptime(fallback, "%H:%M").time()
+
+
+def get_quiet_hours_status(now=None):
+    """
+    Return (active, start_text, end_text, timezone_name).
+
+    Quiet hours use the configured IANA timezone rather than the server's
+    local timezone. This keeps UK quiet hours correct on remote servers that
+    run in UTC and automatically follows BST/GMT daylight-saving changes.
+
+    Both ordinary windows (01:00-06:00) and windows crossing midnight
+    (23:00-06:00) are supported. Equal start and end times are treated as
+    disabled to avoid accidentally pausing the scraper all day.
+    """
+    enabled = str(db.get_parameter("quiet_hours_enabled") or "False").lower()
+    enabled = enabled == "true"
+
+    start_text = str(db.get_parameter("quiet_hours_start") or "01:00")
+    end_text = str(db.get_parameter("quiet_hours_end") or "06:00")
+    timezone_name = str(
+        db.get_parameter("quiet_hours_timezone") or "Europe/London"
+    ).strip() or "Europe/London"
+
+    if not enabled:
+        return False, start_text, end_text, timezone_name
+
+    try:
+        quiet_timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "Unknown quiet-hours timezone %r; using Europe/London.",
+            timezone_name,
+        )
+        timezone_name = "Europe/London"
+        quiet_timezone = ZoneInfo(timezone_name)
+
+    start = _parse_quiet_time(start_text, "01:00")
+    end = _parse_quiet_time(end_text, "06:00")
+
+    if start == end:
+        return False, start_text, end_text, timezone_name
+
+    if now is None:
+        current = datetime.now(quiet_timezone).time().replace(tzinfo=None)
+    elif isinstance(now, datetime):
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=quiet_timezone)
+        current = now.astimezone(quiet_timezone).time().replace(tzinfo=None)
+    else:
+        # A time object is useful for unit tests and is interpreted directly
+        # in the configured quiet-hours timezone.
+        current = now.replace(tzinfo=None)
+
+    if start < end:
+        active = start <= current < end
+    else:
+        active = current >= start or current < end
+
+    return active, start_text, end_text, timezone_name
+
+
+def _quiet_hours_active():
+    return get_quiet_hours_status()[0]
+
+
+def _get_retry_after_seconds(response, fallback_seconds):
+    if response is None:
+        return fallback_seconds
+
+    retry_after = response.headers.get("Retry-After")
+    if not retry_after:
+        return fallback_seconds
+
+    try:
+        return max(1, int(retry_after))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        retry_at = parsedate_to_datetime(retry_after)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        seconds = int(
+            (retry_at - datetime.now(timezone.utc)).total_seconds()
+        )
+        return max(1, seconds)
+    except (TypeError, ValueError, OverflowError):
+        return fallback_seconds
+
+
+def _get_query_spacing_seconds(query_count):
+    if query_count <= 1:
+        return 0.0
+
+    try:
+        refresh_delay = int(
+            db.get_parameter("query_refresh_delay") or 600
+        )
+    except (TypeError, ValueError):
+        refresh_delay = 600
+
+    usable_window = max(60, refresh_delay * 0.80)
+    calculated_spacing = usable_window / query_count
+    return max(2.0, min(15.0, calculated_spacing))
+
+
 def process_items(queue):
     """
-    Process all queries from the database, search for items, and put them in the queue.
-    Uses the global items_queue by default, but can accept a custom queue for backward compatibility.
-
-    Args:
-        queue (Queue, optional): The queue to put the items in. Defaults to the global items_queue.
-
-    Returns:
-        None
+    Scrape every unique query once, pacing requests across the configured
+    interval. Shared subscriptions do not create duplicate Vinted requests.
     """
+    quiet_active, quiet_start, quiet_end, quiet_timezone = (
+        get_quiet_hours_status()
+    )
+    if quiet_active:
+        logger.info(
+            "Quiet hours active (%s-%s, %s); skipping this scrape cycle.",
+            quiet_start,
+            quiet_end,
+            quiet_timezone,
+        )
+        return
 
     all_queries = db.get_queries()
 
-    # Initialize Vinted
+    if not all_queries:
+        logger.info("No Vinted queries configured.")
+        return
+
     vinted = Vinted()
 
-    # Get the number of items per query from the database
-    items_per_query = int(db.get_parameter("items_per_query"))
+    try:
+        items_per_query = int(
+            db.get_parameter("items_per_query") or 20
+        )
+    except (TypeError, ValueError):
+        items_per_query = 20
 
-    # for each keyword we parse data
-    for query in all_queries:
-        all_items = vinted.items.search(query[1], nbr_items=items_per_query)
-        # Filter to only include new items. This should reduce the amount of db calls.
-        data = [item for item in all_items if item.is_new_item()]
-        queue.put((data, query[0]))
-        logger.info(f"Scraped {len(data)} items for query: {query[1]}")
+    query_count = len(all_queries)
+    base_spacing = _get_query_spacing_seconds(query_count)
 
+    logger.info(
+        "Starting paced scrape of %s unique queries with approximately "
+        "%.1f seconds between requests.",
+        query_count,
+        base_spacing,
+    )
+
+    total_429s = 0
+
+    for position, query in enumerate(all_queries, start=1):
+        if _quiet_hours_active():
+            logger.info(
+                "Quiet hours began during the scrape. Stopping after %s/%s queries.",
+                position - 1,
+                query_count,
+            )
+            break
+
+        query_id = query[0]
+        query_url = query[1]
+        all_items = None
+
+        for attempt in range(2):
+            if _quiet_hours_active():
+                logger.info(
+                    "Quiet hours began before a retry; ending this scrape cycle."
+                )
+                break
+
+            try:
+                all_items = vinted.items.search(
+                    query_url,
+                    nbr_items=items_per_query,
+                )
+                break
+            except requests.exceptions.HTTPError as error:
+                response = error.response
+                status_code = (
+                    response.status_code if response is not None else None
+                )
+
+                if status_code != 429:
+                    logger.error(
+                        "HTTP error while scraping query %s/%s: %s",
+                        position,
+                        query_count,
+                        query_url,
+                        exc_info=True,
+                    )
+                    break
+
+                total_429s += 1
+                fallback = 60 * (attempt + 1)
+                wait_seconds = _get_retry_after_seconds(
+                    response,
+                    fallback_seconds=fallback,
+                )
+                wait_seconds = min(max(wait_seconds, 30), 300)
+
+                logger.warning(
+                    "Vinted rate-limited query %s/%s. Waiting %s seconds "
+                    "before %s.",
+                    position,
+                    query_count,
+                    wait_seconds,
+                    "retrying" if attempt == 0 else "continuing",
+                )
+                time.sleep(wait_seconds)
+
+                if attempt == 1:
+                    logger.error(
+                        "Skipping query after repeated 429 responses: %s",
+                        query_url,
+                    )
+            except requests.exceptions.RequestException:
+                logger.error(
+                    "Network error while scraping query %s/%s: %s",
+                    position,
+                    query_count,
+                    query_url,
+                    exc_info=True,
+                )
+                break
+            except Exception:
+                logger.error(
+                    "Unexpected error while scraping query %s/%s: %s",
+                    position,
+                    query_count,
+                    query_url,
+                    exc_info=True,
+                )
+                break
+
+        if all_items is not None:
+            data = [item for item in all_items if item.is_new_item()]
+            queue.put((data, query_id))
+            logger.info(
+                "Scraped %s items for query %s/%s: %s",
+                len(data),
+                position,
+                query_count,
+                query_url,
+            )
+
+        if total_429s >= 3:
+            logger.error(
+                "Stopping this scrape cycle after %s rate-limit responses. "
+                "The next scheduled cycle will try again.",
+                total_429s,
+            )
+            break
+
+        if position < query_count and base_spacing > 0:
+            jittered_spacing = base_spacing * random.uniform(0.85, 1.15)
+            time.sleep(jittered_spacing)
 
 def clear_item_queue(items_queue, new_items_queue):
     """
@@ -346,9 +525,27 @@ def clear_item_queue(items_queue, new_items_queue):
                     brand=item.brand_title,
                     image=None if item.photo is None else item.photo,
                 )
-                # add the item to the queue
-                new_items_queue.put((content, item.url, "Open Vinted", None, None))
-                # new_items_queue.put((content, item.url, "Open Vinted", item.buy_url, "Open buy page"))
+                # Route this alert only to approved subscribers of the
+                # matching query. One query may notify several accounts.
+                subscriber_chat_ids = db.get_query_subscribers(query_id)
+
+                if subscriber_chat_ids:
+                    new_items_queue.put(
+                        (
+                            content,
+                            item.url,
+                            "Open Vinted",
+                            None,
+                            None,
+                            subscriber_chat_ids,
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "No approved Telegram subscribers for query %s; "
+                        "the item will be stored but not sent.",
+                        query_id,
+                    )
                 # Add the item to the db
                 db.add_item_to_db(
                     id=item.id,

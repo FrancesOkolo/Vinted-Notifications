@@ -35,6 +35,39 @@ CREATE TABLE IF NOT EXISTS allowlist
     country TEXT
 );
 
+
+
+-- Approved and pending Telegram accounts
+CREATE TABLE IF NOT EXISTS telegram_users
+(
+    chat_id      TEXT PRIMARY KEY,
+    display_name TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'approved', 'revoked')),
+    is_admin     INTEGER NOT NULL DEFAULT 0
+                 CHECK (is_admin IN (0, 1)),
+    created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- A query is scraped once, but can notify several Telegram accounts.
+CREATE TABLE IF NOT EXISTS query_subscriptions
+(
+    query_id   INTEGER NOT NULL,
+    chat_id    TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (query_id, chat_id),
+    FOREIGN KEY (query_id) REFERENCES queries (id) ON DELETE CASCADE,
+    FOREIGN KEY (chat_id) REFERENCES telegram_users (chat_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_subscriptions_chat
+    ON query_subscriptions (chat_id);
+
+CREATE INDEX IF NOT EXISTS idx_query_subscriptions_query
+    ON query_subscriptions (query_id);
+
+
 -- Parameters table
 CREATE TABLE IF NOT EXISTS parameters
 (
@@ -62,6 +95,10 @@ VALUES ('telegram_enabled', 'False'),
 
        ('items_per_query', '20'),
        ('query_refresh_delay', '60'),
+       ('quiet_hours_enabled', 'True'),
+       ('quiet_hours_start', '01:00'),
+       ('quiet_hours_end', '06:00'),
+       ('quiet_hours_timezone', 'Europe/London'),
 
        ('proxy_list', ''),
        ('proxy_list_link', ''),
