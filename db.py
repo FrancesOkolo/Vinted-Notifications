@@ -546,7 +546,54 @@ def migrate_multi_user_schema():
             (
                 query_id   INTEGER NOT NULL,
                 chat_id    TEXT NOT NULL,
-   ÎN-¢Gß≤⁄Óù∆≠y“,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (query_id, chat_id),
+                FOREIGN KEY (query_id) REFERENCES queries (id) ON DELETE CASCADE,
+                FOREIGN KEY (chat_id) REFERENCES telegram_users (chat_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_query_subscriptions_chat
+                ON query_subscriptions (chat_id);
+
+            CREATE INDEX IF NOT EXISTS idx_query_subscriptions_query
+                ON query_subscriptions (query_id);
+            """
+        )
+
+        cursor.execute(
+            "SELECT value FROM parameters WHERE key='telegram_chat_id'"
+        )
+        row = cursor.fetchone()
+        admin_chat_id = str(row[0]).strip() if row and row[0] is not None else ""
+
+        if admin_chat_id:
+            cursor.execute(
+                """
+                INSERT INTO telegram_users
+                    (chat_id, display_name, status, is_admin)
+                VALUES (?, 'Primary user', 'approved', 1)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    status='approved',
+                    is_admin=1,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (admin_chat_id,),
+            )
+
+            # Preserve all existing searches by assigning otherwise-unowned
+            # queries to the configured primary Telegram account.
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO query_subscriptions (query_id, chat_id)
+                SELECT q.id, ?
+                FROM queries q
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM query_subscriptions s
+                    WHERE s.query_id = q.id
+                )
+                """,
                 (admin_chat_id,),
             )
 
