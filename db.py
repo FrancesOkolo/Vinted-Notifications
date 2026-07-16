@@ -217,100 +217,6 @@ def remove_all_queries_from_db():
             conn.close()
 
 
-def _add_message_template_variable(
-    template,
-    label,
-    placeholder,
-    before_placeholder=None,
-):
-    """Add or fill one labelled placeholder without replacing custom text."""
-    if placeholder in template:
-        return template
-
-    lines = template.splitlines()
-    label_lower = label.lower()
-
-    for index, line in enumerate(lines):
-        if line.strip().lower().startswith(label_lower):
-            lines[index] = line.rstrip() + " " + placeholder
-            return "\n".join(lines)
-
-    new_line = f"{label} : {placeholder}"
-    if before_placeholder:
-        for index, line in enumerate(lines):
-            if before_placeholder in line:
-                lines.insert(index, new_line)
-                return "\n".join(lines)
-
-    lines.append(new_line)
-    return "\n".join(lines)
-
-
-def migrate_message_template():
-    """
-    Add condition and description variables to an existing message template.
-
-    A migration marker ensures this changes the user's template only once;
-    later custom edits remain under the user's control.
-    """
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT value FROM parameters WHERE key=?",
-            ("message_template_v2_migrated",),
-        )
-        marker = cursor.fetchone()
-        if marker and str(marker[0]).lower() == "true":
-            return True
-
-        cursor.execute(
-            "SELECT value FROM parameters WHERE key=?",
-            ("message_template",),
-        )
-        row = cursor.fetchone()
-        template = row[0] if row and row[0] else DEFAULT_MESSAGE_TEMPLATE
-
-        template = _add_message_template_variable(
-            template,
-            "Condition",
-            "{condition}",
-            before_placeholder="{image}",
-        )
-        template = _add_message_template_variable(
-            template,
-            "Description",
-            "{description}",
-        )
-
-        cursor.execute(
-            """
-            INSERT INTO parameters (key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """,
-            ("message_template", template),
-        )
-        cursor.execute(
-            """
-            INSERT INTO parameters (key, value)
-            VALUES (?, 'True')
-            ON CONFLICT(key) DO UPDATE SET value='True'
-            """,
-            ("message_template_v2_migrated",),
-        )
-        conn.commit()
-        return True
-    except Exception:
-        print_exc()
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-
 def update_query_in_db(query_id, query, name):
     """
     Update an existing query in the database.
@@ -559,7 +465,67 @@ def get_items_per_day():
         # Ensure at least 1 day to avoid division by zero
         days_diff = max(1, days_diff)
 
-        # CalculaÎN-¢Gß≤⁄Óù∆≠y‘ion()
+        # Calculate items per day
+        return round(total_items / days_diff, 1)
+    except Exception:
+        print_exc()
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# Quiet-hours configuration
+# ============================================================
+
+
+def migrate_quiet_hours_schema():
+    """
+    Add quiet-hours settings to existing installations.
+
+    The migration is idempotent and preserves any values already chosen
+    by the user. Quiet hours are enabled by default from 01:00 to 06:00
+    in Europe/London, so remote servers follow UK local time correctly.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.executemany(
+            "INSERT OR IGNORE INTO parameters (key, value) VALUES (?, ?)",
+            [
+                ("quiet_hours_enabled", "True"),
+                ("quiet_hours_start", "01:00"),
+                ("quiet_hours_end", "06:00"),
+                ("quiet_hours_timezone", "Europe/London"),
+            ],
+        )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# Multi-user Telegram support
+# ============================================================
+
+def migrate_multi_user_schema():
+    """
+    Create the multi-user Telegram tables for an existing installation.
+
+    The configured telegram_chat_id is treated as the administrator and
+    is subscribed to every existing query that currently has no subscribers.
+    This migration is idempotent and may be run safely on every start.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
         cursor = conn.cursor()
 
         cursor.executescript(
@@ -580,54 +546,7 @@ def get_items_per_day():
             (
                 query_id   INTEGER NOT NULL,
                 chat_id    TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (query_id, chat_id),
-                FOREIGN KEY (query_id) REFERENCES queries (id) ON DELETE CASCADE,
-                FOREIGN KEY (chat_id) REFERENCES telegram_users (chat_id)
-                    ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_query_subscriptions_chat
-                ON query_subscriptions (chat_id);
-
-            CREATE INDEX IF NOT EXISTS idx_query_subscriptions_query
-                ON query_subscriptions (query_id);
-            """
-        )
-
-        cursor.execute(
-            "SELECT value FROM parameters WHERE key='telegram_chat_id'"
-        )
-        row = cursor.fetchone()
-        admin_chat_id = str(row[0]).strip() if row and row[0] is not None else ""
-
-        if admin_chat_id:
-            cursor.execute(
-                """
-                INSERT INTO telegram_users
-                    (chat_id, display_name, status, is_admin)
-                VALUES (?, 'Primary user', 'approved', 1)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    status='approved',
-                    is_admin=1,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (admin_chat_id,),
-            )
-
-            # Preserve all existing searches by assigning otherwise-unowned
-            # queries to the configured primary Telegram account.
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO query_subscriptions (query_id, chat_id)
-                SELECT q.id, ?
-                FROM queries q
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM query_subscriptions s
-                    WHERE s.query_id = q.id
-                )
-                """,
+   ÎN-¢Gß≤⁄Óù∆≠y“,
                 (admin_chat_id,),
             )
 
@@ -1108,6 +1027,100 @@ def remove_all_queries_from_db():
         cursor.execute("DELETE FROM query_subscriptions")
         cursor.execute("DELETE FROM items")
         cursor.execute("DELETE FROM queries")
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def _add_message_template_variable(
+    template,
+    label,
+    placeholder,
+    before_placeholder=None,
+):
+    """Add or fill one labelled placeholder without replacing custom text."""
+    if placeholder in template:
+        return template
+
+    lines = template.splitlines()
+    label_lower = label.lower()
+
+    for index, line in enumerate(lines):
+        if line.strip().lower().startswith(label_lower):
+            lines[index] = line.rstrip() + " " + placeholder
+            return "\n".join(lines)
+
+    new_line = f"{label} : {placeholder}"
+    if before_placeholder:
+        for index, line in enumerate(lines):
+            if before_placeholder in line:
+                lines.insert(index, new_line)
+                return "\n".join(lines)
+
+    lines.append(new_line)
+    return "\n".join(lines)
+
+
+def migrate_message_template():
+    """
+    Add condition and description variables to an existing message template.
+
+    A migration marker ensures this changes the user's template only once;
+    later custom edits remain under the user's control.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT value FROM parameters WHERE key=?",
+            ("message_template_v2_migrated",),
+        )
+        marker = cursor.fetchone()
+        if marker and str(marker[0]).lower() == "true":
+            return True
+
+        cursor.execute(
+            "SELECT value FROM parameters WHERE key=?",
+            ("message_template",),
+        )
+        row = cursor.fetchone()
+        template = row[0] if row and row[0] else DEFAULT_MESSAGE_TEMPLATE
+
+        template = _add_message_template_variable(
+            template,
+            "Condition",
+            "{condition}",
+            before_placeholder="{image}",
+        )
+        template = _add_message_template_variable(
+            template,
+            "Description",
+            "{description}",
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO parameters (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            ("message_template", template),
+        )
+        cursor.execute(
+            """
+            INSERT INTO parameters (key, value)
+            VALUES (?, 'True')
+            ON CONFLICT(key) DO UPDATE SET value='True'
+            """,
+            ("message_template_v2_migrated",),
+        )
         conn.commit()
         return True
     except Exception:
