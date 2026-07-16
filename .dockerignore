@@ -9,6 +9,7 @@ __pycache__/
 *.so
 .Python
 env/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -33,6 +34,19 @@ data/
 **/*.db
 **/*.sqlite*
 logs/
+
+# Secrets, local archives, and one-off operational files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.zip
+*.bak
+*.backup
+backup*/
+*backup*/
+bulk_add_vinted_queries*.py
 
 # Docker
 Dockerfile

@@ -1,16 +1,25 @@
-version: '3.8'
-
 services:
   vinted-notifications:
-    image: fuyucch1/vinted-notifications:latest
-    pull_policy: always
+    build:
+      context: .
+    image: francesokolo/vinted-notifications:${VN_IMAGE_TAG:-test}
+    pull_policy: never
     ports:
-      - "8000:8000"
-      - "8080:8080"
+      - "127.0.0.1:${VN_WEB_PORT:-8000}:8000"
+      - "127.0.0.1:${VN_RSS_PORT:-8080}:8080"
+    environment:
+      VN_WEB_HOST: 0.0.0.0
+      VN_WEB_PORT: 8000
+      VN_RSS_HOST: 0.0.0.0
+      VN_WEB_USERNAME: ${VN_WEB_USERNAME:-admin}
+      VN_WEB_PASSWORD: ${VN_WEB_PASSWORD:?Set VN_WEB_PASSWORD in .env}
+      VN_SECRET_KEY: ${VN_SECRET_KEY:?Set VN_SECRET_KEY in .env}
+      TZ: ${TZ:-Europe/London}
     volumes:
       - VN_data:/app/data
       - VN_logs:/app/logs
     restart: unless-stopped
+    stop_grace_period: 30s
     read_only: true
     tmpfs:
       - /tmp

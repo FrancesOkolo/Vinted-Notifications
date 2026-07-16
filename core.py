@@ -3,6 +3,7 @@ import html
 import json
 import random
 import requests
+import threading
 import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -15,6 +16,11 @@ from url_normalizer import normalise_vinted_url
 
 # Get logger for this module
 logger = get_logger(__name__)
+
+_VERSION_CACHE = None
+_VERSION_CACHE_TIME = 0.0
+_VERSION_CACHE_TTL_SECONDS = 6 * 60 * 60
+_VERSION_CACHE_LOCK = threading.Lock()
 
 
 def process_query(query, name=None, chat_id=None):
@@ -262,7 +268,13 @@ def get_quiet_hours_status(now=None):
             timezone_name,
         )
         timezone_name = "Europe/London"
-        quiet_timezone = ZoneInfo(timezone_name)
+        try:
+            quiet_timezone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            logger.error(
+                "Timezone data is unavailable; quiet hours are disabled."
+            )
+            return False, start_text, end_text, timezone_name
 
     start = _parse_quiet_time(start_text, "01:00")
     end = _parse_quiet_time(end_text, "06:00")
@@ -635,7 +647,7 @@ def clear_item_queue(items_queue, new_items_queue):
                     if "{description}" in message_template
                     else getattr(item, "description", None)
                 )
-                content = message_template.format(
+                format_values = dict(
                     title=_notification_value(item.title),
                     price=_notification_value(
                         str(item.price) + " " + item.currency
@@ -659,25 +671,34 @@ def clear_item_queue(items_queue, new_items_queue):
                         else html.escape(str(item.photo), quote=True)
                     ),
                 )
+                try:
+                    content = message_template.format(**format_values)
+                except (KeyError, IndexError, ValueError):
+                    logger.error(
+                        "Invalid notification template; using the safe default.",
+                        exc_info=True,
+                    )
+                    content = db.DEFAULT_MESSAGE_TEMPLATE.format(**format_values)
                 # Route this alert only to approved subscribers of the
                 # matching query. One query may notify several accounts.
                 subscriber_chat_ids = db.get_query_subscribers(query_id)
 
-                if subscriber_chat_ids:
-                    new_items_queue.put(
-                        (
-                            content,
-                            item.url,
-                            "Open Vinted",
-                            None,
-                            None,
-                            subscriber_chat_ids,
-                        )
+                # Always dispatch so RSS-only installations still receive the
+                # item. Telegram safely ignores an empty destination list.
+                new_items_queue.put(
+                    (
+                        content,
+                        item.url,
+                        "Open Vinted",
+                        None,
+                        None,
+                        subscriber_chat_ids,
                     )
-                else:
+                )
+                if not subscriber_chat_ids:
                     logger.warning(
                         "No approved Telegram subscribers for query %s; "
-                        "the item will be stored but not sent.",
+                        "the item will still be available to RSS.",
                         query_id,
                     )
                 # Add the item to the db
@@ -721,27 +742,44 @@ def contains_banwords(title, banwords_str):
     return False
 
 
-def check_version():
+def check_version(force=False):
     """
     Check if the application is up to date
     """
-    try:
-        # Get URL from the database
-        github_url = db.get_parameter("github_url")
-        # Get version from the database
-        ver = db.get_parameter("version")
-        # Get latest version from the repository
-        url = f"{github_url}/releases/latest"
-        response = requests.get(url)
+    global _VERSION_CACHE, _VERSION_CACHE_TIME
 
-        if response.status_code == 200:
-            latest_version = response.url.split("/")[-1]
-            is_up_to_date = ver == latest_version
-            return is_up_to_date, ver, latest_version, github_url
-        else:
-            # If we can't check, assume it's up to date
-            return True, ver, ver, github_url
-    except Exception as e:
-        logger.error(f"Error checking for new version: {str(e)}", exc_info=True)
-        # If we can't check, assume it's up to date
-        return True, ver, ver, github_url
+    now = time.monotonic()
+    with _VERSION_CACHE_LOCK:
+        if (
+            not force
+            and _VERSION_CACHE is not None
+            and now - _VERSION_CACHE_TIME < _VERSION_CACHE_TTL_SECONDS
+        ):
+            return _VERSION_CACHE
+
+        github_url = (
+            db.get_parameter("github_url")
+            or "https://github.com/FrancesOkolo/Vinted-Notifications"
+        )
+        version = db.get_parameter("version") or "unknown"
+        result = (True, version, version, github_url)
+
+        try:
+            response = requests.get(
+                f"{github_url}/releases/latest",
+                timeout=(3.05, 5),
+            )
+            if response.status_code == 200:
+                latest_version = response.url.rstrip("/").split("/")[-1]
+                result = (
+                    version == latest_version,
+                    version,
+                    latest_version,
+                    github_url,
+                )
+        except requests.RequestException as error:
+            logger.warning("Could not check for a new version: %s", error)
+
+        _VERSION_CACHE = result
+        _VERSION_CACHE_TIME = now
+        return result

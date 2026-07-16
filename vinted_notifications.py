@@ -8,30 +8,6 @@ from logger import get_logger
 # Get logger for this module
 logger = get_logger(__name__)
 
-# Starting sequence
-# Db check
-if not os.path.exists("./data/vinted_notifications.db"):
-    logger.info("Database not found, creating a new one.")
-    # Create the folder if it doesn't exist
-    os.makedirs("./data", exist_ok=True)
-    db.create_or_update_sqlite_db("initial_db.sql")
-    logger.info("Database created successfully")
-
-# Safe, idempotent migration for existing and new installations.
-if not db.migrate_message_template():
-    raise RuntimeError("Failed to initialise the notification message template.")
-
-if not db.migrate_multi_user_schema():
-    raise RuntimeError("Failed to initialise multi-user Telegram support.")
-
-if not db.migrate_quiet_hours_schema():
-    raise RuntimeError("Failed to initialise quiet-hours configuration.")
-
-import core
-from rss_feed_plugin.rss_feed import rss_feed_process
-from web_ui_plugin.web_ui import web_ui_process
-
-
 # Global process references
 telegram_process = None
 rss_process = None
@@ -39,7 +15,49 @@ scrape_process = None
 current_query_refresh_delay = None
 
 
+def initialise_database():
+    """Create, upgrade, and configure the database once in the parent."""
+    if not os.path.exists("./data/vinted_notifications.db"):
+        logger.info("Database not found, creating a new one.")
+        os.makedirs("./data", exist_ok=True)
+        if not db.create_or_update_sqlite_db("initial_db.sql"):
+            raise RuntimeError("Failed to create the application database.")
+        logger.info("Database created successfully")
+
+    if not db.configure_database_runtime():
+        raise RuntimeError("Failed to configure SQLite runtime settings.")
+
+    current_version = db.get_parameter("version")
+    migration_files = os.listdir("migrations")
+    while True:
+        migration_file = next(
+            (name for name in migration_files if name.startswith(current_version)),
+            None,
+        )
+        if not migration_file:
+            break
+        logger.info("Running migration: %s", migration_file)
+        if not db.create_or_update_sqlite_db(
+            os.path.join("migrations", migration_file)
+        ):
+            raise RuntimeError(f"Failed to run migration {migration_file}.")
+        current_version = db.get_parameter("version")
+
+    migrations = [
+        (db.migrate_message_template, "notification message template"),
+        (db.migrate_multi_user_schema, "multi-user Telegram support"),
+        (db.migrate_query_uniqueness, "query uniqueness"),
+        (db.migrate_quiet_hours_schema, "quiet-hours configuration"),
+        (db.migrate_fork_identity, "fork identity"),
+    ]
+    for migration, label in migrations:
+        if not migration():
+            raise RuntimeError(f"Failed to initialise {label}.")
+
+
 def scraper_process(items_queue):
+    import core
+
     logger.info("Scrape process started")
 
     # Get the query refresh delay from the database
@@ -65,6 +83,8 @@ def scraper_process(items_queue):
 
 
 def item_extractor(items_queue, new_items_queue):
+    import core
+
     logger.info("Item extractor process started")
     try:
         while True:
@@ -109,6 +129,18 @@ def telegram_bot_process(queue):
         logger.info("Telegram bot process stopped")
     except Exception as e:
         logger.error(f"Error in telegram bot process: {e}", exc_info=True)
+
+
+def rss_feed_process_entry(queue):
+    from rss_feed_plugin.rss_feed import rss_feed_process
+
+    rss_feed_process(queue)
+
+
+def web_ui_process_entry():
+    from web_ui_plugin.web_ui import web_ui_process
+
+    web_ui_process()
 
 
 def check_refresh_delay(items_queue):
@@ -187,7 +219,7 @@ def monitor_processes(items_queue, telegram_queue, rss_queue):
         # Start RSS process
         logger.info("Starting RSS process based on database status")
         rss_process = multiprocessing.Process(
-            target=rss_feed_process, args=(rss_queue,)
+            target=rss_feed_process_entry, args=(rss_queue,)
         )
         rss_process.start()
     elif not rss_should_run and rss_is_running:
@@ -211,23 +243,8 @@ def plugin_checker():
 
 
 if __name__ == "__main__":
-
-    # Run db migrations
-    current_version = db.get_parameter("version")
-    # Check if there is a file that starts with the current version in the migrations folder. We keep comparing until
-    # we find no migration files that start with the current version.
-    migration_files = [f for f in os.listdir("migrations")]
-    while True:
-        migration_file = next(
-            (f for f in migration_files if f.startswith(current_version)), None
-        )
-        if migration_file:
-            logger.info(f"Running migration: {migration_file}")
-            db.create_or_update_sqlite_db("./migrations/" + migration_file)
-            # Increment the version
-            current_version = db.get_parameter("version")
-        else:
-            break
+    multiprocessing.freeze_support()
+    initialise_database()
 
     # Plugin checker
     plugin_checker()
@@ -279,7 +296,7 @@ if __name__ == "__main__":
 
     # 5. Create and start the Web UI process
     # This process will provide a web interface to control the application
-    web_ui_process_instance = multiprocessing.Process(target=web_ui_process)
+    web_ui_process_instance = multiprocessing.Process(target=web_ui_process_entry)
     web_ui_process_instance.start()
 
     try:

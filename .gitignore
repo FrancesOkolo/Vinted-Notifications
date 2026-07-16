@@ -8,6 +8,8 @@ logs/
 .env
 .env.*
 !.env.example
+*.pem
+*.key
 
 # Databases and their SQLite sidecar files
 *.db
@@ -34,3 +36,8 @@ __pycache__/
 venv/
 build/
 dist/
+.coverage
+htmlcov/
+
+# Personal one-off import lists
+bulk_add_vinted_queries*.py

@@ -312,7 +312,8 @@
                 fetch(`/control/${process}/${action}`, {
                     method: 'POST',
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'X-CSRF-Token': '{{ csrf_token() }}'
                     }
                 })
                     .then(response => response.json())

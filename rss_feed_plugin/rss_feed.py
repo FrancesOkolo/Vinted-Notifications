@@ -4,6 +4,7 @@ import time
 import db
 import datetime
 import html
+import os
 from logger import get_logger
 from feedgen.feed import FeedGenerator
 
@@ -90,8 +91,11 @@ class RSSFeed:
 
         try:
             port = db.get_parameter("rss_port")
-            logger.info(f"Starting RSS feed server on port {port}")
-            self.app.run(host="0.0.0.0", port=port)
+            host = os.environ.get("VN_RSS_HOST", "127.0.0.1")
+            logger.info("Starting RSS feed server on %s:%s", host, port)
+            from waitress import serve
+
+            serve(self.app, host=host, port=int(port), threads=2)
         except Exception as e:
             logger.error(f"Error starting RSS feed server: {str(e)}", exc_info=True)
 

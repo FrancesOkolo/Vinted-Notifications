@@ -14,6 +14,8 @@ from logger import get_logger
 # Get logger for this module
 logger = get_logger(__name__)
 
+REQUEST_TIMEOUT = (10, 30)
+
 
 class Requester:
     """
@@ -121,7 +123,11 @@ class Requester:
         new_session = False
         while tried < self.MAX_RETRIES:
             tried += 1
-            with self.session.get(url, params=params) as response:
+            with self.session.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            ) as response:
                 if response.status_code in (401, 404) and tried < self.MAX_RETRIES:
                     print(f"Cookies invalid, retrying {tried}/{self.MAX_RETRIES}")
                     if self.debug:
@@ -181,7 +187,11 @@ class Requester:
         if self.debug and proxy_configured:
             logger.debug(f"Using proxy: {self.session.proxies}")
 
-        response = self.session.post(url, params)
+        response = self.session.post(
+            url,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
         response.raise_for_status()
         return response
 
@@ -194,7 +204,10 @@ class Requester:
         """
         self.session.cookies.clear_session_cookies()
         try:
-            self.session.head(self.VINTED_AUTH_URL)
+            self.session.head(
+                self.VINTED_AUTH_URL,
+                timeout=REQUEST_TIMEOUT,
+            )
             if self.debug:
                 logger.debug("Cookies set!")
         except Exception:

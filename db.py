@@ -2,6 +2,7 @@ import sqlite3
 from traceback import print_exc
 
 DB_PATH = "./data/vinted_notifications.db"
+DB_TIMEOUT_SECONDS = 30
 
 DEFAULT_MESSAGE_TEMPLATE = """🆕 Title : {title}
 💶 Price : {price}
@@ -12,9 +13,27 @@ Description : {description}"""
 
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_SECONDS)
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA busy_timeout = {DB_TIMEOUT_SECONDS * 1000}")
     return conn
+
+
+def configure_database_runtime():
+    """Enable persistent SQLite settings before worker processes start."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def create_or_update_sqlite_db(db_path):
@@ -28,8 +47,10 @@ def create_or_update_sqlite_db(db_path):
             cursor.executescript(sql_script)
 
         conn.commit()
+        return True
     except Exception:
         print_exc()
+        return False
     finally:
         if conn:
             conn.close()
@@ -38,7 +59,7 @@ def create_or_update_sqlite_db(db_path):
 def is_item_in_db_by_id(id):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT() FROM items WHERE item=?", (id,))
         if cursor.fetchone()[0]:
@@ -54,7 +75,7 @@ def is_item_in_db_by_id(id):
 def get_last_timestamp(query_id):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT last_item FROM queries WHERE id=?", (query_id,))
         result = cursor.fetchone()
@@ -72,7 +93,7 @@ def get_last_timestamp(query_id):
 def update_last_timestamp(query_id, timestamp):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE queries SET last_item=? WHERE id=?", (timestamp, query_id)
@@ -110,7 +131,7 @@ def add_item_to_db(id, title, query_id, price, timestamp, photo_url, currency="E
 def get_queries():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT id, query, last_item, query_name FROM queries")
         return cursor.fetchall()
@@ -124,7 +145,7 @@ def get_queries():
 def is_query_in_db(processed_query):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         # replace spaces in searched_text by % to match any query containing the searched text
 
@@ -145,7 +166,7 @@ def is_query_in_db(processed_query):
 def add_query_to_db(query, name=None):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         if name:
             cursor.execute(
@@ -167,7 +188,7 @@ def add_query_to_db(query, name=None):
 def get_query_id_by_rowid(rowid):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         query = f"SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY ROWID) rn FROM queries) t WHERE rn={rowid}"
         cursor.execute(query)
@@ -186,7 +207,7 @@ def get_query_id_by_rowid(rowid):
 def remove_query_from_db(query_number):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         # Delete items associated with this query using query_id
         cursor.execute("DELETE FROM items WHERE query_id=?", (query_number,))
@@ -203,7 +224,7 @@ def remove_query_from_db(query_number):
 def remove_all_queries_from_db():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         # Delete all items first to maintain foreign key integrity
         cursor.execute("DELETE FROM items")
@@ -231,7 +252,7 @@ def update_query_in_db(query_id, query, name):
     """
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE queries SET query=?, query_name=? WHERE id=?",
@@ -250,7 +271,7 @@ def update_query_in_db(query_id, query, name):
 def add_to_allowlist(country):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("INSERT INTO allowlist VALUES (?)", (country,))
         conn.commit()
@@ -264,7 +285,7 @@ def add_to_allowlist(country):
 def remove_from_allowlist(country):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM allowlist WHERE country=?", (country,))
         conn.commit()
@@ -278,7 +299,7 @@ def remove_from_allowlist(country):
 def get_allowlist():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM allowlist")
         # Get list of countries
@@ -295,7 +316,7 @@ def get_allowlist():
 def clear_allowlist():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM allowlist")
         conn.commit()
@@ -309,7 +330,7 @@ def clear_allowlist():
 def get_parameter(key):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM parameters WHERE key=?", (key,))
         result = cursor.fetchone()
@@ -325,7 +346,7 @@ def set_parameter(key, value):
     """Create or update a configuration parameter."""
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -343,10 +364,35 @@ def set_parameter(key, value):
             conn.close()
 
 
+def set_parameters(values):
+    """Create or update several configuration values atomically."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.executemany(
+            """
+            INSERT INTO parameters (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            [(str(key), str(value)) for key, value in values.items()],
+        )
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
 def get_all_parameters():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT key, value FROM parameters")
         return {row[0]: row[1] for row in cursor.fetchall()}
@@ -361,7 +407,7 @@ def get_all_parameters():
 def get_items(limit=50, query=None):
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         if query:
             # Get the query_id for the given query
@@ -394,7 +440,7 @@ def get_items(limit=50, query=None):
 def get_total_items_count():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM items")
         return cursor.fetchone()[0]
@@ -409,7 +455,7 @@ def get_total_items_count():
 def get_total_queries_count():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM queries")
         return cursor.fetchone()[0]
@@ -424,7 +470,7 @@ def get_total_queries_count():
 def get_last_found_item():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT i.item, i.title, i.price, i.currency, i.timestamp, q.query, i.photo_url FROM items i JOIN queries q ON i.query_id = q.id ORDER BY i.timestamp DESC LIMIT 1"
@@ -441,7 +487,7 @@ def get_last_found_item():
 def get_items_per_day():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
 
         # Get total items
@@ -568,6 +614,16 @@ def migrate_multi_user_schema():
         admin_chat_id = str(row[0]).strip() if row and row[0] is not None else ""
 
         if admin_chat_id:
+            # Exactly one configured administrator is allowed. A previous
+            # administrator remains an approved user but loses admin rights.
+            cursor.execute(
+                """
+                UPDATE telegram_users
+                SET is_admin=0, updated_at=CURRENT_TIMESTAMP
+                WHERE chat_id<>? AND is_admin=1
+                """,
+                (admin_chat_id,),
+            )
             cursor.execute(
                 """
                 INSERT INTO telegram_users
@@ -579,6 +635,14 @@ def migrate_multi_user_schema():
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (admin_chat_id,),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE telegram_users
+                SET is_admin=0, updated_at=CURRENT_TIMESTAMP
+                WHERE is_admin=1
+                """
             )
 
             # Preserve all existing searches by assigning otherwise-unowned
@@ -597,6 +661,123 @@ def migrate_multi_user_schema():
                 (admin_chat_id,),
             )
 
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def migrate_query_uniqueness():
+    """
+    Merge duplicate query rows without losing items or subscriptions, then
+    enforce one shared row per normalised Vinted URL.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            """
+            SELECT query
+            FROM queries
+            GROUP BY query
+            HAVING COUNT(*) > 1
+            """
+        )
+
+        for (query_url,) in cursor.fetchall():
+            cursor.execute(
+                """
+                SELECT id, last_item, query_name
+                FROM queries
+                WHERE query=?
+                ORDER BY id
+                """,
+                (query_url,),
+            )
+            rows = cursor.fetchall()
+            canonical_id = rows[0][0]
+            duplicate_ids = [row[0] for row in rows[1:]]
+            last_items = [row[1] for row in rows if row[1] is not None]
+            query_names = [
+                str(row[2]).strip()
+                for row in rows
+                if row[2] is not None and str(row[2]).strip()
+            ]
+
+            cursor.execute(
+                """
+                UPDATE queries
+                SET last_item=?, query_name=?
+                WHERE id=?
+                """,
+                (
+                    max(last_items) if last_items else None,
+                    query_names[0] if query_names else None,
+                    canonical_id,
+                ),
+            )
+
+            for duplicate_id in duplicate_ids:
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO query_subscriptions
+                        (query_id, chat_id, created_at)
+                    SELECT ?, chat_id, created_at
+                    FROM query_subscriptions
+                    WHERE query_id=?
+                    """,
+                    (canonical_id, duplicate_id),
+                )
+                cursor.execute(
+                    "UPDATE items SET query_id=? WHERE query_id=?",
+                    (canonical_id, duplicate_id),
+                )
+                cursor.execute(
+                    "DELETE FROM query_subscriptions WHERE query_id=?",
+                    (duplicate_id,),
+                )
+                cursor.execute(
+                    "DELETE FROM queries WHERE id=?",
+                    (duplicate_id,),
+                )
+
+        cursor.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_queries_query_unique
+            ON queries (query)
+            """
+        )
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def migrate_fork_identity():
+    """Point installations that still use the upstream URL at this fork."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            """
+            UPDATE parameters
+            SET value='https://github.com/FrancesOkolo/Vinted-Notifications'
+            WHERE key='github_url'
+              AND value='https://github.com/Fuyucch1/Vinted-Notifications'
+            """
+        )
         conn.commit()
         return True
     except Exception:
@@ -848,32 +1029,31 @@ def add_query_to_db(query, name=None, chat_id=None):
         cursor = conn.cursor()
 
         cursor.execute(
-            "SELECT id FROM queries WHERE query=?",
-            (query,),
+            """
+            INSERT INTO queries (query, last_item, query_name)
+            VALUES (?, NULL, ?)
+            ON CONFLICT(query) DO NOTHING
+            """,
+            (query, name),
         )
-        row = cursor.fetchone()
-        query_created = row is None
+        query_created = cursor.rowcount > 0
 
-        if query_created:
+        cursor.execute("SELECT id FROM queries WHERE query=?", (query,))
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            return None, False, False
+
+        query_id = row[0]
+        if not query_created and name:
             cursor.execute(
                 """
-                INSERT INTO queries (query, last_item, query_name)
-                VALUES (?, NULL, ?)
+                UPDATE queries
+                SET query_name=COALESCE(query_name, ?)
+                WHERE id=?
                 """,
-                (query, name),
+                (name, query_id),
             )
-            query_id = cursor.lastrowid
-        else:
-            query_id = row[0]
-            if name:
-                cursor.execute(
-                    """
-                    UPDATE queries
-                    SET query_name=COALESCE(query_name, ?)
-                    WHERE id=?
-                    """,
-                    (name, query_id),
-                )
 
         subscription_created = False
         if chat_id is not None:

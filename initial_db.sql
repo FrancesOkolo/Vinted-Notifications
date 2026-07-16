@@ -11,7 +11,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS queries
 (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    query     TEXT,
+    query     TEXT NOT NULL UNIQUE,
     last_item NUMERIC,
     query_name TEXT
 );
@@ -91,7 +91,7 @@ VALUES ('telegram_enabled', 'False'),
        ('rss_process_running', 'False'),
 
        ('version', '1.0.3'),
-       ('github_url', 'https://github.com/Fuyucch1/Vinted-Notifications'),
+       ('github_url', 'https://github.com/FrancesOkolo/Vinted-Notifications'),
 
        ('items_per_query', '20'),
        ('query_refresh_delay', '60'),

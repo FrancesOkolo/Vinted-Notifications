@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # --- build args / defaults for the runtime user ---
 ARG APP_UID=10001
@@ -19,7 +19,7 @@ RUN groupadd -g ${APP_GID} ${APP_USER} \
 
 # Copy requirements first for better caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 
 # Copy the rest of the application
 COPY . .
@@ -31,6 +31,9 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # Expose ports
 EXPOSE 8000
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()" || exit 1
 
 # Run as root for the entrypoint to adjust ownership if needed,
 # then the entrypoint will drop to ${APP_USER}.

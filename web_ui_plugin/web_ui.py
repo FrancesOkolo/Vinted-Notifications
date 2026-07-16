@@ -1,9 +1,24 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask import (
+    Flask,
+    Response,
+    abort,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 import db
 import core
 import html
+import hmac
+import json
 import os
 import re
+import secrets
+import string
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -22,8 +37,71 @@ app = Flask(
     static_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"),
 )
 
-# Secret key for session management
-app.secret_key = os.urandom(24)
+# A persistent key is mandatory in Docker. Localhost-only development can use
+# an ephemeral key without placing a secret in source control.
+app.secret_key = os.environ.get("VN_SECRET_KEY") or os.urandom(32)
+
+WEB_USERNAME = os.environ.get("VN_WEB_USERNAME", "").strip()
+WEB_PASSWORD = os.environ.get("VN_WEB_PASSWORD", "")
+if bool(WEB_USERNAME) != bool(WEB_PASSWORD):
+    raise RuntimeError(
+        "VN_WEB_USERNAME and VN_WEB_PASSWORD must either both be set or both be empty."
+    )
+
+
+def csrf_token():
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return token
+
+
+def _basic_auth_valid():
+    if not WEB_USERNAME:
+        return True
+    auth = request.authorization
+    return bool(
+        auth
+        and hmac.compare_digest(auth.username or "", WEB_USERNAME)
+        and hmac.compare_digest(auth.password or "", WEB_PASSWORD)
+    )
+
+
+@app.before_request
+def protect_web_interface():
+    if request.path == "/healthz":
+        return None
+
+    if not _basic_auth_valid():
+        return Response(
+            "Authentication required.",
+            401,
+            {"WWW-Authenticate": 'Basic realm="Vinted Notifications"'},
+        )
+
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        supplied = request.form.get("_csrf_token") or request.headers.get(
+            "X-CSRF-Token"
+        )
+        expected = session.get("_csrf_token")
+        if not supplied or not expected or not hmac.compare_digest(
+            supplied,
+            expected,
+        ):
+            abort(400, description="Invalid or missing CSRF token.")
+
+    return None
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    if request.path == "/config":
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.context_processor
@@ -39,7 +117,25 @@ def inject_version_info():
 
 @app.context_processor
 def inject_current_year():
-    return {"current_year": datetime.now().year}
+    return {
+        "current_year": datetime.now().year,
+        "csrf_token": csrf_token,
+    }
+
+
+@app.route("/healthz")
+def healthz():
+    conn = None
+    try:
+        conn = db.get_db_connection()
+        conn.execute("SELECT 1").fetchone()
+        return jsonify({"status": "ok"})
+    except Exception as error:
+        logger.error("Health check failed: %s", error)
+        return jsonify({"status": "error"}), 503
+    finally:
+        if conn:
+            conn.close()
 
 
 def _query_last_found_sort_key(query):
@@ -285,7 +381,10 @@ def update_query(query_id):
 @app.route("/items")
 def items():
     query_id = request.args.get("query", "")  # Default to empty string instead of None
-    limit = int(request.args.get("limit", 50))
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 500))
+    except ValueError:
+        limit = 50
 
     # Get items
     query_string = None
@@ -405,10 +504,51 @@ def _quiet_hours_panel(params):
     """
 
 
+def _validated_int(name, default, minimum, maximum):
+    raw_value = request.form.get(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name.replace('_', ' ').title()} must be a number.") from error
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{name.replace('_', ' ').title()} must be between "
+            f"{minimum} and {maximum}."
+        )
+    return value
+
+
+def _validate_message_template(template):
+    if not template.strip():
+        raise ValueError("The notification message template cannot be empty.")
+
+    allowed = {"title", "price", "brand", "condition", "description", "image"}
+    fields = {
+        field_name
+        for _, field_name, _, _ in string.Formatter().parse(template)
+        if field_name is not None
+    }
+    unknown = fields - allowed
+    if unknown:
+        raise ValueError(
+            "Unsupported notification template variable(s): "
+            + ", ".join(sorted(unknown))
+        )
+
+    template.format(**{field: "test" for field in allowed})
+
+
 @app.route("/config")
 def config():
     params = db.get_all_parameters()
-    rendered = render_template("config.html", params=params)
+    telegram_token_configured = bool(params.get("telegram_token", "").strip())
+    params = dict(params)
+    params["telegram_token"] = ""
+    rendered = render_template(
+        "config.html",
+        params=params,
+        telegram_token_configured=telegram_token_configured,
+    )
 
     if 'id="quiet-hours-settings"' not in rendered and "</form>" in rendered:
         before, closing = rendered.rsplit("</form>", 1)
@@ -447,46 +587,96 @@ def update_config():
         )
         return redirect(url_for("config"))
 
-    # Update Telegram parameters
+    try:
+        items_per_query = _validated_int("items_per_query", 20, 1, 100)
+        query_refresh_delay = _validated_int(
+            "query_refresh_delay",
+            60,
+            30,
+            86400,
+        )
+        rss_port = _validated_int("rss_port", 8080, 1024, 65535)
+        rss_max_items = _validated_int("rss_max_items", 100, 1, 1000)
+
+        telegram_chat_id = request.form.get("telegram_chat_id", "").strip()
+        if telegram_chat_id and not telegram_chat_id.lstrip("-").isdigit():
+            raise ValueError("Telegram Chat ID must be numeric.")
+
+        user_agents = request.form.get("user_agents", "[]").strip() or "[]"
+        parsed_user_agents = json.loads(user_agents)
+        if not isinstance(parsed_user_agents, list) or not all(
+            isinstance(value, str) for value in parsed_user_agents
+        ):
+            raise ValueError("User Agents must be a JSON list of strings.")
+
+        default_headers = (
+            request.form.get("default_headers", "{}").strip() or "{}"
+        )
+        parsed_headers = json.loads(default_headers)
+        if not isinstance(parsed_headers, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in parsed_headers.items()
+        ):
+            raise ValueError("Default Headers must be a JSON object of strings.")
+
+        message_template = request.form.get("message_template", "")
+        _validate_message_template(message_template)
+    except (
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+    ) as error:
+        flash(str(error), "error")
+        return redirect(url_for("config"))
+
+    existing_token = db.get_parameter("telegram_token") or ""
+    submitted_token = request.form.get("telegram_token", "").strip()
+    telegram_token = submitted_token or existing_token
+    if "clear_telegram_token" in request.form:
+        telegram_token = ""
+
     telegram_enabled = "telegram_enabled" in request.form
-    db.set_parameter("telegram_enabled", str(telegram_enabled))
-    db.set_parameter("telegram_token", request.form.get("telegram_token", ""))
-    db.set_parameter("telegram_chat_id", request.form.get("telegram_chat_id", ""))
+    if telegram_enabled and (not telegram_token or not telegram_chat_id):
+        flash(
+            "Telegram cannot be enabled without a bot token and Chat ID.",
+            "error",
+        )
+        return redirect(url_for("config"))
 
-    # Update RSS parameters
-    rss_enabled = "rss_enabled" in request.form
-    db.set_parameter("rss_enabled", str(rss_enabled))
-    db.set_parameter("rss_port", request.form.get("rss_port", "8080"))
-    db.set_parameter("rss_max_items", request.form.get("rss_max_items", "100"))
+    settings = {
+        "telegram_enabled": str(telegram_enabled),
+        "telegram_token": telegram_token,
+        "telegram_chat_id": telegram_chat_id,
+        "rss_enabled": str("rss_enabled" in request.form),
+        "rss_port": rss_port,
+        "rss_max_items": rss_max_items,
+        "items_per_query": items_per_query,
+        "query_refresh_delay": query_refresh_delay,
+        "banwords": request.form.get("banwords", ""),
+        "quiet_hours_enabled": str("quiet_hours_enabled" in request.form),
+        "quiet_hours_start": quiet_start,
+        "quiet_hours_end": quiet_end,
+        "quiet_hours_timezone": quiet_timezone,
+        "check_proxies": str("check_proxies" in request.form),
+        "proxy_list": request.form.get("proxy_list", ""),
+        "proxy_list_link": request.form.get("proxy_list_link", ""),
+        "message_template": message_template,
+        "user_agents": user_agents,
+        "default_headers": default_headers,
+        "last_proxy_check_time": "1",
+    }
 
-    # Update System parameters
-    db.set_parameter("items_per_query", request.form.get("items_per_query", "20"))
-    db.set_parameter(
-        "query_refresh_delay", request.form.get("query_refresh_delay", "60")
-    )
-    db.set_parameter("banwords", request.form.get("banwords", ""))
+    if not db.set_parameters(settings):
+        flash("Configuration could not be saved.", "error")
+        return redirect(url_for("config"))
 
-    # Update quiet-hours parameters
-    quiet_enabled = "quiet_hours_enabled" in request.form
-    db.set_parameter("quiet_hours_enabled", str(quiet_enabled))
-    db.set_parameter("quiet_hours_start", quiet_start)
-    db.set_parameter("quiet_hours_end", quiet_end)
-    db.set_parameter("quiet_hours_timezone", quiet_timezone)
+    if not db.migrate_multi_user_schema():
+        flash("Configuration saved, but administrator rotation failed.", "error")
+        return redirect(url_for("config"))
 
-    # Update Proxy parameters
-    check_proxies = "check_proxies" in request.form
-    db.set_parameter("check_proxies", str(check_proxies))
-    db.set_parameter("proxy_list", request.form.get("proxy_list", ""))
-    db.set_parameter("proxy_list_link", request.form.get("proxy_list_link", ""))
-
-    # Update Advanced parameters
-    db.set_parameter("message_template", request.form.get("message_template", ""))
-    db.set_parameter("user_agents", request.form.get("user_agents", "[]"))
-    db.set_parameter("default_headers", request.form.get("default_headers", "{}"))
-
-    # Reset proxy cache to force refresh on next use
-    db.set_parameter("last_proxy_check_time", "1")
-    logger.info("Proxy settings updated, cache reset")
+    logger.info("Configuration updated; proxy cache reset")
 
     flash("Configuration updated", "success")
     return redirect(url_for("config"))
@@ -620,8 +810,11 @@ def logs():
 
 @app.route("/api/logs")
 def api_logs():
-    offset = int(request.args.get("offset", 0))
-    limit = int(request.args.get("limit", 100))
+    try:
+        offset = max(0, int(request.args.get("offset", 0)))
+        limit = max(1, min(int(request.args.get("limit", 100)), 500))
+    except ValueError:
+        return jsonify({"error": "offset and limit must be integers"}), 400
     level_filter = request.args.get("level", "all")
 
     log_file_path = os.path.join("logs", "vinted.log")
@@ -687,7 +880,12 @@ def api_logs():
 def web_ui_process():
     logger.info("Web UI process started")
     try:
-        app.run(host="0.0.0.0", port=8000, debug=False)
+        from waitress import serve
+
+        host = os.environ.get("VN_WEB_HOST", "127.0.0.1")
+        port = int(os.environ.get("VN_WEB_PORT", "8000"))
+        logger.info("Serving Web UI on %s:%s", host, port)
+        serve(app, host=host, port=port, threads=4)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Web UI process stopped")
     except Exception as e:

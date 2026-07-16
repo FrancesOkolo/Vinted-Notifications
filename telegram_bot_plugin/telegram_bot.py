@@ -4,6 +4,7 @@ from telegram.error import RetryAfter
 import db
 import core
 import asyncio
+from queue import Empty
 from logger import get_logger
 
 # Get logger for this module
@@ -582,14 +583,14 @@ class LeRobot:
         self,
         context: ContextTypes.DEFAULT_TYPE,
     ):
-        try:
-            while True:
-                if self.new_items_queue.empty():
-                    await asyncio.sleep(0.1)
-                    continue
+        while True:
+            try:
+                item = self.new_items_queue.get_nowait()
+            except Empty:
+                await asyncio.sleep(0.1)
+                continue
 
-                item = self.new_items_queue.get()
-
+            try:
                 if len(item) == 6:
                     (
                         content,
@@ -611,11 +612,15 @@ class LeRobot:
                     buy_text,
                     chat_ids=chat_ids,
                 )
-        except Exception as error:
-            logger.error(
-                f"Error checking Telegram queue: {str(error)}",
-                exc_info=True,
-            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error(
+                    "Error processing a Telegram queue item: %s",
+                    error,
+                    exc_info=True,
+                )
+                await asyncio.sleep(1)
 
     async def set_commands(self, context: ContextTypes.DEFAULT_TYPE):
         try:

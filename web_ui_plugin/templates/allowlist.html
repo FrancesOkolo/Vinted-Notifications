@@ -16,6 +16,7 @@
             </div>
             <div class="card-body">
                 <form action="/add_country" method="post">
+                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                     <div class="row">
                         <div class="col-md-10">
                             <div class="form-group">
@@ -59,6 +60,7 @@
                             <td>{{ country }}</td>
                             <td>
                                 <form action="/remove_country/{{ country }}" method="post" class="d-inline">
+                                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                                     <button type="submit" class="btn btn-sm btn-outline-danger">
                                         <i class="bi bi-trash"></i> Remove
                                     </button>
@@ -94,6 +96,7 @@
                                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel
                                     </button>
                                     <form action="/clear_allowlist" method="post" class="d-inline">
+                                        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                                         <button type="submit" class="btn btn-danger">Clear Allowlist</button>
                                     </form>
                                 </div>

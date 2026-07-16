@@ -16,6 +16,7 @@
             </div>
             <div class="card-body">
                 <form action="/update_config" method="post">
+                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                     <div class="row mb-4">
                         <div class="col-md-12">
                             <div class="card h-100">
@@ -96,9 +97,19 @@
                                     </div>
                                     <div class="mb-3">
                                         <label for="telegram_token" class="form-label">Bot Token</label>
-                                        <input type="text" class="form-control" id="telegram_token"
-                                               name="telegram_token" value="{{ params.telegram_token }}">
-                                        <small class="form-text text-muted">Get this from BotFather</small>
+                                        <input type="password" class="form-control" id="telegram_token"
+                                               name="telegram_token" value="" autocomplete="new-password"
+                                               placeholder="{% if telegram_token_configured %}Configured — leave blank to keep{% else %}Paste BotFather token{% endif %}">
+                                        <small class="form-text text-muted">The stored token is never displayed. Leave blank to keep it.</small>
+                                        {% if telegram_token_configured %}
+                                        <div class="form-check mt-2">
+                                            <input class="form-check-input" type="checkbox"
+                                                   id="clear_telegram_token" name="clear_telegram_token">
+                                            <label class="form-check-label" for="clear_telegram_token">
+                                                Clear stored bot token
+                                            </label>
+                                        </div>
+                                        {% endif %}
                                     </div>
                                     <div class="mb-3">
                                         <label for="telegram_chat_id" class="form-label">Chat ID</label>
@@ -322,7 +333,8 @@
                 fetch(`/control/${process}/${action}`, {
                     method: 'POST',
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'X-CSRF-Token': '{{ csrf_token() }}'
                     }
                 })
                     .then(response => response.json())

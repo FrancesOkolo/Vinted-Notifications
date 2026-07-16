@@ -16,6 +16,7 @@
             </div>
             <div class="card-body">
                 <form action="/add_query" method="post">
+                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                     <div class="row g-3">
 
                         <!-- Vinted URL (required) -->
@@ -108,6 +109,7 @@
                                                         aria-label="Close"></button>
                                             </div>
                                             <form action="/update_query/{{ query.query_id }}" method="post">
+                                                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                                                 <div class="modal-body">
                                                     <div class="mb-3">
                                                         <label for="query{{ query.id }}" class="form-label">Vinted
@@ -166,6 +168,7 @@
                                                 </button>
                                                 <form action="/remove_query/{{ query.query_id }}" method="post"
                                                       class="d-inline">
+                                                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                                                     <button type="submit" class="btn btn-danger">Remove</button>
                                                 </form>
                                             </div>
@@ -206,6 +209,7 @@
                             <div class="modal-footer">
                                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                                 <form action="/remove_query/all" method="post" class="d-inline">
+                                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                                     <button type="submit" class="btn btn-danger">Remove All</button>
                                 </form>
                             </div>
