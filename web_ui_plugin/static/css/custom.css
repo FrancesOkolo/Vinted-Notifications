@@ -63,6 +63,7 @@ body {
 /* Add some padding to the main content area */
 main {
     padding-bottom: 2rem;
+    min-width: 0;
 }
 
 /* Vinted-style card styles */
@@ -82,6 +83,90 @@ main {
 
 .card:hover {
     box-shadow: var(--shadow-sm);
+}
+
+/* Compact, scannable dashboard layout */
+.dashboard-stat-card .card-body {
+    min-height: 12rem;
+}
+
+.dashboard-stat-card .stat-icon {
+    font-size: 2rem;
+    margin-bottom: 0.75rem;
+}
+
+.dashboard-stat-card .stat-value {
+    font-size: clamp(2rem, 3vw, 3.25rem);
+    line-height: 1.05;
+}
+
+.dashboard-stat-card .stat-description {
+    margin-bottom: 0;
+}
+
+.dashboard-section-header {
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.dashboard-section,
+.dashboard-section .card-body,
+.dashboard-section .table-responsive {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.dashboard-section-actions {
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.dashboard-section-actions .btn,
+.dashboard-section-actions .btn-group,
+.dashboard-collapse-toggle {
+    margin: 0;
+}
+
+.dashboard-collapse-toggle {
+    align-items: center;
+    display: inline-flex;
+    justify-content: center;
+    min-height: 2.25rem;
+    min-width: 2.25rem;
+    padding-left: 0.6rem;
+    padding-right: 0.6rem;
+}
+
+time[data-relative-time] {
+    cursor: help;
+    text-decoration: underline dotted rgba(108, 117, 125, 0.6);
+    text-underline-offset: 0.15em;
+}
+
+[data-query-row][hidden],
+#queryNoResultsRow[hidden],
+[id$="Content"][hidden] {
+    display: none !important;
+}
+
+.query-table-toolbar {
+    align-items: center;
+    display: flex;
+    gap: 1rem;
+    justify-content: space-between;
+}
+
+.query-search-group {
+    max-width: 24rem;
+}
+
+.query-results-count {
+    flex: 0 0 auto;
+}
+
+.query-pagination .btn {
+    margin: 0;
 }
 
 /* Vinted-style product cards */
@@ -371,5 +456,93 @@ main {
 
     .table-sort-button {
         min-height: 3rem;
+    }
+
+    .dashboard-stats .card {
+        margin-bottom: 0;
+    }
+
+    .dashboard-stat-card .card-body {
+        min-height: 9rem;
+        padding: 0.75rem 0.5rem;
+    }
+
+    .dashboard-stat-card .stat-icon {
+        font-size: 1.5rem;
+        margin-bottom: 0.35rem;
+    }
+
+    .dashboard-stat-card .stat-label {
+        font-size: 0.95rem;
+        margin-bottom: 0.25rem;
+    }
+
+    .dashboard-stat-card .stat-value {
+        font-size: 1.8rem;
+        margin-bottom: 0.25rem;
+    }
+
+    .dashboard-stat-card .stat-description {
+        font-size: 0.75rem;
+        line-height: 1.2;
+    }
+
+    .dashboard-last-item .img-thumbnail {
+        height: 38px !important;
+        width: 38px !important;
+    }
+
+    .dashboard-last-item h6 {
+        font-size: 0.8rem;
+        max-width: 110px !important;
+    }
+
+    .dashboard-last-item small {
+        font-size: 0.7rem;
+    }
+
+    .dashboard-last-item .btn {
+        font-size: 0.7rem;
+        margin: 0;
+        padding: 0.2rem 0.4rem;
+    }
+
+    .dashboard-section-actions {
+        justify-content: flex-start;
+        width: 100%;
+    }
+
+    .query-table-toolbar {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+
+    .query-search-group {
+        max-width: none;
+    }
+
+    .query-pagination {
+        gap: 0.5rem;
+    }
+}
+
+@media (max-width: 420px) {
+    .dashboard-stat-card .stat-description {
+        display: none;
+    }
+
+    .dashboard-stat-card .card-body {
+        min-height: 7.25rem;
+    }
+
+    #cardView .card-img-top {
+        height: 120px !important;
+    }
+
+    .query-pagination .btn {
+        font-size: 0.75rem;
+        padding-left: 0.5rem;
+        padding-right: 0.5rem;
     }
 }

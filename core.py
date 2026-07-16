@@ -21,6 +21,17 @@ _VERSION_CACHE = None
 _VERSION_CACHE_TIME = 0.0
 _VERSION_CACHE_TTL_SECONDS = 6 * 60 * 60
 _VERSION_CACHE_LOCK = threading.Lock()
+_ITEM_PAGE_REQUEST_TIMEOUT = (5, 10)
+_ITEM_PAGE_NAVIGATION_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 def process_query(query, name=None, chat_id=None):
@@ -575,11 +586,31 @@ def _get_item_description(item):
     if description:
         return str(description).strip()
 
+    item_url = urlparse(str(getattr(item, "url", "")))
+    item_id = str(getattr(item, "id", ""))
+    if item_url.scheme not in ("http", "https") or not item_url.netloc or not item_id.isdigit():
+        logger.warning("Could not build a safe detail URL for Vinted item %r", item_id)
+        return None
+
+    origin = f"{item_url.scheme}://{item_url.netloc}"
+    detail_url = f"{origin}/items/{item_id}"
+    navigation_headers = {
+        **_ITEM_PAGE_NAVIGATION_HEADERS,
+        "Referer": f"{origin}/",
+    }
+
     try:
         # Reuse the catalogue session and its current proxy/cookies, but make
-        # only one page request. Description enrichment must never amplify a
-        # Vinted rate limit or delay the notification through automatic retries.
-        with requester.session.get(item.url, timeout=20) as response:
+        # only one browser-style page request. Vinted rejects API-style page
+        # requests with 403, while a normal same-origin navigation exposes the
+        # product description in JSON-LD. Never retry here: enrichment must not
+        # amplify rate limits or hold up a notification indefinitely.
+        with requester.session.get(
+            detail_url,
+            headers=navigation_headers,
+            timeout=_ITEM_PAGE_REQUEST_TIMEOUT,
+            allow_redirects=True,
+        ) as response:
             response.raise_for_status()
             return _description_from_item_page(response.text)
     except requests.exceptions.RequestException as error:

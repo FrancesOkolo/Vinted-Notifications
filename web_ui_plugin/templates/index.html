@@ -8,52 +8,52 @@
 </div>
 
 <!-- Statistics Section -->
-<div class="row mb-4">
-    <div class="col-md-3">
-        <div class="card h-100 border-0 shadow-sm">
-            <div class="card-body text-center">
-                <div class="d-flex align-items-center justify-content-center mb-3">
-                    <i class="bi bi-box-seam text-primary" style="font-size: 2rem;"></i>
+<div class="row g-3 mb-4 dashboard-stats">
+    <div class="col-6 col-md-3">
+        <div class="card h-100 border-0 shadow-sm dashboard-stat-card">
+            <div class="card-body text-center d-flex flex-column justify-content-center">
+                <div class="d-flex align-items-center justify-content-center stat-icon">
+                    <i class="bi bi-box-seam text-primary"></i>
                 </div>
-                <h5 class="card-title">Total Items</h5>
-                <h2 class="display-4 fw-bold text-primary">{{ stats.total_items }}</h2>
-                <p class="card-text text-muted">Items grabbed for monitored queries so far</p>
+                <h5 class="card-title stat-label">Total Items</h5>
+                <h2 class="fw-bold text-primary stat-value">{{ stats.total_items }}</h2>
+                <p class="card-text text-muted stat-description">Items grabbed for monitored queries so far</p>
             </div>
         </div>
     </div>
-    <div class="col-md-3">
-        <div class="card h-100 border-0 shadow-sm">
-            <div class="card-body text-center">
-                <div class="d-flex align-items-center justify-content-center mb-3">
-                    <i class="bi bi-search text-success" style="font-size: 2rem;"></i>
+    <div class="col-6 col-md-3">
+        <div class="card h-100 border-0 shadow-sm dashboard-stat-card">
+            <div class="card-body text-center d-flex flex-column justify-content-center">
+                <div class="d-flex align-items-center justify-content-center stat-icon">
+                    <i class="bi bi-search text-success"></i>
                 </div>
-                <h5 class="card-title">Active Queries</h5>
-                <h2 class="display-4 fw-bold text-success">{{ stats.total_queries }}</h2>
-                <p class="card-text text-muted">Queries being monitored</p>
+                <h5 class="card-title stat-label">Active Queries</h5>
+                <h2 class="fw-bold text-success stat-value">{{ stats.total_queries }}</h2>
+                <p class="card-text text-muted stat-description">Queries being monitored</p>
             </div>
         </div>
     </div>
-    <div class="col-md-3">
-        <div class="card h-100 border-0 shadow-sm">
-            <div class="card-body text-center">
-                <div class="d-flex align-items-center justify-content-center mb-3">
-                    <i class="bi bi-bar-chart-fill text-warning" style="font-size: 2rem;"></i>
+    <div class="col-6 col-md-3">
+        <div class="card h-100 border-0 shadow-sm dashboard-stat-card">
+            <div class="card-body text-center d-flex flex-column justify-content-center">
+                <div class="d-flex align-items-center justify-content-center stat-icon">
+                    <i class="bi bi-bar-chart-fill text-warning"></i>
                 </div>
-                <h5 class="card-title">Items per Day</h5>
-                <h2 class="display-4 fw-bold text-warning">{{ stats.items_per_day }}</h2>
-                <p class="card-text text-muted">Average items found daily</p>
+                <h5 class="card-title stat-label">Items per Day</h5>
+                <h2 class="fw-bold text-warning stat-value">{{ stats.items_per_day }}</h2>
+                <p class="card-text text-muted stat-description">Average items found daily</p>
             </div>
         </div>
     </div>
-    <div class="col-md-3">
-        <div class="card h-100 border-0 shadow-sm">
-            <div class="card-body text-center">
-                <div class="d-flex align-items-center justify-content-center mb-3">
-                    <i class="bi bi-clock-history text-info" style="font-size: 2rem;"></i>
+    <div class="col-6 col-md-3">
+        <div class="card h-100 border-0 shadow-sm dashboard-stat-card">
+            <div class="card-body text-center d-flex flex-column justify-content-center">
+                <div class="d-flex align-items-center justify-content-center stat-icon">
+                    <i class="bi bi-clock-history text-info"></i>
                 </div>
-                <h5 class="card-title">Last Found Item</h5>
+                <h5 class="card-title stat-label">Last Found Item</h5>
                 {% if stats.last_item %}
-                <div class="d-flex align-items-center justify-content-center">
+                <div class="d-flex align-items-center justify-content-center dashboard-last-item">
                     {% if stats.last_item.photo_url %}
                     <img src="{{ stats.last_item.photo_url }}" alt="{{ stats.last_item.title }}"
                          class="img-thumbnail me-2" style="width: 50px; height: 50px; object-fit: cover;">
@@ -70,7 +70,13 @@
                                 {{ stats.last_item.title }}
                             </a>
                         </h6>
-                        <small class="text-muted">{{ stats.last_item.timestamp }}</small>
+                        <small class="text-muted">
+                            <time datetime="{{ stats.last_item.timestamp_iso }}"
+                                  data-relative-time="{{ stats.last_item.timestamp_raw }}"
+                                  title="{{ stats.last_item.timestamp }}">
+                                {{ stats.last_item.timestamp }}
+                            </time>
+                        </small>
                         <div class="mt-1">
                             <a href="{{ stats.last_item.url }}" target="_blank"
                                class="btn btn-sm btn-outline-info">
@@ -89,12 +95,20 @@
 
 <div class="row mb-4">
     <div class="col-md-12">
-        <div class="card">
-            <div class="card-header d-flex align-items-center">
-                <i class="bi bi-speedometer2 me-2 text-info"></i>
-                <h5 class="card-title mb-0">Process Status</h5>
+        <div class="card dashboard-section">
+            <div class="card-header d-flex align-items-center justify-content-between dashboard-section-header">
+                <div class="d-flex align-items-center">
+                    <i class="bi bi-speedometer2 me-2 text-info"></i>
+                    <h5 class="card-title mb-0">Process Status</h5>
+                </div>
+                <button type="button" class="btn btn-sm btn-outline-secondary dashboard-collapse-toggle"
+                        data-collapse-target="processStatusContent" data-section-label="Process Status"
+                        aria-expanded="true" aria-controls="processStatusContent" title="Collapse Process Status">
+                    <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                    <span class="visually-hidden">Collapse Process Status</span>
+                </button>
             </div>
-            <div class="card-body">
+            <div class="card-body" id="processStatusContent">
                 <div class="row">
                     <div class="col-md-6">
                         <div class="d-flex justify-content-between align-items-center mb-3">
@@ -152,10 +166,10 @@
 </div>
 
 <div class="row">
-    <div class="col-md-6">
-        <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <div class="d-flex align-items-center">
+    <div class="col-md-6 order-2 order-md-1">
+        <div class="card dashboard-section">
+            <div class="card-header d-flex justify-content-between align-items-center dashboard-section-header">
+                <div class="d-flex align-items-center dashboard-section-actions">
                     <i class="bi bi-box me-2 text-info"></i>
                     <h5 class="card-title mb-0">Recent Items</h5>
                 </div>
@@ -169,13 +183,19 @@
                         </button>
                     </div>
                     <a href="/items" class="btn btn-sm btn-outline-primary">View All</a>
+                    <button type="button" class="btn btn-sm btn-outline-secondary dashboard-collapse-toggle"
+                            data-collapse-target="recentItemsContent" data-section-label="Recent Items"
+                            aria-expanded="true" aria-controls="recentItemsContent" title="Collapse Recent Items">
+                        <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                        <span class="visually-hidden">Collapse Recent Items</span>
+                    </button>
                 </div>
             </div>
-            <div class="card-body">
+            <div class="card-body" id="recentItemsContent">
                 <!-- Card View -->
                 <div class="row" id="cardView">
                     {% for item in items %}
-                    <div class="col-md-4 col-lg-3 mb-3">
+                    <div class="col-6 col-md-6 col-xl-4 mb-3">
                         <div class="card h-100">
                             {% if item.photo_url %}
                             <img src="{{ item.photo_url }}" class="card-img-top" alt="{{ item.title }}"
@@ -191,7 +211,10 @@
                                     <strong>{{ item.title }}</strong></h6>
                                 <p class="card-text small mb-1">
                                     Price: {{ item.price }} {{ item.currency }}<br>
-                                    Date: {{ item.timestamp }}
+                                    Date:
+                                    <time datetime="{{ item.timestamp_iso }}"
+                                          data-relative-time="{{ item.timestamp_raw }}"
+                                          title="{{ item.timestamp }}">{{ item.timestamp }}</time>
                                 </p>
                             </div>
                             <div class="card-footer bg-white p-2">
@@ -237,7 +260,11 @@
                             </td>
                             <td>{{ item.title }}</td>
                             <td>{{ item.price }} {{ item.currency }}</td>
-                            <td>{{ item.timestamp }}</td>
+                            <td>
+                                <time datetime="{{ item.timestamp_iso }}"
+                                      data-relative-time="{{ item.timestamp_raw }}"
+                                      title="{{ item.timestamp }}">{{ item.timestamp }}</time>
+                            </td>
                             <td>
                                 <a href="{{ item.url }}" target="_blank"
                                    class="btn btn-sm btn-outline-primary">
@@ -256,16 +283,38 @@
             </div>
         </div>
     </div>
-    <div class="col-md-6">
-        <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
+    <div class="col-md-6 order-1 order-md-2">
+        <div class="card dashboard-section">
+            <div class="card-header d-flex justify-content-between align-items-center dashboard-section-header">
                 <div class="d-flex align-items-center">
                     <i class="bi bi-search me-2 text-info"></i>
                     <h5 class="card-title mb-0">Queries</h5>
                 </div>
-                <a href="/queries" class="btn btn-sm btn-outline-primary">Manage</a>
+                <div class="d-flex align-items-center dashboard-section-actions">
+                    <a href="/queries" class="btn btn-sm btn-outline-primary">Manage</a>
+                    <button type="button" class="btn btn-sm btn-outline-secondary dashboard-collapse-toggle"
+                            data-collapse-target="queriesContent" data-section-label="Queries"
+                            aria-expanded="true" aria-controls="queriesContent" title="Collapse Queries">
+                        <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                        <span class="visually-hidden">Collapse Queries</span>
+                    </button>
+                </div>
             </div>
-            <div class="card-body p-0">
+            <div class="card-body p-0" id="queriesContent">
+                <div class="query-table-toolbar p-3 border-bottom">
+                    <div class="input-group input-group-sm query-search-group">
+                        <span class="input-group-text" aria-hidden="true"><i class="bi bi-search"></i></span>
+                        <label class="visually-hidden" for="querySearchInput">Search queries</label>
+                        <input type="search" class="form-control" id="querySearchInput"
+                               placeholder="Search {{ queries|length }} queries" autocomplete="off"
+                               aria-controls="dashboardQueriesTable">
+                        <button type="button" class="btn btn-outline-secondary" id="clearQuerySearch"
+                                title="Clear query search" aria-label="Clear query search" hidden>
+                            <i class="bi bi-x-lg" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                    <small class="text-muted query-results-count" id="queryResultsCount" aria-live="polite"></small>
+                </div>
                 <div class="table-responsive">
                     <table class="table table-hover mb-0 sortable-query-table" id="dashboardQueriesTable">
                         <caption class="visually-hidden">
@@ -298,15 +347,32 @@
                             data-last-found="{{ query.last_found_timestamp if query.last_found_timestamp is not none else '' }}">
                             <td data-row-number>{{ query.id }}</td>
                             <td>{{ query.display }}</td>
-                            <td class="last-found-cell">{{ query.last_found_item }}</td>
-                        </tr>
-                        {% else %}
-                        <tr>
-                            <td colspan="3" class="text-center">No queries found</td>
+                            <td class="last-found-cell">
+                                {% if query.last_found_timestamp is not none %}
+                                <time datetime="{{ query.last_found_item|replace(' ', 'T') }}"
+                                      data-relative-time="{{ query.last_found_timestamp }}"
+                                      title="{{ query.last_found_item }}">{{ query.last_found_item }}</time>
+                                {% else %}
+                                Never
+                                {% endif %}
+                            </td>
                         </tr>
                         {% endfor %}
+                        <tr id="queryNoResultsRow" {% if queries %}hidden{% endif %}>
+                            <td colspan="3" class="text-center">No queries found</td>
+                        </tr>
                         </tbody>
                     </table>
+                </div>
+                <div class="query-pagination d-flex align-items-center justify-content-between p-3 border-top"
+                     id="queryPagination" aria-label="Query table pagination">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="queryPreviousPage">
+                        <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous
+                    </button>
+                    <span class="small text-muted" id="queryPageStatus" aria-live="polite"></span>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="queryNextPage">
+                        Next <i class="bi bi-chevron-right" aria-hidden="true"></i>
+                    </button>
                 </div>
                 <span class="visually-hidden" id="querySortStatus" aria-live="polite"></span>
             </div>
@@ -435,12 +501,83 @@
             setActiveView('list');
         });
 
-        // Sort the dashboard query table without a page reload.
+        // Human-friendly relative times retain the exact local time in a tooltip.
+        const relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, {numeric: 'auto'});
+
+        function relativeTimeFromTimestamp(timestamp) {
+            const seconds = Math.round((Number(timestamp) * 1000 - Date.now()) / 1000);
+            const absoluteSeconds = Math.abs(seconds);
+
+            if (absoluteSeconds < 60) {
+                return relativeTimeFormatter.format(seconds, 'second');
+            }
+            if (absoluteSeconds < 3600) {
+                return relativeTimeFormatter.format(Math.round(seconds / 60), 'minute');
+            }
+            if (absoluteSeconds < 86400) {
+                return relativeTimeFormatter.format(Math.round(seconds / 3600), 'hour');
+            }
+            if (absoluteSeconds < 2592000) {
+                return relativeTimeFormatter.format(Math.round(seconds / 86400), 'day');
+            }
+            if (absoluteSeconds < 31536000) {
+                return relativeTimeFormatter.format(Math.round(seconds / 2592000), 'month');
+            }
+            return relativeTimeFormatter.format(Math.round(seconds / 31536000), 'year');
+        }
+
+        function updateRelativeTimes() {
+            document.querySelectorAll('[data-relative-time]').forEach(timeElement => {
+                timeElement.textContent = relativeTimeFromTimestamp(timeElement.dataset.relativeTime);
+            });
+        }
+
+        updateRelativeTimes();
+        window.setInterval(updateRelativeTimes, 60000);
+
+        // Collapsible dashboard sections remember their state on this device.
+        document.querySelectorAll('.dashboard-collapse-toggle').forEach(button => {
+            const target = document.getElementById(button.dataset.collapseTarget);
+            const storageKey = `vintedDashboardSection:${button.dataset.collapseTarget}`;
+
+            function setCollapsed(collapsed) {
+                const action = collapsed ? 'Expand' : 'Collapse';
+                const icon = button.querySelector('i');
+                const accessibleLabel = button.querySelector('.visually-hidden');
+
+                target.hidden = collapsed;
+                button.setAttribute('aria-expanded', String(!collapsed));
+                button.title = `${action} ${button.dataset.sectionLabel}`;
+                icon.className = `bi ${collapsed ? 'bi-chevron-down' : 'bi-chevron-up'}`;
+                accessibleLabel.textContent = `${action} ${button.dataset.sectionLabel}`;
+            }
+
+            setCollapsed(localStorage.getItem(storageKey) === 'collapsed');
+            button.addEventListener('click', function () {
+                const collapsed = button.getAttribute('aria-expanded') === 'true';
+                setCollapsed(collapsed);
+                localStorage.setItem(storageKey, collapsed ? 'collapsed' : 'expanded');
+            });
+        });
+
+        // Sort, search, and paginate the dashboard query table without a page reload.
         const queryTable = document.getElementById('dashboardQueriesTable');
         if (queryTable) {
             const queryTableBody = queryTable.querySelector('tbody');
             const sortHeaders = Array.from(queryTable.querySelectorAll('[data-sort-header]'));
             const sortStatus = document.getElementById('querySortStatus');
+            const queryRows = Array.from(queryTableBody.querySelectorAll('[data-query-row]'));
+            const noResultsRow = document.getElementById('queryNoResultsRow');
+            const searchInput = document.getElementById('querySearchInput');
+            const clearSearchButton = document.getElementById('clearQuerySearch');
+            const resultsCount = document.getElementById('queryResultsCount');
+            const previousPageButton = document.getElementById('queryPreviousPage');
+            const nextPageButton = document.getElementById('queryNextPage');
+            const pageStatus = document.getElementById('queryPageStatus');
+            const pageSize = 10;
+            let activeSortKey = 'lastFound';
+            let activeSortDirection = 'descending';
+            let currentPage = 1;
 
             function compareQueryRows(leftRow, rightRow, sortKey, direction) {
                 let comparison = 0;
@@ -471,15 +608,7 @@
                 return direction === 'ascending' ? comparison : -comparison;
             }
 
-            function sortQueryTable(sortKey, direction) {
-                const rows = Array.from(queryTableBody.querySelectorAll('[data-query-row]'));
-                rows.sort((leftRow, rightRow) => compareQueryRows(leftRow, rightRow, sortKey, direction));
-
-                rows.forEach((row, index) => {
-                    row.querySelector('[data-row-number]').textContent = index + 1;
-                    queryTableBody.appendChild(row);
-                });
-
+            function updateSortHeaders(sortKey, direction) {
                 sortHeaders.forEach(header => {
                     const button = header.querySelector('.table-sort-button');
                     const indicator = header.querySelector('.sort-indicator');
@@ -502,6 +631,59 @@
                         button.setAttribute('aria-label', `Sort by ${label} ascending`);
                     }
                 });
+            }
+
+            function renderQueryTable() {
+                const searchTerm = searchInput.value.trim().toLocaleLowerCase();
+                const orderedRows = queryRows.slice().sort((leftRow, rightRow) =>
+                    compareQueryRows(leftRow, rightRow, activeSortKey, activeSortDirection)
+                );
+                const matchingRows = orderedRows.filter(row =>
+                    row.dataset.query.toLocaleLowerCase().includes(searchTerm)
+                );
+                const pageCount = Math.max(1, Math.ceil(matchingRows.length / pageSize));
+                currentPage = Math.min(currentPage, pageCount);
+                const firstResultIndex = (currentPage - 1) * pageSize;
+                const pageRows = matchingRows.slice(firstResultIndex, firstResultIndex + pageSize);
+
+                queryRows.forEach(row => {
+                    row.hidden = true;
+                });
+                orderedRows.forEach(row => queryTableBody.appendChild(row));
+                queryTableBody.appendChild(noResultsRow);
+
+                matchingRows.forEach((row, index) => {
+                    row.querySelector('[data-row-number]').textContent = index + 1;
+                });
+                pageRows.forEach(row => {
+                    row.hidden = false;
+                });
+
+                noResultsRow.hidden = matchingRows.length !== 0;
+                clearSearchButton.hidden = searchInput.value.length === 0;
+                previousPageButton.disabled = currentPage <= 1 || matchingRows.length === 0;
+                nextPageButton.disabled = currentPage >= pageCount || matchingRows.length === 0;
+                pageStatus.textContent = `Page ${currentPage} of ${pageCount}`;
+
+                if (matchingRows.length === 0) {
+                    resultsCount.textContent = searchTerm
+                        ? `No queries match "${searchInput.value.trim()}"`
+                        : 'No queries found';
+                } else {
+                    const firstNumber = firstResultIndex + 1;
+                    const lastNumber = firstResultIndex + pageRows.length;
+                    resultsCount.textContent = searchTerm
+                        ? `Showing ${firstNumber}\u2013${lastNumber} of ${matchingRows.length} matches`
+                        : `Showing ${firstNumber}\u2013${lastNumber} of ${matchingRows.length} queries`;
+                }
+            }
+
+            function sortQueryTable(sortKey, direction) {
+                activeSortKey = sortKey;
+                activeSortDirection = direction;
+                currentPage = 1;
+                updateSortHeaders(sortKey, direction);
+                renderQueryTable();
 
                 if (sortStatus) {
                     const activeButton = queryTable.querySelector(`[data-sort-key="${sortKey}"]`);
@@ -517,6 +699,35 @@
                     sortQueryTable(this.dataset.sortKey, nextDirection);
                 });
             });
+
+            searchInput.addEventListener('input', function () {
+                currentPage = 1;
+                renderQueryTable();
+            });
+
+            clearSearchButton.addEventListener('click', function () {
+                searchInput.value = '';
+                currentPage = 1;
+                renderQueryTable();
+                searchInput.focus();
+            });
+
+            previousPageButton.addEventListener('click', function () {
+                if (currentPage > 1) {
+                    currentPage -= 1;
+                    renderQueryTable();
+                    queryTable.scrollIntoView({block: 'nearest'});
+                }
+            });
+
+            nextPageButton.addEventListener('click', function () {
+                currentPage += 1;
+                renderQueryTable();
+                queryTable.scrollIntoView({block: 'nearest'});
+            });
+
+            updateSortHeaders(activeSortKey, activeSortDirection);
+            renderQueryTable();
         }
     });
 </script>

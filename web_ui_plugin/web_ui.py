@@ -211,18 +211,20 @@ def index():
             }
         )
 
-    # Get recent items
-    items = db.get_items(limit=10)
+    # Keep the dashboard concise; the Items page remains the full browsing view.
+    items = db.get_items(limit=5)
     formatted_items = []
     for item in items:
+        item_timestamp = float(item[4])
+        item_datetime = datetime.fromtimestamp(item_timestamp)
         formatted_items.append(
             {
                 "title": item[1],
                 "price": item[2],
                 "currency": item[3],
-                "timestamp": datetime.fromtimestamp(item[4]).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
+                "timestamp": item_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp_iso": item_datetime.astimezone().isoformat(),
+                "timestamp_raw": item_timestamp,
                 "query": item[5],
                 "photo_url": item[6],
                 "url": f"{urlparse(item[5]).scheme}://{urlparse(item[5]).netloc}/items/{item[0]}",
@@ -243,13 +245,15 @@ def index():
     # Get the last found item
     last_item = db.get_last_found_item()
     if last_item:
+        last_item_timestamp = float(last_item[4])
+        last_item_datetime = datetime.fromtimestamp(last_item_timestamp)
         stats["last_item"] = {
             "title": last_item[1],
             "price": last_item[2],
             "currency": last_item[3],
-            "timestamp": datetime.fromtimestamp(last_item[4]).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
+            "timestamp": last_item_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_iso": last_item_datetime.astimezone().isoformat(),
+            "timestamp_raw": last_item_timestamp,
             "query": last_item[5],
             "photo_url": last_item[6],
             "url": f"{urlparse(last_item[5]).scheme}://{urlparse(last_item[5]).netloc}/items/{last_item[0]}"

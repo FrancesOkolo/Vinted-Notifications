@@ -193,6 +193,47 @@ def test_rss_dispatches_when_no_telegram_subscribers(database, monkeypatch):
     assert dispatched[5] == []
 
 
+def test_item_description_uses_browser_navigation_headers(database, monkeypatch):
+    core = _core()
+    calls = []
+
+    class Response:
+        text = """
+        <script type="application/ld+json">
+        {"@type": "Product", "description": "A detailed Vinted listing"}
+        </script>
+        """
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    class Item:
+        id = 12345
+        url = "https://www.vinted.co.uk/items/12345-example"
+        description = None
+
+    monkeypatch.setattr(core.requester.session, "get", fake_get)
+
+    assert core._get_item_description(Item()) == "A detailed Vinted listing"
+    assert len(calls) == 1
+    assert calls[0][0] == "https://www.vinted.co.uk/items/12345"
+    assert calls[0][1]["timeout"] == (5, 10)
+    assert calls[0][1]["allow_redirects"] is True
+    assert calls[0][1]["headers"]["Sec-Fetch-Dest"] == "document"
+    assert calls[0][1]["headers"]["Sec-Fetch-Mode"] == "navigate"
+    assert calls[0][1]["headers"]["Referer"] == "https://www.vinted.co.uk/"
+
+
 def test_version_check_is_cached_and_has_a_timeout(database, monkeypatch):
     core = _core()
     values = {
@@ -282,5 +323,22 @@ def test_dashboard_query_table_has_accessible_sort_controls():
     assert 'aria-sort="descending"' in template
     assert 'id="querySortStatus" aria-live="polite"' in template
     assert "localeCompare" in template
-    assert "rows.sort" in template
+    assert "queryRows.slice().sort" in template
     assert 'shown as "Never"' in template
+
+
+def test_dashboard_has_search_pagination_relative_times_and_collapsible_sections():
+    template = (ROOT / "web_ui_plugin" / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    web_source = (ROOT / "web_ui_plugin" / "web_ui.py").read_text(encoding="utf-8")
+
+    assert 'id="querySearchInput"' in template
+    assert 'id="queryPreviousPage"' in template
+    assert 'id="queryNextPage"' in template
+    assert "const pageSize = 10" in template
+    assert 'class="btn btn-sm btn-outline-secondary dashboard-collapse-toggle"' in template
+    assert "vintedDashboardSection:" in template
+    assert "data-relative-time" in template
+    assert "Intl.RelativeTimeFormat" in template
+    assert "items = db.get_items(limit=5)" in web_source
