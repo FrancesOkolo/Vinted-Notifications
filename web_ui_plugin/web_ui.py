@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import re
+import requests
 import secrets
 import string
 from urllib.parse import urlparse, parse_qs
@@ -272,10 +273,80 @@ def index():
     )
 
 
+_CURRENCY_SYMBOLS = {"GBP": "£", "EUR": "€", "USD": "$"}
+
+_VINTED_COUNTRY = {
+    "co.uk": "UK", "fr": "FR", "de": "DE", "com": "COM", "it": "IT",
+    "es": "ES", "nl": "NL", "be": "BE", "pl": "PL", "at": "AT",
+    "lt": "LT", "cz": "CZ", "pt": "PT", "lu": "LU", "sk": "SK",
+    "ie": "IE", "se": "SE", "ro": "RO", "hu": "HU", "fi": "FI",
+    "dk": "DK", "gr": "GR", "hr": "HR", "us": "US", "ca": "CA",
+}
+
+
+def _summarise_query_filters(url):
+    """Return short, human-readable chips describing a query's filters.
+
+    Numeric IDs (brands, sizes, categories) can't be resolved to names without
+    a lookup Vinted blocks, so those are summarised as counts. Price range and
+    the Vinted country are shown directly.
+    """
+    chips = []
+    try:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+    except (ValueError, TypeError):
+        return chips
+
+    host = (parsed.netloc or "").lower()
+    marker = "vinted."
+    if marker in host:
+        suffix = host.split(marker, 1)[1]
+        chips.append(_VINTED_COUNTRY.get(suffix, suffix.upper()))
+
+    currency = (params.get("currency", [""])[0] or "").upper()
+    symbol = _CURRENCY_SYMBOLS.get(currency, (currency + " ") if currency else "")
+    price_from = params.get("price_from", [None])[0]
+    price_to = params.get("price_to", [None])[0]
+    if price_from and price_to:
+        chips.append(f"{symbol}{price_from}–{symbol}{price_to}")
+    elif price_to:
+        chips.append(f"≤ {symbol}{price_to}")
+    elif price_from:
+        chips.append(f"≥ {symbol}{price_from}")
+
+    def _count(*keys):
+        return sum(len(params.get(key, [])) for key in keys)
+
+    def _add_count(count, singular, plural):
+        if count == 1:
+            chips.append(f"1 {singular}")
+        elif count > 1:
+            chips.append(f"{count} {plural}")
+
+    _add_count(_count("brand_id[]", "brand_ids[]"), "brand", "brands")
+    _add_count(_count("catalog[]", "catalog_ids[]"), "category", "categories")
+    _add_count(_count("size_id[]", "size_ids[]"), "size", "sizes")
+    _add_count(_count("color_id[]", "color_ids[]"), "colour", "colours")
+    _add_count(
+        _count("status[]", "status_ids[]", "status_id[]"),
+        "condition",
+        "conditions",
+    )
+
+    if (params.get("is_for_swap", ["0"])[0] or "0") in ("1", "true"):
+        chips.append("swap")
+
+    return chips
+
+
 @app.route("/queries")
 def queries():
     # Get queries, newest Last Found Item first; Never entries last.
     all_queries = _queries_newest_first(db.get_queries())
+    # Fetch pause-state and item counts once each to avoid per-row queries.
+    enabled_map = db.get_query_enabled_map()
+    item_counts = db.get_query_item_counts()
     formatted_queries = []
     for i, query in enumerate(all_queries):
         parsed_query = urlparse(query[1])
@@ -288,12 +359,16 @@ def queries():
 
         # last_item is already included in db.get_queries().
         last_timestamp = query[2]
+        # last_found_timestamp is the raw epoch used for client-side sorting;
+        # None (rendered as "Never") always sorts to the bottom.
+        last_found_timestamp = None
         if last_timestamp is None:
             last_found_item = "Never"
         else:
             try:
+                last_found_timestamp = float(last_timestamp)
                 last_found_item = datetime.fromtimestamp(
-                    float(last_timestamp)
+                    last_found_timestamp
                 ).strftime("%Y-%m-%d %H:%M:%S")
             except (TypeError, ValueError, OSError, OverflowError) as error:
                 logger.warning(
@@ -303,6 +378,7 @@ def queries():
                     error,
                 )
                 last_found_item = "Never"
+                last_found_timestamp = None
 
         formatted_queries.append(
             {
@@ -311,6 +387,10 @@ def queries():
                 "query": query[1],
                 "display": query_name if query_name else query[1],
                 "last_found_item": last_found_item,
+                "last_found_timestamp": last_found_timestamp,
+                "enabled": enabled_map.get(query[0], True),
+                "item_count": item_counts.get(query[0], 0),
+                "filters": _summarise_query_filters(query[1]),
             }
         )
 
@@ -340,6 +420,38 @@ def add_query():
     return redirect(url_for("queries"))
 
 
+@app.route("/add_query/bulk", methods=["POST"])
+def add_query_bulk():
+    raw = request.form.get("queries", "")
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+
+    added = duplicates = failed = 0
+    for line in lines:
+        try:
+            normalised = normalise_vinted_url(line)
+            message, _success = core.process_query(normalised, name=None)
+            if message == "Query added.":
+                added += 1
+            elif "already" in message.lower():
+                duplicates += 1
+            else:
+                failed += 1
+        except (ValueError, TypeError):
+            failed += 1
+
+    if not lines:
+        flash("No URLs provided.", "warning")
+    else:
+        parts = [f"{added} added"]
+        if duplicates:
+            parts.append(f"{duplicates} already existed")
+        if failed:
+            parts.append(f"{failed} invalid")
+        flash("Bulk add: " + ", ".join(parts) + ".", "success" if added else "warning")
+
+    return redirect(url_for("queries"))
+
+
 @app.route("/remove_query/<int:query_id>", methods=["POST"])
 def remove_query(query_id):
     message, success = core.process_remove_query(str(query_id))
@@ -360,6 +472,43 @@ def remove_all_queries():
         flash(message, "error")
 
     return redirect(url_for("queries"))
+
+
+@app.route("/remove_query/bulk", methods=["POST"])
+def remove_query_bulk():
+    ids = request.form.getlist("query_ids")
+    removed = 0
+    for raw_id in ids:
+        if str(raw_id).isdigit():
+            _message, success = core.process_remove_query(str(raw_id))
+            if success:
+                removed += 1
+
+    if removed:
+        flash(
+            f"Removed {removed} quer{'y' if removed == 1 else 'ies'}.",
+            "success",
+        )
+    else:
+        flash("No queries were removed.", "warning")
+
+    return redirect(url_for("queries"))
+
+
+@app.route("/toggle_query/<int:query_id>", methods=["POST"])
+def toggle_query(query_id):
+    enabled_map = db.get_query_enabled_map()
+    if query_id not in enabled_map:
+        return jsonify({"status": "error", "message": "Query not found."}), 404
+
+    new_state = not enabled_map[query_id]
+    if db.set_query_enabled(query_id, new_state):
+        return jsonify({"status": "success", "enabled": new_state})
+
+    return (
+        jsonify({"status": "error", "message": "Could not update the query."}),
+        500,
+    )
 
 
 @app.route("/update_query/<int:query_id>", methods=["POST"])
@@ -455,62 +604,6 @@ def items():
     )
 
 
-def _quiet_hours_panel(params):
-    """Render quiet-hours controls inside the existing configuration form."""
-    enabled = params.get("quiet_hours_enabled", "True") == "True"
-    start = html.escape(params.get("quiet_hours_start", "01:00"), quote=True)
-    end = html.escape(params.get("quiet_hours_end", "06:00"), quote=True)
-    timezone_name = html.escape(
-        params.get("quiet_hours_timezone", "Europe/London"),
-        quote=True,
-    )
-    checked = "checked" if enabled else ""
-
-    return f"""
-    <div id="quiet-hours-settings" class="card mb-4">
-        <div class="card-header">
-            <strong>Quiet hours</strong>
-        </div>
-        <div class="card-body">
-            <div class="form-check form-switch mb-3">
-                <input class="form-check-input" type="checkbox"
-                       id="quiet_hours_enabled" name="quiet_hours_enabled" {checked}>
-                <label class="form-check-label" for="quiet_hours_enabled">
-                    Pause Vinted scraping during quiet hours
-                </label>
-            </div>
-            <div class="row g-3">
-                <div class="col-md-4">
-                    <label for="quiet_hours_start" class="form-label">Start</label>
-                    <input type="time" class="form-control" id="quiet_hours_start"
-                           name="quiet_hours_start" value="{start}" required>
-                </div>
-                <div class="col-md-4">
-                    <label for="quiet_hours_end" class="form-label">End</label>
-                    <input type="time" class="form-control" id="quiet_hours_end"
-                           name="quiet_hours_end" value="{end}" required>
-                </div>
-                <div class="col-md-4">
-                    <label for="quiet_hours_timezone" class="form-label">Timezone</label>
-                    <input type="text" class="form-control"
-                           id="quiet_hours_timezone" name="quiet_hours_timezone"
-                           value="{timezone_name}" required>
-                </div>
-            </div>
-            <div class="form-text mt-2">
-                Use an IANA timezone such as Europe/London. This remains correct when
-                the app runs on a UTC server and follows BST/GMT automatically. The
-                global quiet period applies to every Telegram account. Windows that
-                cross midnight are supported.
-            </div>
-            <button type="submit" class="btn btn-primary mt-3">
-                Save Configuration
-            </button>
-        </div>
-    </div>
-    """
-
-
 def _validated_int(name, default, minimum, maximum):
     raw_value = request.form.get(name, str(default)).strip()
     try:
@@ -529,7 +622,7 @@ def _validate_message_template(template):
     if not template.strip():
         raise ValueError("The notification message template cannot be empty.")
 
-    allowed = {"title", "price", "brand", "condition", "description", "image"}
+    allowed = {"title", "price", "brand", "condition", "image"}
     fields = {
         field_name
         for _, field_name, _, _ in string.Formatter().parse(template)
@@ -551,17 +644,113 @@ def config():
     telegram_token_configured = bool(params.get("telegram_token", "").strip())
     params = dict(params)
     params["telegram_token"] = ""
-    rendered = render_template(
+
+    enabled_map = db.get_query_enabled_map()
+    active_count = sum(1 for on in enabled_map.values() if on)
+    try:
+        refresh_delay = int(params.get("query_refresh_delay") or 300)
+    except (TypeError, ValueError):
+        refresh_delay = 300
+    # Mirror core's paced-scrape spacing to estimate a full cycle's duration.
+    if active_count > 1:
+        usable_window = max(60, refresh_delay * 0.80)
+        spacing = max(2.0, min(15.0, usable_window / active_count))
+        cycle_seconds = int(spacing * active_count)
+    else:
+        cycle_seconds = 0
+    query_health = {
+        "total": len(enabled_map),
+        "active": active_count,
+        "paused": sum(1 for on in enabled_map.values() if not on),
+        "refresh_delay": refresh_delay,
+        "cycle_seconds": cycle_seconds,
+        "cycle_minutes": round(cycle_seconds / 60, 1),
+        "keeps_up": cycle_seconds <= refresh_delay,
+    }
+
+    return render_template(
         "config.html",
         params=params,
         telegram_token_configured=telegram_token_configured,
+        query_health=query_health,
     )
 
-    if 'id="quiet-hours-settings"' not in rendered and "</form>" in rendered:
-        before, closing = rendered.rsplit("</form>", 1)
-        rendered = before + _quiet_hours_panel(params) + "</form>" + closing
 
-    return rendered
+@app.route("/test_telegram", methods=["POST"])
+def test_telegram():
+    """Send a one-off test message using the saved bot token and Chat ID."""
+    token = (db.get_parameter("telegram_token") or "").strip()
+    chat_id = (db.get_parameter("telegram_chat_id") or "").strip()
+    if not token or not chat_id:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Save a bot token and Chat ID first, then try again.",
+                }
+            ),
+            400,
+        )
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": (
+                    "✅ Vinted Notifications test message — "
+                    "your Telegram alerts are configured correctly."
+                ),
+            },
+            timeout=(3.05, 10),
+        )
+        payload = response.json()
+        if response.status_code == 200 and payload.get("ok"):
+            return jsonify(
+                {"status": "success", "message": "Test message sent — check Telegram."}
+            )
+        description = payload.get("description", f"HTTP {response.status_code}")
+        return (
+            jsonify(
+                {"status": "error", "message": f"Telegram rejected it: {description}"}
+            ),
+            400,
+        )
+    except (requests.RequestException, ValueError) as error:
+        logger.warning("Telegram test message failed: %s", error)
+        return (
+            jsonify({"status": "error", "message": f"Could not reach Telegram: {error}"}),
+            502,
+        )
+
+
+@app.route("/config/health", methods=["GET"])
+def config_health():
+    health = core.get_scraper_health()
+    if health["stalled"]:
+        status = "stalled"
+    elif health["blocked"]:
+        status = "blocked"
+    else:
+        status = "ok"
+
+    enabled_map = db.get_query_enabled_map()
+    return jsonify(
+        {
+            "pending_notifications": db.count_pending_notifications(),
+            "scraper": {
+                "status": status,
+                "heartbeat_age": health["heartbeat_age"],
+                "last_ok_age": health["last_ok_age"],
+                "failed_cycles": health["failed_cycles"],
+            },
+            "queries": {
+                "total": len(enabled_map),
+                "active": sum(1 for on in enabled_map.values() if on),
+                "paused": sum(1 for on in enabled_map.values() if not on),
+            },
+        }
+    )
 
 
 @app.route("/update_config", methods=["POST"])
@@ -889,7 +1078,10 @@ def web_ui_process():
     try:
         from waitress import serve
 
-        host = os.environ.get("VN_WEB_HOST", "127.0.0.1")
+        # Bind to all interfaces by default so the container is reachable from
+        # the host/network out of the box. Set VN_WEB_HOST=127.0.0.1 to restrict
+        # to localhost-only (e.g. behind an authenticated reverse proxy).
+        host = os.environ.get("VN_WEB_HOST", "0.0.0.0")
         port = int(os.environ.get("VN_WEB_PORT", "8000"))
         logger.info("Serving Web UI on %s:%s", host, port)
         serve(app, host=host, port=port, threads=4)

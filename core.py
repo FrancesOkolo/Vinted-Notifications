@@ -357,11 +357,93 @@ def _get_query_spacing_seconds(query_count):
     return max(2.0, min(15.0, calculated_spacing))
 
 
+def record_scraper_heartbeat():
+    """Record that the scrape cycle just fired, proving the scraper is alive.
+
+    Written at the start of every process_items run — including quiet-hours
+    skips, since the process is healthy then, just intentionally idle. The
+    main-process watchdog treats a frozen heartbeat as a stalled scraper.
+    """
+    try:
+        db.set_parameter("scraper_heartbeat", str(int(time.time())))
+    except Exception:
+        logger.warning("Could not record scraper heartbeat.", exc_info=True)
+
+
+def _finalize_scrape_cycle(successful_fetches, query_count):
+    """Update health counters after a scrape cycle completes."""
+    now = int(time.time())
+    try:
+        db.set_parameter("scraper_last_cycle", str(now))
+        if successful_fetches > 0:
+            db.set_parameter("scraper_last_ok", str(now))
+            db.set_parameter("scraper_failed_cycles", "0")
+        elif query_count > 0:
+            # A full cycle that reached nothing usually means Vinted is
+            # blocking every request (403/429), not an empty marketplace.
+            try:
+                failed = int(db.get_parameter("scraper_failed_cycles") or 0)
+            except (TypeError, ValueError):
+                failed = 0
+            db.set_parameter("scraper_failed_cycles", str(failed + 1))
+    except Exception:
+        logger.warning("Could not update scrape-cycle health.", exc_info=True)
+
+
+def get_scraper_health(now=None):
+    """Return a health snapshot for the main-process watchdog.
+
+    Keys:
+      heartbeat_age  seconds since the scrape cycle last fired (None if never)
+      stalled        heartbeat is older than a few refresh intervals
+      blocked        several consecutive cycles reached no items at all
+      failed_cycles  current consecutive-failure count
+      last_ok_age    seconds since the last successful fetch (None if never)
+      stale_after    the staleness threshold in seconds
+
+    A missing heartbeat (fresh boot, before the first cycle) is never reported
+    as stalled, avoiding false alarms at startup.
+    """
+    now = int(now if now is not None else time.time())
+
+    def _age(key):
+        raw = db.get_parameter(key)
+        try:
+            return now - int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        refresh_delay = int(db.get_parameter("query_refresh_delay") or 300)
+    except (TypeError, ValueError):
+        refresh_delay = 300
+    stale_after = max(refresh_delay * 3, 600)
+
+    heartbeat_age = _age("scraper_heartbeat")
+    last_ok_age = _age("scraper_last_ok")
+
+    try:
+        failed_cycles = int(db.get_parameter("scraper_failed_cycles") or 0)
+    except (TypeError, ValueError):
+        failed_cycles = 0
+
+    return {
+        "heartbeat_age": heartbeat_age,
+        "stalled": heartbeat_age is not None and heartbeat_age > stale_after,
+        "blocked": failed_cycles >= 3,
+        "failed_cycles": failed_cycles,
+        "last_ok_age": last_ok_age,
+        "stale_after": stale_after,
+    }
+
+
 def process_items(queue):
     """
     Scrape every unique query once, pacing requests across the configured
     interval. Shared subscriptions do not create duplicate Vinted requests.
     """
+    record_scraper_heartbeat()
+
     quiet_active, quiet_start, quiet_end, quiet_timezone = (
         get_quiet_hours_status()
     )
@@ -374,10 +456,12 @@ def process_items(queue):
         )
         return
 
-    all_queries = db.get_queries()
+    # Only scrape enabled queries; paused ones stay in the database but make
+    # no requests.
+    all_queries = db.get_queries(enabled_only=True)
 
     if not all_queries:
-        logger.info("No Vinted queries configured.")
+        logger.info("No active Vinted queries configured.")
         return
 
     vinted = Vinted()
@@ -400,6 +484,7 @@ def process_items(queue):
     )
 
     total_429s = 0
+    successful_fetches = 0
 
     for position, query in enumerate(all_queries, start=1):
         if _quiet_hours_active():
@@ -486,6 +571,7 @@ def process_items(queue):
                 break
 
         if all_items is not None:
+            successful_fetches += 1
             data = [item for item in all_items if item.is_new_item()]
             queue.put((data, query_id))
             logger.info(
@@ -507,6 +593,8 @@ def process_items(queue):
         if position < query_count and base_spacing > 0:
             jittered_spacing = base_spacing * random.uniform(0.85, 1.15)
             time.sleep(jittered_spacing)
+
+    _finalize_scrape_cycle(successful_fetches, query_count)
 
 
 class _ProductJsonLdParser(HTMLParser):
@@ -714,8 +802,27 @@ def clear_item_queue(items_queue, new_items_queue):
                 # matching query. One query may notify several accounts.
                 subscriber_chat_ids = db.get_query_subscribers(query_id)
 
-                # Always dispatch so RSS-only installations still receive the
-                # item. Telegram safely ignores an empty destination list.
+                # Persist the Telegram notification to the durable outbox BEFORE
+                # the item is marked "seen" below, so a crash or restart between
+                # finding and delivering it cannot lose the alert. The Telegram
+                # bot drains the outbox and retries until delivered.
+                if subscriber_chat_ids:
+                    db.enqueue_notification(
+                        content,
+                        item.url,
+                        "Open Vinted",
+                        subscriber_chat_ids,
+                        query_id=query_id,
+                    )
+                else:
+                    logger.warning(
+                        "No approved Telegram subscribers for query %s; "
+                        "the item will still be available to RSS.",
+                        query_id,
+                    )
+
+                # RSS-only installations still receive every item via the
+                # ephemeral in-memory queue.
                 new_items_queue.put(
                     (
                         content,
@@ -726,13 +833,7 @@ def clear_item_queue(items_queue, new_items_queue):
                         subscriber_chat_ids,
                     )
                 )
-                if not subscriber_chat_ids:
-                    logger.warning(
-                        "No approved Telegram subscribers for query %s; "
-                        "the item will still be available to RSS.",
-                        query_id,
-                    )
-                # Add the item to the db
+                # Mark the item as seen only after it has been persisted above.
                 db.add_item_to_db(
                     id=item.id,
                     timestamp=item.raw_timestamp,
@@ -800,7 +901,11 @@ def check_version(force=False):
                 f"{github_url}/releases/latest",
                 timeout=(3.05, 5),
             )
-            if response.status_code == 200:
+            # Only treat it as a real release when GitHub redirects to a tag
+            # (…/releases/tag/<tag>). A repo with no published releases
+            # redirects to …/releases, which must NOT be read as a version —
+            # otherwise the UI shows a bogus "Update: releases" banner.
+            if response.status_code == 200 and "/releases/tag/" in response.url:
                 latest_version = response.url.rstrip("/").split("/")[-1]
                 result = (
                     version == latest_version,

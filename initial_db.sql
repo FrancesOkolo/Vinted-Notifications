@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS queries
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     query     TEXT NOT NULL UNIQUE,
     last_item NUMERIC,
-    query_name TEXT
+    query_name TEXT,
+    enabled   INTEGER NOT NULL DEFAULT 1
 );
 
 -- Items table
@@ -109,6 +110,5 @@ VALUES ('telegram_enabled', 'False'),
 💶 Price : {price}
 🛍️ Brand : {brand}
 Condition : {condition}
-<a href="{image}">&#8205;</a>
-Description : {description}'),
+<a href="{image}">&#8205;</a>'),
        ('message_template_v2_migrated', 'True');

@@ -1,6 +1,38 @@
 import multiprocessing
 import time
 import os
+import sys
+from pathlib import Path
+
+
+def _load_env_file():
+    """Load a project-root .env into the environment before settings are read.
+
+    This lets VN_* configuration (VN_WEB_HOST, VN_WEB_USERNAME, VN_SECRET_KEY,
+    ...) come from a file instead of only the shell. Existing environment
+    variables always win (override=False), so real ``-e``/compose values still
+    take precedence over the file. When no .env exists — or python-dotenv is
+    not installed — this is a no-op and the app behaves exactly as before.
+
+    Called at import time (not only under ``__main__``) so that spawn-based
+    child processes on Windows reload the file when they re-import this module;
+    fork-based children on Linux simply inherit the already-populated
+    environment. Either way the Web UI/RSS child processes see the values.
+    """
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.is_file():
+        return False, None
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return False, "missing-dotenv"
+    load_dotenv(env_path)
+    return True, str(env_path)
+
+
+# Populate the environment before importing anything that reads VN_* settings.
+_env_loaded, _env_detail = _load_env_file()
+
 import db
 from apscheduler.schedulers.background import BackgroundScheduler
 from logger import get_logger
@@ -8,11 +40,40 @@ from logger import get_logger
 # Get logger for this module
 logger = get_logger(__name__)
 
+# Log the .env outcome once, from the main process only (children stay quiet).
+if __name__ == "__main__":
+    if _env_loaded:
+        logger.info("Loaded environment variables from %s", _env_detail)
+    elif _env_detail == "missing-dotenv":
+        logger.warning(
+            "Found a .env file but python-dotenv is not installed; its values "
+            "were not loaded. Install dependencies with "
+            "'pip install -r requirements.txt'."
+        )
+
 # Global process references
 telegram_process = None
 rss_process = None
 scrape_process = None
 current_query_refresh_delay = None
+
+
+def telegram_polling_enabled():
+    """Whether this instance should receive Telegram bot commands.
+
+    Telegram permits multiple processes to send with one bot token, but only
+    one process may poll ``getUpdates``. Local test runs can therefore use
+    ``--telegram-send-only`` (or ``VN_TELEGRAM_POLLING=false``) while the live
+    server remains the sole command-polling instance.
+    """
+    if "--telegram-send-only" in sys.argv:
+        return False
+
+    configured = os.getenv("VN_TELEGRAM_POLLING")
+    if configured is None:
+        return True
+
+    return configured.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def initialise_database():
@@ -45,6 +106,9 @@ def initialise_database():
 
     migrations = [
         (db.migrate_message_template, "notification message template"),
+        (db.migrate_remove_description_field, "remove unreliable description field"),
+        (db.migrate_pending_notifications_table, "durable notification outbox"),
+        (db.migrate_query_enabled_column, "per-query pause/enable"),
         (db.migrate_multi_user_schema, "multi-user Telegram support"),
         (db.migrate_query_uniqueness, "query uniqueness"),
         (db.migrate_quiet_hours_schema, "quiet-hours configuration"),
@@ -96,6 +160,10 @@ def item_extractor(items_queue, new_items_queue):
 
 
 def dispatcher_function(input_queue, rss_queue, telegram_queue):
+    # Telegram delivery now goes through the durable outbox (see
+    # core.clear_item_queue -> db.enqueue_notification), so this dispatcher only
+    # feeds the ephemeral RSS feed. telegram_queue is retained for signature
+    # compatibility but is no longer used for item delivery.
     logger.info("Dispatcher process started")
     try:
         while True:
@@ -107,24 +175,20 @@ def dispatcher_function(input_queue, rss_queue, telegram_queue):
                 rss_queue.put(item[:5])
             else:
                 rss_queue.put(item)
-
-            telegram_queue.put(item)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Dispatcher process stopped")
     except Exception as e:
         logger.error(f"Error in dispatcher process: {e}", exc_info=True)
 
 
-def telegram_bot_process(queue):
-    logger.info("Telegram bot process started")
-    import asyncio
-
+def telegram_bot_process(queue, polling_enabled=True):
+    mode = "polling" if polling_enabled else "send-only"
+    logger.info("Telegram bot process started in %s mode", mode)
     try:
         # Import LeRobot
         from telegram_bot_plugin.telegram_bot import LeRobot
 
-        # The bot will run with app.run_polling() which is already in the module
-        asyncio.run(LeRobot(queue))
+        LeRobot(queue, polling_enabled=polling_enabled)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Telegram bot process stopped")
     except Exception as e:
@@ -180,10 +244,74 @@ def check_refresh_delay(items_queue):
         logger.error(f"Error updating refresh delay: {e}", exc_info=True)
 
 
+def ensure_scrape_process_alive(items_queue):
+    """Restart the scrape process if it has died, so scraping self-heals."""
+    global scrape_process
+
+    if scrape_process is not None and scrape_process.is_alive():
+        return
+
+    logger.error("Scrape process is not running; restarting it.")
+    scrape_process = multiprocessing.Process(
+        target=scraper_process, args=(items_queue,)
+    )
+    scrape_process.start()
+
+
+def check_scraper_watchdog():
+    """Alert the admin once when the scraper stalls or is blocked, and once
+    again when it recovers.
+
+    The alert state is persisted in the database, so a sustained problem
+    produces a single notification rather than one on every monitor tick.
+    """
+    try:
+        import core
+
+        health = core.get_scraper_health()
+        problem = bool(health["stalled"] or health["blocked"])
+        already_alerted = db.get_parameter("scraper_watchdog_alerted") == "True"
+
+        # Only act on a transition (healthy <-> problem).
+        if problem == already_alerted:
+            return
+
+        admin_chat_id = db.get_parameter("telegram_chat_id")
+        telegram_enabled = db.get_parameter("telegram_enabled") == "True"
+
+        if problem:
+            if health["stalled"]:
+                reason = "has stalled with no recent scrape activity"
+            else:
+                reason = (
+                    "appears to be blocked by Vinted "
+                    f"({health['failed_cycles']} consecutive cycles found nothing)"
+                )
+            logger.error("Scraper watchdog: the scraper %s.", reason)
+            content = (
+                "⚠️ Vinted Notifications: the scraper "
+                f"{reason}. It will keep retrying automatically."
+            )
+            db.set_parameter("scraper_watchdog_alerted", "True")
+        else:
+            logger.info("Scraper watchdog: the scraper has recovered.")
+            content = (
+                "✅ Vinted Notifications: the scraper has recovered "
+                "and is running normally again."
+            )
+            db.set_parameter("scraper_watchdog_alerted", "False")
+
+        if telegram_enabled and admin_chat_id:
+            db.enqueue_notification(content, None, None, [admin_chat_id])
+    except Exception:
+        logger.error("Error in scraper watchdog.", exc_info=True)
+
+
 def monitor_processes(items_queue, telegram_queue, rss_queue):
     global telegram_process, rss_process
 
-    # Check if the query refresh delay has changed
+    # Restart the scrape process if it has died, then apply any delay change.
+    ensure_scrape_process_alive(items_queue)
     check_refresh_delay(items_queue)
 
     ### TELEGRAM ###
@@ -198,9 +326,12 @@ def monitor_processes(items_queue, telegram_queue, rss_queue):
 
     if telegram_should_run and not telegram_is_running:
         # Start telegram process
-        logger.info("Starting telegram bot process.")
+        polling_enabled = telegram_polling_enabled()
+        mode = "polling" if polling_enabled else "send-only"
+        logger.info("Starting Telegram process in %s mode.", mode)
         telegram_process = multiprocessing.Process(
-            target=telegram_bot_process, args=(telegram_queue,)
+            target=telegram_bot_process,
+            args=(telegram_queue, polling_enabled),
         )
         telegram_process.start()
     elif not telegram_should_run and telegram_is_running:
@@ -229,6 +360,30 @@ def monitor_processes(items_queue, telegram_queue, rss_queue):
         rss_process.join()
         rss_process = None
 
+    ### SCRAPER WATCHDOG ###
+    check_scraper_watchdog()
+
+
+def reset_scraper_watchdog_baseline(now=None):
+    """Start each process lifetime with a fresh watchdog baseline.
+
+    The heartbeat and failure counter live in SQLite, so without this reset a
+    clean restart can inherit a stale heartbeat or failures from the previous
+    process and immediately emit a false stalled/blocked alert before the first
+    scheduled scrape. The last successful-cycle timestamp is intentionally
+    preserved for health reporting.
+    """
+    baseline = int(now if now is not None else time.time())
+    if not db.set_parameters(
+        {
+            "scraper_heartbeat": str(baseline),
+            "scraper_failed_cycles": "0",
+            "scraper_watchdog_alerted": "False",
+        }
+    ):
+        raise RuntimeError("Failed to reset the scraper watchdog baseline.")
+    logger.info("Scraper watchdog baseline reset at %s.", baseline)
+
 
 def plugin_checker():
     # Get telegram and rss enable status
@@ -245,6 +400,7 @@ def plugin_checker():
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     initialise_database()
+    reset_scraper_watchdog_baseline()
 
     # Plugin checker
     plugin_checker()

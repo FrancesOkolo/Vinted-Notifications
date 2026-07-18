@@ -7,6 +7,44 @@
     <h1 class="h2">Configuration</h1>
 </div>
 
+<div class="row mb-4">
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header d-flex align-items-center justify-content-between">
+                <div class="d-flex align-items-center">
+                    <i class="bi bi-activity me-2 text-info"></i>
+                    <h5 class="card-title mb-0">System Health</h5>
+                </div>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="refreshHealthBtn"
+                        title="Refresh health">
+                    <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
+                    <span class="visually-hidden">Refresh health</span>
+                </button>
+            </div>
+            <div class="card-body">
+                <div class="row text-center g-3">
+                    <div class="col-md-3 col-6">
+                        <div class="text-muted small">Scraper</div>
+                        <div id="healthScraper" class="fs-5 fw-bold" aria-live="polite">…</div>
+                    </div>
+                    <div class="col-md-3 col-6">
+                        <div class="text-muted small">Last scrape cycle</div>
+                        <div id="healthHeartbeat" class="fs-5 fw-bold">…</div>
+                    </div>
+                    <div class="col-md-3 col-6">
+                        <div class="text-muted small">Pending alerts</div>
+                        <div id="healthPending" class="fs-5 fw-bold">…</div>
+                    </div>
+                    <div class="col-md-3 col-6">
+                        <div class="text-muted small">Queries</div>
+                        <div id="healthQueries" class="fs-5 fw-bold">…</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="row">
     <div class="col-md-12">
         <div class="card">
@@ -30,9 +68,10 @@
                                             <div class="mb-3">
                                                 <label for="items_per_query" class="form-label">Items Per Query</label>
                                                 <input type="number" class="form-control" id="items_per_query"
-                                                       name="items_per_query" value="{{ params.items_per_query }}">
+                                                       name="items_per_query" value="{{ params.items_per_query }}"
+                                                       min="1" max="100">
                                                 <small class="form-text text-muted">Maximum number of items to fetch per
-                                                    query</small>
+                                                    query (1–100)</small>
                                             </div>
                                         </div>
                                         <div class="col-md-6">
@@ -41,9 +80,21 @@
                                                     (seconds)</label>
                                                 <input type="number" class="form-control" id="query_refresh_delay"
                                                        name="query_refresh_delay"
-                                                       value="{{ params.query_refresh_delay }}">
-                                                <small class="form-text text-muted">Delay between query refreshes in
-                                                    seconds</small>
+                                                       value="{{ params.query_refresh_delay }}"
+                                                       min="30" max="86400">
+                                                <small class="form-text text-muted">
+                                                    Delay between query refreshes in seconds (min 30). Too low risks
+                                                    Vinted rate-limits.
+                                                    {% if query_health.active > 1 %}
+                                                    With {{ query_health.active }} active queries a full cycle takes
+                                                    about {{ query_health.cycle_minutes }} min.
+                                                    {% if not query_health.keeps_up %}
+                                                    <span class="text-danger">That is longer than the refresh delay, so
+                                                        scrapes will fall behind — raise the delay or pause some
+                                                        queries.</span>
+                                                    {% endif %}
+                                                    {% endif %}
+                                                </small>
                                             </div>
                                         </div>
                                     </div>
@@ -117,6 +168,15 @@
                                                name="telegram_chat_id" value="{{ params.telegram_chat_id }}">
                                         <small class="form-text text-muted">The chat ID where notifications will be
                                             sent</small>
+                                    </div>
+                                    <div class="mb-3">
+                                        <button type="button" class="btn btn-outline-info btn-sm" id="testTelegramBtn">
+                                            <i class="bi bi-send"></i> Send test message
+                                        </button>
+                                        <small class="form-text text-muted d-block mt-1">
+                                            Sends a test alert using the <strong>saved</strong> token and Chat ID — save
+                                            any changes first.
+                                        </small>
                                     </div>
                                 </div>
                             </div>
@@ -226,7 +286,12 @@
                                                           rows="6">{{ params.message_template }}</textarea>
                                                 <small class="form-text text-muted">Template for notification messages.
                                                     Available variables: {title}, {price}, {brand}, {condition},
-                                                    {description}, {image}</small>
+                                                    {image}</small>
+                                                <div class="mt-2">
+                                                    <span class="form-text text-muted">Preview (sample data):</span>
+                                                    <div id="templatePreview"
+                                                         class="border rounded p-2 bg-light small mt-1"></div>
+                                                </div>
                                             </div>
                                         </div>
                                         <div class="col-md-12">
@@ -248,6 +313,52 @@
                                                     (JSON format)</small>
                                             </div>
                                         </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <div id="quiet-hours-settings" class="card h-100">
+                                <div class="card-header d-flex align-items-center">
+                                    <i class="bi bi-moon-stars me-2 text-info"></i>
+                                    <h5 class="card-title mb-0">Quiet Hours</h5>
+                                </div>
+                                <div class="card-body">
+                                    <div class="form-check form-switch mb-3">
+                                        <input class="form-check-input" type="checkbox" id="quiet_hours_enabled"
+                                               name="quiet_hours_enabled"
+                                               {% if params.get('quiet_hours_enabled', 'True') == 'True' %}checked{% endif %}>
+                                        <label class="form-check-label" for="quiet_hours_enabled">
+                                            Pause Vinted scraping during quiet hours
+                                        </label>
+                                    </div>
+                                    <div class="row g-3">
+                                        <div class="col-md-4">
+                                            <label for="quiet_hours_start" class="form-label">Start</label>
+                                            <input type="time" class="form-control" id="quiet_hours_start"
+                                                   name="quiet_hours_start"
+                                                   value="{{ params.get('quiet_hours_start', '01:00') }}" required>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <label for="quiet_hours_end" class="form-label">End</label>
+                                            <input type="time" class="form-control" id="quiet_hours_end"
+                                                   name="quiet_hours_end"
+                                                   value="{{ params.get('quiet_hours_end', '06:00') }}" required>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <label for="quiet_hours_timezone" class="form-label">Timezone</label>
+                                            <input type="text" class="form-control" id="quiet_hours_timezone"
+                                                   name="quiet_hours_timezone"
+                                                   value="{{ params.get('quiet_hours_timezone', 'Europe/London') }}"
+                                                   required>
+                                        </div>
+                                    </div>
+                                    <div class="form-text mt-2">
+                                        Use an IANA timezone such as Europe/London. This remains correct when the app
+                                        runs on a UTC server and follows BST/GMT automatically. The global quiet period
+                                        applies to every Telegram account. Windows that cross midnight are supported.
                                     </div>
                                 </div>
                             </div>
@@ -481,6 +592,105 @@
                     createBanwordTag(word);
                 }
             });
+        }
+
+        // --- Shared flash helper ---
+        function showConfigFlash(message, category) {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert alert-${category} alert-dismissible fade show flash-message`;
+            alertDiv.setAttribute('role', 'alert');
+            alertDiv.innerHTML = `${message}<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>`;
+            document.querySelector('.flash-messages').appendChild(alertDiv);
+            setTimeout(() => {
+                new bootstrap.Alert(alertDiv).close();
+            }, 5000);
+        }
+
+        // --- Send test Telegram message ---
+        const testTelegramBtn = document.getElementById('testTelegramBtn');
+        if (testTelegramBtn) {
+            testTelegramBtn.addEventListener('click', function () {
+                const original = this.innerHTML;
+                this.disabled = true;
+                this.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Sending…';
+                fetch('/test_telegram', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': '{{ csrf_token() }}'}
+                })
+                    .then(response => response.json().then(data => ({ok: response.ok, data})))
+                    .then(({ok, data}) => {
+                        showConfigFlash(data.message, data.status === 'success' ? 'success' : 'danger');
+                    })
+                    .catch(() => {
+                        showConfigFlash('Could not reach the server.', 'danger');
+                    })
+                    .finally(() => {
+                        this.disabled = false;
+                        this.innerHTML = original;
+                    });
+            });
+        }
+
+        // --- Message-template live preview ---
+        const templateTextarea = document.getElementById('message_template');
+        const templatePreview = document.getElementById('templatePreview');
+        if (templateTextarea && templatePreview) {
+            const sampleValues = {
+                title: 'Nike Air Max 90',
+                price: '25 GBP',
+                brand: 'Nike',
+                condition: 'Very good',
+                image: 'https://example.com/item.jpg'
+            };
+            const renderTemplatePreview = function () {
+                const rendered = templateTextarea.value.replace(/\{(\w+)\}/g, (match, key) =>
+                    Object.prototype.hasOwnProperty.call(sampleValues, key) ? sampleValues[key] : match);
+                templatePreview.innerHTML = rendered.replace(/\n/g, '<br>');
+            };
+            templateTextarea.addEventListener('input', renderTemplatePreview);
+            renderTemplatePreview();
+        }
+
+        // --- System Health panel ---
+        const formatHealthAge = function (seconds) {
+            if (seconds === null || seconds === undefined) return 'never';
+            if (seconds < 90) return Math.round(seconds) + 's ago';
+            if (seconds < 5400) return Math.round(seconds / 60) + 'm ago';
+            if (seconds < 129600) return Math.round(seconds / 3600) + 'h ago';
+            return Math.round(seconds / 86400) + 'd ago';
+        };
+        const loadHealth = function () {
+            fetch('/config/health')
+                .then(response => response.json())
+                .then(data => {
+                    const scraper = document.getElementById('healthScraper');
+                    const map = {
+                        ok: ['OK', 'text-success'],
+                        stalled: ['Stalled', 'text-danger'],
+                        blocked: ['Blocked', 'text-warning']
+                    };
+                    const [text, cls] = map[data.scraper.status] || ['Unknown', 'text-muted'];
+                    scraper.textContent = text;
+                    scraper.className = 'fs-5 fw-bold ' + cls;
+                    document.getElementById('healthHeartbeat').textContent =
+                        formatHealthAge(data.scraper.heartbeat_age);
+                    const pending = document.getElementById('healthPending');
+                    pending.textContent = data.pending_notifications;
+                    pending.className = 'fs-5 fw-bold ' +
+                        (data.pending_notifications > 0 ? 'text-warning' : 'text-success');
+                    document.getElementById('healthQueries').textContent =
+                        data.queries.active + ' active' +
+                        (data.queries.paused ? ' / ' + data.queries.paused + ' paused' : '');
+                })
+                .catch(error => {
+                    console.error('Health load failed:', error);
+                });
+        };
+        const refreshHealthBtn = document.getElementById('refreshHealthBtn');
+        if (refreshHealthBtn) {
+            refreshHealthBtn.addEventListener('click', loadHealth);
+            loadHealth();
+            setInterval(loadHealth, 20000);
         }
     });
 </script>

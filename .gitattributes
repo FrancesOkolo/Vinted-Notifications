@@ -1,5 +1,12 @@
 * text=auto
-*.sh text eol=lf
-Dockerfile text eol=lf
-*.yml text eol=lf
-*.yaml text eol=lf
+
+# Shell scripts and container files MUST use LF, or they break on Linux
+# (e.g. `env: 'sh\r': No such file or directory`). Force LF regardless of the
+# editing platform.
+*.sh                 text eol=lf
+docker-entrypoint.sh text eol=lf
+*entrypoint*         text eol=lf
+Dockerfile           text eol=lf
+*.dockerfile         text eol=lf
+*.yml                text eol=lf
+*.yaml               text eol=lf

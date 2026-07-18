@@ -91,7 +91,10 @@ class RSSFeed:
 
         try:
             port = db.get_parameter("rss_port")
-            host = os.environ.get("VN_RSS_HOST", "127.0.0.1")
+            # Bind to all interfaces by default so the container is reachable
+            # from the host/network. Set VN_RSS_HOST=127.0.0.1 to restrict to
+            # localhost-only.
+            host = os.environ.get("VN_RSS_HOST", "0.0.0.0")
             logger.info("Starting RSS feed server on %s:%s", host, port)
             from waitress import serve
 

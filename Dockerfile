@@ -25,8 +25,12 @@ RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 COPY . .
 
 # EntryPoint script (added below)
+# Strip any CRLF line endings before use so a file edited on Windows can't
+# break the container with `env: 'sh\r': No such file or directory`. This runs
+# every build, so the image is self-healing regardless of how the file arrives.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+ && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Expose ports
 EXPOSE 8000

@@ -152,12 +152,27 @@
                                 row.classList.add('table-warning');
                             }
 
-                            row.innerHTML = `
-                                <td>${log.timestamp}</td>
-                                <td><span class="badge log-${log.level.toLowerCase()}">${log.level}</span></td>
-                                <td>${log.module}</td>
-                                <td class="log-entry">${log.message}</td>
-                            `;
+                            // Build cells with textContent, never innerHTML: log lines
+                            // contain scraped and user-influenced text, so interpolating
+                            // them into HTML would allow markup/script injection (XSS).
+                            const timestampCell = document.createElement('td');
+                            timestampCell.textContent = log.timestamp;
+
+                            const levelCell = document.createElement('td');
+                            const levelBadge = document.createElement('span');
+                            // level is constrained to A-Z by the server-side parser.
+                            levelBadge.className = 'badge log-' + String(log.level).toLowerCase();
+                            levelBadge.textContent = log.level;
+                            levelCell.appendChild(levelBadge);
+
+                            const moduleCell = document.createElement('td');
+                            moduleCell.textContent = log.module;
+
+                            const messageCell = document.createElement('td');
+                            messageCell.className = 'log-entry';
+                            messageCell.textContent = log.message;
+
+                            row.append(timestampCell, levelCell, moduleCell, messageCell);
                             logEntries.appendChild(row);
                         });
 

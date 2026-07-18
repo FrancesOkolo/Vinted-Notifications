@@ -2,6 +2,23 @@
 
 {% block title %}Queries - Vinted Notifications{% endblock %}
 
+{% block head %}
+<style>
+    .query-paused {
+        background-color: rgba(108, 117, 125, 0.10);
+    }
+
+    .query-select-column {
+        width: 1%;
+        white-space: nowrap;
+    }
+
+    .query-bulk-actions {
+        margin-left: auto;
+    }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
     <h1 class="h2">Queries</h1>
@@ -27,11 +44,12 @@
                                    class="form-control"
                                    id="query"
                                    name="query"
-                                   placeholder="https://www.vinted.fr/catalog?search_text=nike+shoes"
+                                   placeholder="https://www.vinted.co.uk/catalog?search_text=nike+shoes"
                                    required
                                    pattern="^https?:\/\/(?:www\.)?vinted\.[a-z]{2,}(?:\.[a-z]{2,})*(\/.*)?$">
                             <div class="form-text">
-                                Paste a valid Vinted search URL (e.g.&nbsp;`https://www.vinted.fr/catalog?...`)
+                                Paste a valid Vinted UK search URL (e.g.&nbsp;`https://www.vinted.co.uk/catalog?...`).
+                                Tracking parameters are removed and results are sorted newest-first automatically.
                             </div>
                         </div>
 
@@ -51,6 +69,25 @@
                         </div>
                     </div>
                 </form>
+
+                <div class="mt-3">
+                    <button class="btn btn-sm btn-link p-0 text-decoration-none" type="button"
+                            data-bs-toggle="collapse" data-bs-target="#bulkAddPanel"
+                            aria-expanded="false" aria-controls="bulkAddPanel">
+                        <i class="bi bi-list-ul me-1"></i> Add multiple queries at once
+                    </button>
+                    <div class="collapse mt-2" id="bulkAddPanel">
+                        <form action="/add_query/bulk" method="post">
+                            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                            <label for="bulkQueries" class="form-label">Paste one Vinted search URL per line</label>
+                            <textarea class="form-control" id="bulkQueries" name="queries" rows="5"
+                                      placeholder="https://www.vinted.co.uk/catalog?search_text=nike+shoes&#10;https://www.vinted.co.uk/catalog?search_text=terracotta+pot"></textarea>
+                            <div class="d-flex justify-content-end mt-2">
+                                <button type="submit" class="btn btn-primary btn-sm">Add All</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -64,127 +101,150 @@
                 <h5 class="card-title mb-0">Current Queries</h5>
             </div>
             <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead>
-                        <tr>
-                            <th>#</th>
-                            <th>Query</th>
-                            <th>Last Found Item</th>
-                            <th>Actions</th>
-                        </tr>
-                        </thead>
-                        <tbody>
-                        {% for query in queries %}
-                        <tr>
-                            <td>{{ query.id }}</td>
-                            <td>{{ query.display }}</td>
-                            <td>{{ query.last_found_item }}</td>
-                            <td>
-                                <div class="btn-group" role="group">
-                                    <a href="/items?query={{ query.query_id }}"
-                                       class="btn btn-sm btn-outline-primary">
-                                        <i class="bi bi-box"></i> View Items
-                                    </a>
-                                    <button type="button" class="btn btn-sm btn-outline-secondary"
-                                            data-bs-toggle="modal"
-                                            data-bs-target="#editModal{{ query.id }}">
-                                        <i class="bi bi-pencil"></i> Edit
-                                    </button>
-                                    <button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal"
-                                            data-bs-target="#deleteModal{{ query.id }}">
-                                        <i class="bi bi-trash"></i> Remove
-                                    </button>
-                                </div>
-
-                                <!-- Edit Modal -->
-                                <div class="modal fade" id="editModal{{ query.id }}" tabindex="-1"
-                                     aria-labelledby="editModalLabel{{ query.id }}" aria-hidden="true">
-                                    <div class="modal-dialog">
-                                        <div class="modal-content">
-                                            <div class="modal-header">
-                                                <h5 class="modal-title" id="editModalLabel{{ query.id }}">Edit
-                                                    Query</h5>
-                                                <button type="button" class="btn-close" data-bs-dismiss="modal"
-                                                        aria-label="Close"></button>
-                                            </div>
-                                            <form action="/update_query/{{ query.query_id }}" method="post">
-                                                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                                <div class="modal-body">
-                                                    <div class="mb-3">
-                                                        <label for="query{{ query.id }}" class="form-label">Vinted
-                                                            search URL <span class="text-danger">*</span></label>
-                                                        <input type="url"
-                                                               class="form-control"
-                                                               id="query{{ query.id }}"
-                                                               name="query"
-                                                               value="{{ query.query }}"
-                                                               placeholder="https://www.vinted.fr/catalog?search_text=nike+shoes"
-                                                               required
-                                                               pattern="^https?:\/\/(?:www\.)?vinted\.[a-z]{2,}(?:\.[a-z]{2,})*(\/.*)?$">
-                                                    </div>
-                                                    <div class="mb-3">
-                                                        <label for="query_name{{ query.id }}" class="form-label">Name
-                                                            <span class="text-danger">*</span></label>
-                                                        <input type="text"
-                                                               class="form-control"
-                                                               id="query_name{{ query.id }}"
-                                                               name="query_name"
-                                                               value="{{ query.display if query.display != query.query else '' }}"
-                                                               required
-                                                               placeholder="My search">
-                                                    </div>
-                                                </div>
-                                                <div class="modal-footer">
-                                                    <button type="button" class="btn btn-secondary"
-                                                            data-bs-dismiss="modal">
-                                                        Cancel
-                                                    </button>
-                                                    <button type="submit" class="btn btn-primary">Save Changes</button>
-                                                </div>
-                                            </form>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Delete Modal -->
-                                <div class="modal fade" id="deleteModal{{ query.id }}" tabindex="-1"
-                                     aria-labelledby="deleteModalLabel{{ query.id }}" aria-hidden="true">
-                                    <div class="modal-dialog">
-                                        <div class="modal-content">
-                                            <div class="modal-header">
-                                                <h5 class="modal-title" id="deleteModalLabel{{ query.id }}">Confirm
-                                                    Deletion</h5>
-                                                <button type="button" class="btn-close" data-bs-dismiss="modal"
-                                                        aria-label="Close"></button>
-                                            </div>
-                                            <div class="modal-body">
-                                                Are you sure you want to remove the query: <strong>{{ query.display
-                                                }}</strong>?
-                                            </div>
-                                            <div class="modal-footer">
-                                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
-                                                    Cancel
-                                                </button>
-                                                <form action="/remove_query/{{ query.query_id }}" method="post"
-                                                      class="d-inline">
-                                                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                                    <button type="submit" class="btn btn-danger">Remove</button>
-                                                </form>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            </td>
-                        </tr>
-                        {% else %}
-                        <tr>
-                            <td colspan="4" class="text-center">No queries found</td>
-                        </tr>
-                        {% endfor %}
-                        </tbody>
-                    </table>
+                <div class="query-table-toolbar p-3 border-bottom">
+                    <div class="input-group input-group-sm query-search-group">
+                        <span class="input-group-text" aria-hidden="true"><i class="bi bi-search"></i></span>
+                        <label class="visually-hidden" for="querySearchInput">Search queries</label>
+                        <input type="search" class="form-control" id="querySearchInput"
+                               placeholder="Search {{ queries|length }} queries" autocomplete="off"
+                               aria-controls="queriesTable">
+                        <button type="button" class="btn btn-outline-secondary" id="clearQuerySearch"
+                                title="Clear query search" aria-label="Clear query search" hidden>
+                            <i class="bi bi-x-lg" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                    <small class="text-muted query-results-count" id="queryResultsCount" aria-live="polite"></small>
+                    <div class="query-bulk-actions">
+                        <button type="button" class="btn btn-sm btn-danger" id="bulkRemoveButton"
+                                data-bs-toggle="modal" data-bs-target="#bulkDeleteModal" disabled>
+                            <i class="bi bi-trash"></i> Remove selected (<span id="bulkSelectedCount">0</span>)
+                        </button>
+                    </div>
                 </div>
+                <form id="bulkRemoveForm" action="/remove_query/bulk" method="post">
+                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0 sortable-query-table" id="queriesTable">
+                            <caption class="visually-hidden">
+                                Current queries. Use the Query, Items and Last Found Item column buttons to change the
+                                sort order.
+                            </caption>
+                            <thead>
+                            <tr>
+                                <th scope="col" class="query-select-column">
+                                    <input type="checkbox" class="form-check-input" id="querySelectAll"
+                                           aria-label="Select all matching queries">
+                                </th>
+                                <th scope="col" class="query-row-number">#</th>
+                                <th scope="col" aria-sort="none" data-sort-header="query">
+                                    <button type="button" class="table-sort-button" data-sort-key="query"
+                                            data-sort-label="Query" aria-label="Sort by Query ascending">
+                                        <span>Query</span>
+                                        <span class="sort-indicator" aria-hidden="true">&#8597;</span>
+                                    </button>
+                                </th>
+                                <th scope="col" aria-sort="none" data-sort-header="items">
+                                    <button type="button" class="table-sort-button" data-sort-key="items"
+                                            data-sort-label="Items" aria-label="Sort by Items found ascending">
+                                        <span>Items</span>
+                                        <span class="sort-indicator" aria-hidden="true">&#8597;</span>
+                                    </button>
+                                </th>
+                                <th scope="col" class="last-found-column" aria-sort="descending"
+                                    data-sort-header="lastFound">
+                                    <button type="button" class="table-sort-button" data-sort-key="lastFound"
+                                            data-sort-label="Last Found Item"
+                                            aria-label="Last Found Item, sorted descending. Activate to sort ascending">
+                                        <span>Last Found Item</span>
+                                        <span class="sort-indicator is-active" aria-hidden="true">&#8595;</span>
+                                    </button>
+                                </th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            {% for query in queries %}
+                            <tr data-query-row data-query="{{ query.display|e }}"
+                                data-item-count="{{ query.item_count }}"
+                                data-last-found="{{ query.last_found_timestamp if query.last_found_timestamp is not none else '' }}"
+                                class="{{ 'query-paused' if not query.enabled else '' }}">
+                                <td class="query-select-column">
+                                    <input type="checkbox" class="form-check-input query-select" name="query_ids"
+                                           value="{{ query.query_id }}" aria-label="Select {{ query.display }}">
+                                </td>
+                                <td data-row-number>{{ query.id }}</td>
+                                <td>
+                                    <a href="{{ query.query }}" target="_blank" rel="noopener noreferrer"
+                                       title="Open this search on Vinted">{{ query.display }}<i
+                                            class="bi bi-box-arrow-up-right ms-1 small"></i></a>
+                                    <span class="badge bg-secondary ms-2 query-paused-badge"
+                                          {% if query.enabled %}hidden{% endif %}>Paused</span>
+                                    {% if query.filters %}
+                                    <div class="query-filter-chips mt-1">
+                                        {% for chip in query.filters %}
+                                        <span class="badge rounded-pill bg-light text-secondary border fw-normal">{{ chip }}</span>
+                                        {% endfor %}
+                                    </div>
+                                    {% endif %}
+                                </td>
+                                <td>{{ query.item_count }}</td>
+                                <td class="last-found-cell">
+                                    {% if query.last_found_timestamp is not none %}
+                                    <time datetime="{{ query.last_found_item|replace(' ', 'T') }}"
+                                          data-relative-time="{{ query.last_found_timestamp }}"
+                                          title="{{ query.last_found_item }}">{{ query.last_found_item }}</time>
+                                    {% else %}
+                                    Never
+                                    {% endif %}
+                                </td>
+                                <td class="query-actions-cell">
+                                    <div class="btn-group" role="group">
+                                        <a href="/items?query={{ query.query_id }}"
+                                           class="btn btn-sm btn-outline-primary">
+                                            <i class="bi bi-box"></i> View Items
+                                        </a>
+                                        <button type="button"
+                                                class="btn btn-sm {{ 'btn-outline-success' if not query.enabled else 'btn-outline-warning' }} query-toggle"
+                                                data-query-id="{{ query.query_id }}"
+                                                title="{{ 'Resume this query' if not query.enabled else 'Pause this query' }}">
+                                            <i class="bi {{ 'bi-play-fill' if not query.enabled else 'bi-pause-fill' }}"></i>
+                                            <span class="query-toggle-label">{{ 'Resume' if not query.enabled else 'Pause' }}</span>
+                                        </button>
+                                        <button type="button" class="btn btn-sm btn-outline-secondary"
+                                                data-bs-toggle="modal" data-bs-target="#editQueryModal"
+                                                data-query-id="{{ query.query_id }}"
+                                                data-query-url="{{ query.query|e }}"
+                                                data-query-name="{{ (query.display if query.display != query.query else '')|e }}">
+                                            <i class="bi bi-pencil"></i> Edit
+                                        </button>
+                                        <button type="button" class="btn btn-sm btn-outline-danger"
+                                                data-bs-toggle="modal" data-bs-target="#deleteQueryModal"
+                                                data-query-id="{{ query.query_id }}"
+                                                data-query-name="{{ query.display|e }}">
+                                            <i class="bi bi-trash"></i> Remove
+                                        </button>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                            <tr id="queryNoResultsRow" {% if queries %}hidden{% endif %}>
+                                <td colspan="6" class="text-center">No queries found</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </form>
+                <div class="query-pagination d-flex align-items-center justify-content-between p-3 border-top"
+                     id="queryPagination" aria-label="Query table pagination">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="queryPreviousPage">
+                        <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous
+                    </button>
+                    <span class="small text-muted" id="queryPageStatus" aria-live="polite"></span>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="queryNextPage">
+                        Next <i class="bi bi-chevron-right" aria-hidden="true"></i>
+                    </button>
+                </div>
+                <span class="visually-hidden" id="querySortStatus" aria-live="polite"></span>
             </div>
             {% if queries %}
             <div class="card-footer">
@@ -221,4 +281,431 @@
         </div>
     </div>
 </div>
+
+<!-- Bulk delete confirmation modal -->
+<div class="modal fade" id="bulkDeleteModal" tabindex="-1" aria-labelledby="bulkDeleteModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="bulkDeleteModalLabel">Confirm Deletion</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                Remove <strong id="bulkDeleteCount">0</strong> selected quer<span id="bulkDeletePlural">ies</span>?
+                This action cannot be undone.
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="submit" form="bulkRemoveForm" class="btn btn-danger">Remove Selected</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Shared Edit Query modal (populated from the clicked row's data attributes) -->
+<div class="modal fade" id="editQueryModal" tabindex="-1" aria-labelledby="editQueryModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="editQueryModalLabel">Edit Query</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <form id="editQueryForm" method="post">
+                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="editQueryUrl" class="form-label">Vinted search URL <span
+                                class="text-danger">*</span></label>
+                        <input type="url"
+                               class="form-control"
+                               id="editQueryUrl"
+                               name="query"
+                               placeholder="https://www.vinted.co.uk/catalog?search_text=nike+shoes"
+                               required
+                               pattern="^https?:\/\/(?:www\.)?vinted\.[a-z]{2,}(?:\.[a-z]{2,})*(\/.*)?$">
+                    </div>
+                    <div class="mb-3">
+                        <label for="editQueryName" class="form-label">Name <span class="text-danger">*</span></label>
+                        <input type="text"
+                               class="form-control"
+                               id="editQueryName"
+                               name="query_name"
+                               required
+                               placeholder="My search">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Shared Delete Query modal (populated from the clicked row's data attributes) -->
+<div class="modal fade" id="deleteQueryModal" tabindex="-1" aria-labelledby="deleteQueryModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="deleteQueryModalLabel">Confirm Deletion</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                Are you sure you want to remove the query: <strong id="deleteQueryName"></strong>?
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <form id="deleteQueryForm" method="post" class="d-inline">
+                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-danger">Remove</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        const csrfToken = '{{ csrf_token() }}';
+
+        // Populate the single shared Edit modal from the clicked row's data.
+        const editQueryModal = document.getElementById('editQueryModal');
+        if (editQueryModal) {
+            const editForm = document.getElementById('editQueryForm');
+            const editUrl = document.getElementById('editQueryUrl');
+            const editName = document.getElementById('editQueryName');
+            editQueryModal.addEventListener('show.bs.modal', function (event) {
+                const button = event.relatedTarget;
+                if (!button) {
+                    return;
+                }
+                editForm.action = '/update_query/' + button.dataset.queryId;
+                editUrl.value = button.dataset.queryUrl || '';
+                editName.value = button.dataset.queryName || '';
+            });
+        }
+
+        // Populate the single shared Delete modal from the clicked row's data.
+        const deleteQueryModal = document.getElementById('deleteQueryModal');
+        if (deleteQueryModal) {
+            const deleteForm = document.getElementById('deleteQueryForm');
+            const deleteName = document.getElementById('deleteQueryName');
+            deleteQueryModal.addEventListener('show.bs.modal', function (event) {
+                const button = event.relatedTarget;
+                if (!button) {
+                    return;
+                }
+                deleteForm.action = '/remove_query/' + button.dataset.queryId;
+                deleteName.textContent = button.dataset.queryName || '';
+            });
+        }
+
+        // Human-friendly relative times keep the exact local time in a tooltip.
+        const relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, {numeric: 'auto'});
+
+        function relativeTimeFromTimestamp(timestamp) {
+            const seconds = Math.round((Number(timestamp) * 1000 - Date.now()) / 1000);
+            const absoluteSeconds = Math.abs(seconds);
+            if (absoluteSeconds < 60) {
+                return relativeTimeFormatter.format(seconds, 'second');
+            }
+            if (absoluteSeconds < 3600) {
+                return relativeTimeFormatter.format(Math.round(seconds / 60), 'minute');
+            }
+            if (absoluteSeconds < 86400) {
+                return relativeTimeFormatter.format(Math.round(seconds / 3600), 'hour');
+            }
+            if (absoluteSeconds < 2592000) {
+                return relativeTimeFormatter.format(Math.round(seconds / 86400), 'day');
+            }
+            if (absoluteSeconds < 31536000) {
+                return relativeTimeFormatter.format(Math.round(seconds / 2592000), 'month');
+            }
+            return relativeTimeFormatter.format(Math.round(seconds / 31536000), 'year');
+        }
+
+        function updateRelativeTimes() {
+            document.querySelectorAll('[data-relative-time]').forEach(timeElement => {
+                timeElement.textContent = relativeTimeFromTimestamp(timeElement.dataset.relativeTime);
+            });
+        }
+
+        updateRelativeTimes();
+        window.setInterval(updateRelativeTimes, 60000);
+
+        // Pause / resume a query without deleting it.
+        function applyEnabledState(button, enabled) {
+            const row = button.closest('[data-query-row]');
+            if (row) {
+                row.classList.toggle('query-paused', !enabled);
+                const badge = row.querySelector('.query-paused-badge');
+                if (badge) {
+                    badge.hidden = enabled;
+                }
+            }
+            const label = button.querySelector('.query-toggle-label');
+            const icon = button.querySelector('i');
+            button.classList.toggle('btn-outline-warning', enabled);
+            button.classList.toggle('btn-outline-success', !enabled);
+            if (label) {
+                label.textContent = enabled ? 'Pause' : 'Resume';
+            }
+            if (icon) {
+                icon.className = enabled ? 'bi bi-pause-fill' : 'bi bi-play-fill';
+            }
+            button.title = enabled ? 'Pause this query' : 'Resume this query';
+        }
+
+        document.querySelectorAll('.query-toggle').forEach(button => {
+            button.addEventListener('click', function () {
+                this.disabled = true;
+                fetch('/toggle_query/' + this.dataset.queryId, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken}
+                })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.status === 'success') {
+                            applyEnabledState(this, data.enabled);
+                        }
+                        this.disabled = false;
+                    })
+                    .catch(error => {
+                        console.error('Error toggling query:', error);
+                        this.disabled = false;
+                    });
+            });
+        });
+
+        // Search, sort, paginate, and bulk-select the query table.
+        const queryTable = document.getElementById('queriesTable');
+        if (queryTable) {
+            const queryTableBody = queryTable.querySelector('tbody');
+            const sortHeaders = Array.from(queryTable.querySelectorAll('[data-sort-header]'));
+            const sortStatus = document.getElementById('querySortStatus');
+            const queryRows = Array.from(queryTableBody.querySelectorAll('[data-query-row]'));
+            const noResultsRow = document.getElementById('queryNoResultsRow');
+            const searchInput = document.getElementById('querySearchInput');
+            const clearSearchButton = document.getElementById('clearQuerySearch');
+            const resultsCount = document.getElementById('queryResultsCount');
+            const previousPageButton = document.getElementById('queryPreviousPage');
+            const nextPageButton = document.getElementById('queryNextPage');
+            const pageStatus = document.getElementById('queryPageStatus');
+            const selectAll = document.getElementById('querySelectAll');
+            const bulkButton = document.getElementById('bulkRemoveButton');
+            const bulkSelectedCount = document.getElementById('bulkSelectedCount');
+            const bulkDeleteCount = document.getElementById('bulkDeleteCount');
+            const bulkDeletePlural = document.getElementById('bulkDeletePlural');
+            const pageSize = 25;
+            let activeSortKey = 'lastFound';
+            let activeSortDirection = 'descending';
+            let currentPage = 1;
+
+            function matchingRowsForTerm() {
+                const term = searchInput.value.trim().toLocaleLowerCase();
+                return queryRows.filter(row => row.dataset.query.toLocaleLowerCase().includes(term));
+            }
+
+            function updateBulkUI() {
+                const selected = queryRows.filter(row => {
+                    const checkbox = row.querySelector('.query-select');
+                    return checkbox && checkbox.checked;
+                });
+                const count = selected.length;
+                if (bulkSelectedCount) {
+                    bulkSelectedCount.textContent = count;
+                }
+                if (bulkDeleteCount) {
+                    bulkDeleteCount.textContent = count;
+                }
+                if (bulkDeletePlural) {
+                    bulkDeletePlural.textContent = count === 1 ? 'y' : 'ies';
+                }
+                if (bulkButton) {
+                    bulkButton.disabled = count === 0;
+                }
+                if (selectAll) {
+                    const matching = matchingRowsForTerm();
+                    const matchingChecked = matching.filter(row => row.querySelector('.query-select').checked);
+                    selectAll.checked = matching.length > 0 && matchingChecked.length === matching.length;
+                    selectAll.indeterminate = matchingChecked.length > 0 && matchingChecked.length < matching.length;
+                }
+            }
+
+            function compareQueryRows(leftRow, rightRow, sortKey, direction) {
+                let comparison = 0;
+
+                if (sortKey === 'lastFound') {
+                    const leftValue = leftRow.dataset.lastFound;
+                    const rightValue = rightRow.dataset.lastFound;
+                    // Missing timestamps ("Never") stay at the bottom either way.
+                    if (!leftValue && !rightValue) {
+                        return 0;
+                    }
+                    if (!leftValue) {
+                        return 1;
+                    }
+                    if (!rightValue) {
+                        return -1;
+                    }
+                    comparison = Number(leftValue) - Number(rightValue);
+                } else if (sortKey === 'items') {
+                    comparison = Number(leftRow.dataset.itemCount || 0) - Number(rightRow.dataset.itemCount || 0);
+                } else {
+                    comparison = leftRow.dataset.query.localeCompare(
+                        rightRow.dataset.query,
+                        undefined,
+                        {numeric: true, sensitivity: 'base'}
+                    );
+                }
+
+                return direction === 'ascending' ? comparison : -comparison;
+            }
+
+            function updateSortHeaders(sortKey, direction) {
+                sortHeaders.forEach(header => {
+                    const button = header.querySelector('.table-sort-button');
+                    const indicator = header.querySelector('.sort-indicator');
+                    const isActive = header.dataset.sortHeader === sortKey;
+                    const label = button.dataset.sortLabel;
+
+                    header.setAttribute('aria-sort', isActive ? direction : 'none');
+                    indicator.classList.toggle('is-active', isActive);
+                    indicator.textContent = isActive
+                        ? (direction === 'ascending' ? '↑' : '↓')
+                        : '↕';
+
+                    if (isActive) {
+                        const nextDirection = direction === 'ascending' ? 'descending' : 'ascending';
+                        button.setAttribute(
+                            'aria-label',
+                            `${label}, sorted ${direction}. Activate to sort ${nextDirection}`
+                        );
+                    } else {
+                        button.setAttribute('aria-label', `Sort by ${label} ascending`);
+                    }
+                });
+            }
+
+            function renderQueryTable() {
+                const searchTerm = searchInput.value.trim().toLocaleLowerCase();
+                const orderedRows = queryRows.slice().sort((leftRow, rightRow) =>
+                    compareQueryRows(leftRow, rightRow, activeSortKey, activeSortDirection)
+                );
+                const matchingRows = orderedRows.filter(row =>
+                    row.dataset.query.toLocaleLowerCase().includes(searchTerm)
+                );
+                const pageCount = Math.max(1, Math.ceil(matchingRows.length / pageSize));
+                currentPage = Math.min(currentPage, pageCount);
+                const firstResultIndex = (currentPage - 1) * pageSize;
+                const pageRows = matchingRows.slice(firstResultIndex, firstResultIndex + pageSize);
+
+                queryRows.forEach(row => {
+                    row.hidden = true;
+                });
+                orderedRows.forEach(row => queryTableBody.appendChild(row));
+                queryTableBody.appendChild(noResultsRow);
+
+                matchingRows.forEach((row, index) => {
+                    row.querySelector('[data-row-number]').textContent = index + 1;
+                });
+                pageRows.forEach(row => {
+                    row.hidden = false;
+                });
+
+                noResultsRow.hidden = matchingRows.length !== 0;
+                clearSearchButton.hidden = searchInput.value.length === 0;
+                previousPageButton.disabled = currentPage <= 1 || matchingRows.length === 0;
+                nextPageButton.disabled = currentPage >= pageCount || matchingRows.length === 0;
+                pageStatus.textContent = `Page ${currentPage} of ${pageCount}`;
+
+                if (matchingRows.length === 0) {
+                    resultsCount.textContent = searchTerm
+                        ? `No queries match "${searchInput.value.trim()}"`
+                        : 'No queries found';
+                } else {
+                    const firstNumber = firstResultIndex + 1;
+                    const lastNumber = firstResultIndex + pageRows.length;
+                    resultsCount.textContent = searchTerm
+                        ? `Showing ${firstNumber}–${lastNumber} of ${matchingRows.length} matches`
+                        : `Showing ${firstNumber}–${lastNumber} of ${matchingRows.length} queries`;
+                }
+
+                updateBulkUI();
+            }
+
+            function sortQueryTable(sortKey, direction) {
+                activeSortKey = sortKey;
+                activeSortDirection = direction;
+                currentPage = 1;
+                updateSortHeaders(sortKey, direction);
+                renderQueryTable();
+
+                if (sortStatus) {
+                    const activeButton = queryTable.querySelector(`[data-sort-key="${sortKey}"]`);
+                    sortStatus.textContent = `Sorted by ${activeButton.dataset.sortLabel}, ${direction}`;
+                }
+            }
+
+            sortHeaders.forEach(header => {
+                const button = header.querySelector('.table-sort-button');
+                button.addEventListener('click', function () {
+                    const currentDirection = header.getAttribute('aria-sort');
+                    const nextDirection = currentDirection === 'ascending' ? 'descending' : 'ascending';
+                    sortQueryTable(this.dataset.sortKey, nextDirection);
+                });
+            });
+
+            searchInput.addEventListener('input', function () {
+                currentPage = 1;
+                renderQueryTable();
+            });
+
+            clearSearchButton.addEventListener('click', function () {
+                searchInput.value = '';
+                currentPage = 1;
+                renderQueryTable();
+                searchInput.focus();
+            });
+
+            previousPageButton.addEventListener('click', function () {
+                if (currentPage > 1) {
+                    currentPage -= 1;
+                    renderQueryTable();
+                    queryTable.scrollIntoView({block: 'nearest'});
+                }
+            });
+
+            nextPageButton.addEventListener('click', function () {
+                currentPage += 1;
+                renderQueryTable();
+                queryTable.scrollIntoView({block: 'nearest'});
+            });
+
+            // Bulk selection: the header checkbox selects every matching row
+            // (across pages), and selections persist while paging/searching.
+            if (selectAll) {
+                selectAll.addEventListener('change', function () {
+                    matchingRowsForTerm().forEach(row => {
+                        row.querySelector('.query-select').checked = selectAll.checked;
+                    });
+                    updateBulkUI();
+                });
+            }
+
+            queryRows.forEach(row => {
+                const checkbox = row.querySelector('.query-select');
+                if (checkbox) {
+                    checkbox.addEventListener('change', updateBulkUI);
+                }
+            });
+
+            updateSortHeaders(activeSortKey, activeSortDirection);
+            renderQueryTable();
+        }
+    });
+</script>
 {% endblock %}

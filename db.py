@@ -1,4 +1,6 @@
 import sqlite3
+import json
+import time
 from traceback import print_exc
 
 DB_PATH = "./data/vinted_notifications.db"
@@ -8,8 +10,7 @@ DEFAULT_MESSAGE_TEMPLATE = """🆕 Title : {title}
 💶 Price : {price}
 🛍️ Brand : {brand}
 Condition : {condition}
-<a href="{image}">&#8205;</a>
-Description : {description}"""
+<a href="{image}">&#8205;</a>"""
 
 
 def get_db_connection():
@@ -924,12 +925,14 @@ def is_telegram_user_admin(chat_id):
     return bool(user and user[2] == "approved" and int(user[3]) == 1)
 
 
-def get_queries(chat_id=None):
+def get_queries(chat_id=None, enabled_only=False):
     """
     Return all queries, or only those subscribed to by chat_id.
 
-    Tuple layout remains compatible with the original application:
-    (id, query, last_item, query_name)
+    When enabled_only is True, paused queries (enabled=0) are excluded — the
+    scraper uses this so a paused query stops making requests without being
+    deleted. The tuple layout remains compatible with the original
+    application: (id, query, last_item, query_name)
     """
     conn = None
     try:
@@ -941,8 +944,9 @@ def get_queries(chat_id=None):
                 """
                 SELECT id, query, last_item, query_name
                 FROM queries
+                {where}
                 ORDER BY id
-                """
+                """.format(where="WHERE enabled=1" if enabled_only else "")
             )
         else:
             cursor.execute(
@@ -950,9 +954,9 @@ def get_queries(chat_id=None):
                 SELECT q.id, q.query, q.last_item, q.query_name
                 FROM queries q
                 JOIN query_subscriptions s ON s.query_id=q.id
-                WHERE s.chat_id=?
+                WHERE s.chat_id=?{enabled}
                 ORDER BY s.created_at, q.id
-                """,
+                """.format(enabled=" AND q.enabled=1" if enabled_only else ""),
                 (str(chat_id),),
             )
 
@@ -1108,6 +1112,53 @@ def get_query_subscribers(query_id):
     except Exception:
         print_exc()
         return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def copy_query_subscriptions(source_chat_id, target_chat_id):
+    """Copy one approved user's subscriptions to another approved user.
+
+    Existing target subscriptions are retained, so the operation is safe to
+    repeat. Returns the number of newly copied subscriptions, or ``None`` when
+    either account is not approved or the database operation fails.
+    """
+    source_chat_id = str(source_chat_id)
+    target_chat_id = str(target_chat_id)
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM telegram_users
+            WHERE chat_id IN (?, ?) AND status='approved'
+            """,
+            (source_chat_id, target_chat_id),
+        )
+        expected_accounts = 1 if source_chat_id == target_chat_id else 2
+        if cursor.fetchone()[0] != expected_accounts:
+            return None
+
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO query_subscriptions (query_id, chat_id)
+            SELECT query_id, ?
+            FROM query_subscriptions
+            WHERE chat_id=?
+            """,
+            (target_chat_id, source_chat_id),
+        )
+        copied = cursor.rowcount
+        conn.commit()
+        return copied
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return None
     finally:
         if conn:
             conn.close()
@@ -1295,7 +1346,7 @@ def _add_message_template_variable(
 
 def migrate_message_template():
     """
-    Add condition and description variables to an existing message template.
+    Add the condition variable to an existing message template.
 
     A migration marker ensures this changes the user's template only once;
     later custom edits remain under the user's control.
@@ -1326,12 +1377,6 @@ def migrate_message_template():
             "{condition}",
             before_placeholder="{image}",
         )
-        template = _add_message_template_variable(
-            template,
-            "Description",
-            "{description}",
-        )
-
         cursor.execute(
             """
             INSERT INTO parameters (key, value)
@@ -1353,6 +1398,313 @@ def migrate_message_template():
     except Exception:
         print_exc()
         return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def _strip_description_placeholder(template):
+    """Remove the unreliable description placeholder without losing other text."""
+    cleaned_lines = []
+    for line in template.splitlines():
+        if "{description}" not in line:
+            cleaned_lines.append(line)
+            continue
+
+        cleaned = line.replace("{description}", "").rstrip()
+        label_only = cleaned.strip().lower().replace(" ", "")
+        if label_only not in {"", "description", "description:"}:
+            cleaned_lines.append(cleaned)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def migrate_remove_description_field():
+    """Remove the unreliable description field from saved message templates."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT value FROM parameters WHERE key=?",
+            ("message_template_description_removed_v2",),
+        )
+        marker = cursor.fetchone()
+        if marker and str(marker[0]).lower() == "true":
+            return True
+
+        cursor.execute(
+            "SELECT value FROM parameters WHERE key=?",
+            ("message_template",),
+        )
+        row = cursor.fetchone()
+        template = row[0] if row and row[0] else DEFAULT_MESSAGE_TEMPLATE
+        template = _strip_description_placeholder(template)
+        cursor.execute(
+            """
+            INSERT INTO parameters (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            ("message_template", template),
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO parameters (key, value)
+            VALUES (?, 'True')
+            ON CONFLICT(key) DO UPDATE SET value='True'
+            """,
+            ("message_template_description_removed_v2",),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+# --- Notification outbox ----------------------------------------------------
+# Telegram alerts are persisted here before an item is marked "seen", so a
+# crash or restart between finding an item and delivering it cannot lose the
+# notification. Rows are deleted on successful delivery.
+
+
+def migrate_pending_notifications_table():
+    """Create the durable notification outbox table if it does not exist."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                url TEXT,
+                button_text TEXT,
+                chat_ids TEXT,
+                query_id INTEGER,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(pending_notifications)")
+        }
+        if "query_id" not in columns:
+            conn.execute(
+                "ALTER TABLE pending_notifications ADD COLUMN query_id INTEGER"
+            )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def enqueue_notification(content, url, button_text, chat_ids, query_id=None):
+    """Persist one Telegram notification for delivery. Returns the new row id."""
+    conn = None
+    try:
+        chat_ids_json = (
+            json.dumps([str(c) for c in chat_ids]) if chat_ids else None
+        )
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO pending_notifications
+                (
+                    content, url, button_text, chat_ids, query_id,
+                    attempts, next_attempt_at
+                )
+            VALUES (?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                content,
+                url,
+                button_text,
+                chat_ids_json,
+                query_id,
+                time.time(),
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_due_notifications(limit=10):
+    """Return notifications whose next attempt time has arrived.
+
+    Each row is
+    (id, content, url, button_text, chat_ids_json, query_id, attempts).
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                id, content, url, button_text, chat_ids, query_id, attempts
+            FROM pending_notifications
+            WHERE next_attempt_at <= ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (time.time(), limit),
+        )
+        return cursor.fetchall()
+    except Exception:
+        print_exc()
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def delete_notification(notification_id):
+    """Remove a notification once delivered (or permanently undeliverable)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            "DELETE FROM pending_notifications WHERE id=?", (notification_id,)
+        )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def reschedule_notification(notification_id, attempts, next_attempt_at):
+    """Record a failed attempt and defer the next try."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            """
+            UPDATE pending_notifications
+            SET attempts=?, next_attempt_at=?
+            WHERE id=?
+            """,
+            (attempts, next_attempt_at, notification_id),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def count_pending_notifications():
+    """Return how many notifications are still awaiting delivery."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM pending_notifications")
+        return cursor.fetchone()[0]
+    except Exception:
+        print_exc()
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+# --- Query pause/enable + counts -------------------------------------------
+
+
+def migrate_query_enabled_column():
+    """Add the queries.enabled column to older databases if it's missing."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(queries)")]
+        if "enabled" not in columns:
+            conn.execute(
+                "ALTER TABLE queries ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"
+            )
+            conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_query_enabled(query_id, enabled):
+    """Pause (enabled=0) or resume (enabled=1) a single query."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            "UPDATE queries SET enabled=? WHERE id=?",
+            (1 if enabled else 0, query_id),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_query_enabled_map():
+    """Return {query_id: bool} of whether each query is enabled."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        rows = conn.execute("SELECT id, enabled FROM queries").fetchall()
+        return {row[0]: bool(row[1]) for row in rows}
+    except Exception:
+        print_exc()
+        return {}
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_query_item_counts():
+    """Return {query_id: number of items found} across all queries."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT query_id, COUNT(*) FROM items GROUP BY query_id"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+    except Exception:
+        print_exc()
+        return {}
     finally:
         if conn:
             conn.close()

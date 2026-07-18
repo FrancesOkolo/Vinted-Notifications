@@ -1,14 +1,35 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, NetworkError, BadRequest, Conflict
 import db
 import core
 import asyncio
-from queue import Empty
+import time
+import json
 from logger import get_logger
 
 # Get logger for this module
 logger = get_logger(__name__)
+
+# Delivery retry policy. A notification tool must not drop an alert on a
+# transient blip, so failed sends are retried with backoff before giving up.
+SEND_MAX_ATTEMPTS = 4
+SEND_BACKOFFS = (2, 5, 10)  # seconds to wait before attempts 2, 3, 4
+
+
+def is_retryable_telegram_error(error):
+    """True for transient errors worth retrying.
+
+    telegram.error.NetworkError covers timeouts and "Bad Gateway"-style
+    upstream hiccups. Note BadRequest is a *subclass* of NetworkError in
+    python-telegram-bot, but it signals a permanent client problem (invalid
+    chat id, message too long, malformed HTML) that will never succeed, so it
+    is excluded. Forbidden (bot blocked) is not a NetworkError and is likewise
+    not retried.
+    """
+    if isinstance(error, BadRequest):
+        return False
+    return isinstance(error, NetworkError)
 
 
 async def hello(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -58,19 +79,35 @@ async def hello(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 class LeRobot:
-    def __init__(self, queue):
+    def __init__(self, queue, polling_enabled=True):
         from telegram import Bot
-        from telegram.ext import ApplicationBuilder, CommandHandler
 
         try:
-
+            self.polling_enabled = polling_enabled
             self.bot = Bot(db.get_parameter("telegram_token"))
+            # Create the item queue to send to telegram
+            self.new_items_queue = queue
+            # Throttle repeated getUpdates-conflict logs (see on_error).
+            self._last_conflict_log = 0.0
+
+            if not polling_enabled:
+                self.app = None
+                logger.info(
+                    "Telegram send-only mode enabled: notifications will be "
+                    "delivered, but getUpdates command polling is disabled."
+                )
+                asyncio.run(self.run_send_only())
+                return
+
+            from telegram.ext import (
+                ApplicationBuilder,
+                CallbackQueryHandler,
+                CommandHandler,
+            )
+
             self.app = (
                 ApplicationBuilder().token(db.get_parameter("telegram_token")).build()
             )
-
-            # Create the item queue to send to telegram
-            self.new_items_queue = queue
 
             # Handler verify if bot is running
             self.app.add_handler(CommandHandler("hello", hello))
@@ -86,6 +123,9 @@ class LeRobot:
                 CommandHandler("revoke_user", self.revoke_user)
             )
             self.app.add_handler(CommandHandler("users", self.users))
+            self.app.add_handler(
+                CommandHandler("copy_my_queries", self.copy_my_queries)
+            )
             # Allowlist handlers
             self.app.add_handler(
                 CommandHandler("clear_allowlist", self.clear_allowlist)
@@ -93,22 +133,68 @@ class LeRobot:
             self.app.add_handler(CommandHandler("add_country", self.add_country))
             self.app.add_handler(CommandHandler("remove_country", self.remove_country))
             self.app.add_handler(CommandHandler("allowlist", self.allowlist))
+            self.app.add_handler(
+                CallbackQueryHandler(
+                    self.unsubscribe_query,
+                    pattern=r"^unsubscribe:\d+$",
+                )
+            )
 
             # TODO : Help command
 
             # TODO : Manage removals after current items have been processed.
+
+            # Handle otherwise-unhandled errors (e.g. transient polling
+            # NetworkErrors) so they don't dump full tracebacks to the log.
+            self.app.add_error_handler(self.on_error)
 
             job_queue = self.app.job_queue
             # Set the commands
             job_queue.run_once(self.set_commands, when=1)
             # Every day we check for a new version
             job_queue.run_repeating(self.check_version, interval=86400, first=1)
-            # Every second we check for new posts to send to telegram
-            job_queue.run_once(self.check_telegram_queue, when=1)
+            # Continuously deliver persisted notifications from the outbox.
+            job_queue.run_once(self.drain_outbox, when=1)
 
-            self.app.run_polling()
+            # drop_pending_updates avoids replaying a backlog of old commands
+            # that piled up while the bot was stopped.
+            self.app.run_polling(drop_pending_updates=True)
         except Exception as e:
             logger.error(f"Error initializing bot: {str(e)}", exc_info=True)
+
+    async def run_send_only(self):
+        """Deliver the outbox without receiving commands via getUpdates."""
+        await self.bot.initialize()
+        try:
+            await self.drain_outbox(None)
+        finally:
+            await self.bot.shutdown()
+
+    async def on_error(self, update, context):
+        """Global error handler for the Telegram application.
+
+        Transient network errors are logged as a single warning line; anything
+        else is logged as an error with a traceback for investigation.
+        """
+        error = context.error
+        if is_retryable_telegram_error(error):
+            logger.warning("Transient Telegram network error: %s", error)
+        elif isinstance(error, Conflict):
+            # Another instance is polling the same bot token. The polling loop
+            # retries fast, so log a concise, actionable message at most once a
+            # minute instead of a traceback on every retry.
+            now = time.monotonic()
+            if now - self._last_conflict_log > 60:
+                self._last_conflict_log = now
+                logger.error(
+                    "Telegram getUpdates conflict: another bot instance is "
+                    "polling the same token. Ensure only one instance runs "
+                    "(e.g. stop the local copy if the server is live)."
+                )
+        else:
+            logger.error(
+                "Unhandled Telegram error: %s", error, exc_info=error
+            )
 
     async def require_approved(self, update: Update) -> bool:
         chat_id = str(update.effective_chat.id)
@@ -243,6 +329,66 @@ class LeRobot:
         await update.message.reply_text(
             "Telegram users:\n" + "\n".join(lines)
         )
+
+    async def copy_my_queries(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Copy the administrator's subscriptions to an approved account."""
+        if not await self.require_admin(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /copy_my_queries CHAT_ID"
+            )
+            return
+
+        target_chat_id = context.args[0]
+        if not target_chat_id.lstrip("-").isdigit():
+            await update.message.reply_text("Invalid Telegram chat ID.")
+            return
+
+        if not db.is_telegram_user_approved(target_chat_id):
+            await update.message.reply_text(
+                "That Telegram account is not approved yet. "
+                "Use /approve_user first."
+            )
+            return
+
+        source_chat_id = str(update.effective_chat.id)
+        copied = db.copy_query_subscriptions(
+            source_chat_id,
+            target_chat_id,
+        )
+        if copied is None:
+            await update.message.reply_text(
+                "The query subscriptions could not be copied."
+            )
+            return
+
+        await update.message.reply_text(
+            f"Copied {copied} new query subscription(s) to "
+            f"{target_chat_id}. Existing subscriptions were kept."
+        )
+
+        try:
+            await self.bot.send_message(
+                chat_id=target_chat_id,
+                text=(
+                    "Your administrator shared their Vinted searches with "
+                    "your account.\n"
+                    "Use /queries to review them and /remove_query NUMBER "
+                    "to remove any you do not want."
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Subscriptions copied, but the target account could not be "
+                "notified.",
+                exc_info=True,
+            )
 
     ### QUERIES ###
 
@@ -493,6 +639,7 @@ class LeRobot:
         buy_url=None,
         buy_text=None,
         chat_ids=None,
+        query_id=None,
     ):
         if chat_ids is None:
             configured_chat_id = db.get_parameter("telegram_chat_id")
@@ -501,13 +648,25 @@ class LeRobot:
         if isinstance(chat_ids, (str, int)):
             chat_ids = [chat_ids]
 
-        buttons = [[InlineKeyboardButton(text=text, url=url)]]
+        # Only attach buttons when a link is supplied. Watchdog/status
+        # messages pass url=None and send as plain text.
+        buttons = []
+        if url and text:
+            buttons.append([InlineKeyboardButton(text=text, url=url)])
         if buy_url and buy_text:
+            buttons.append([InlineKeyboardButton(text=buy_text, url=buy_url)])
+        if query_id is not None and self.polling_enabled:
             buttons.append(
-                [InlineKeyboardButton(text=buy_text, url=buy_url)]
+                [
+                    InlineKeyboardButton(
+                        text="Unsubscribe from this search",
+                        callback_data=f"unsubscribe:{int(query_id)}",
+                    )
+                ]
             )
-        markup = InlineKeyboardMarkup(buttons)
+        markup = InlineKeyboardMarkup(buttons) if buttons else None
 
+        all_delivered = True
         for chat_id in {
             str(value).strip()
             for value in chat_ids
@@ -520,6 +679,90 @@ class LeRobot:
                 )
                 continue
 
+            delivered = await self._send_message_with_retries(
+                chat_id, content, markup
+            )
+            all_delivered = all_delivered and delivered
+
+        # True when every approved recipient received it (or there were none to
+        # deliver to). The outbox uses this to decide whether to retry.
+        return all_delivered
+
+    async def unsubscribe_query(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Unsubscribe only the Telegram account that clicked the button."""
+        callback = update.callback_query
+        if callback is None:
+            return
+
+        try:
+            query_id = int((callback.data or "").split(":", 1)[1])
+        except (IndexError, TypeError, ValueError):
+            await callback.answer(
+                "This unsubscribe button is invalid.",
+                show_alert=True,
+            )
+            return
+
+        chat_id = str(update.effective_chat.id)
+        if not db.is_telegram_user_approved(chat_id):
+            await callback.answer(
+                "This Telegram account is not approved.",
+                show_alert=True,
+            )
+            return
+
+        removed = db.remove_query_subscription(query_id, chat_id)
+        if not removed:
+            await callback.answer(
+                "You are already unsubscribed from this search.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer("Unsubscribed from this search.")
+
+        # Leave item-link buttons available, but remove the now-used
+        # unsubscribe button from this message.
+        markup = callback.message.reply_markup if callback.message else None
+        if markup:
+            remaining_rows = [
+                [
+                    button
+                    for button in row
+                    if not (
+                        button.callback_data
+                        and button.callback_data.startswith("unsubscribe:")
+                    )
+                ]
+                for row in markup.inline_keyboard
+            ]
+            remaining_rows = [row for row in remaining_rows if row]
+            try:
+                await callback.edit_message_reply_markup(
+                    InlineKeyboardMarkup(remaining_rows)
+                    if remaining_rows
+                    else None
+                )
+            except BadRequest:
+                logger.debug(
+                    "Subscription removed, but the Telegram message buttons "
+                    "could not be updated.",
+                    exc_info=True,
+                )
+
+    async def _send_message_with_retries(self, chat_id, content, markup):
+        """Send one message, retrying transient failures with backoff.
+
+        Returns True on success, False once the message is given up on. Only
+        transient errors are retried; permanent client errors (bad chat id,
+        blocked bot, malformed HTML) fail fast without wasting retries.
+        """
+        attempt = 0
+        while True:
             try:
                 await self.bot.send_message(
                     chat_id=chat_id,
@@ -529,29 +772,56 @@ class LeRobot:
                     write_timeout=40,
                     reply_markup=markup,
                 )
+                return True
             except RetryAfter as error:
-                retry_after = error.retry_after
-                logger.error(
-                    "Telegram flood control for chat %s. Retrying in %s seconds.",
+                wait_seconds = error.retry_after + 2
+                if attempt >= SEND_MAX_ATTEMPTS - 1:
+                    logger.error(
+                        "Gave up delivering to chat %s after flood control "
+                        "(%s attempts).",
+                        chat_id,
+                        attempt + 1,
+                    )
+                    return False
+                logger.warning(
+                    "Telegram flood control for chat %s; waiting %ss "
+                    "(attempt %s/%s).",
                     chat_id,
-                    retry_after + 2,
+                    wait_seconds,
+                    attempt + 1,
+                    SEND_MAX_ATTEMPTS,
                 )
-                await asyncio.sleep(retry_after + 2)
-                await self.bot.send_message(
-                    chat_id=chat_id,
-                    text=content,
-                    parse_mode="HTML",
-                    read_timeout=40,
-                    write_timeout=40,
-                    reply_markup=markup,
-                )
+                await asyncio.sleep(wait_seconds)
+                attempt += 1
             except Exception as error:
-                logger.error(
-                    "Error sending new post to chat %s: %s",
+                if not is_retryable_telegram_error(error):
+                    logger.error(
+                        "Permanent error delivering to chat %s (not retried): %s",
+                        chat_id,
+                        error,
+                        exc_info=True,
+                    )
+                    return False
+                if attempt >= SEND_MAX_ATTEMPTS - 1:
+                    logger.error(
+                        "Failed to deliver to chat %s after %s attempts: %s",
+                        chat_id,
+                        attempt + 1,
+                        error,
+                    )
+                    return False
+                wait_seconds = SEND_BACKOFFS[min(attempt, len(SEND_BACKOFFS) - 1)]
+                logger.warning(
+                    "Transient error delivering to chat %s (attempt %s/%s): "
+                    "%s; retrying in %ss.",
                     chat_id,
-                    str(error),
-                    exc_info=True,
+                    attempt + 1,
+                    SEND_MAX_ATTEMPTS,
+                    error,
+                    wait_seconds,
                 )
+                await asyncio.sleep(wait_seconds)
+                attempt += 1
 
     async def check_version(
         self,
@@ -579,48 +849,89 @@ class LeRobot:
                 exc_info=True,
             )
 
-    async def check_telegram_queue(
-        self,
-        context: ContextTypes.DEFAULT_TYPE,
-    ):
+    async def drain_outbox(self, context: ContextTypes.DEFAULT_TYPE):
+        """Continuously deliver persisted notifications from the outbox.
+
+        Rows are removed on success. A failed row is retried later with
+        backoff and dropped after too many attempts, so a permanently
+        undeliverable message can't wedge delivery. Because the outbox lives in
+        the database, undelivered notifications survive a restart — closing the
+        window where a crash could silently lose an alert.
+        """
+        max_attempts = 10
         while True:
             try:
-                item = self.new_items_queue.get_nowait()
-            except Empty:
-                await asyncio.sleep(0.1)
+                due = db.get_due_notifications(limit=10)
+            except Exception:
+                logger.error(
+                    "Could not read the notification outbox.", exc_info=True
+                )
+                await asyncio.sleep(5)
                 continue
 
-            try:
-                if len(item) == 6:
-                    (
-                        content,
-                        url,
-                        text,
-                        buy_url,
-                        buy_text,
-                        chat_ids,
-                    ) = item
-                else:
-                    content, url, text, buy_url, buy_text = item
+            if not due:
+                await asyncio.sleep(1)
+                continue
+
+            for (
+                notif_id,
+                content,
+                url,
+                button_text,
+                chat_ids_json,
+                query_id,
+                attempts,
+            ) in due:
+                try:
+                    chat_ids = (
+                        json.loads(chat_ids_json) if chat_ids_json else None
+                    )
+                except (TypeError, ValueError):
                     chat_ids = None
 
-                await self.send_new_post(
-                    content,
-                    url,
-                    text,
-                    buy_url,
-                    buy_text,
-                    chat_ids=chat_ids,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.error(
-                    "Error processing a Telegram queue item: %s",
-                    error,
-                    exc_info=True,
-                )
-                await asyncio.sleep(1)
+                try:
+                    delivered = await self.send_new_post(
+                        content,
+                        url,
+                        button_text,
+                        chat_ids=chat_ids,
+                        query_id=query_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.error(
+                        "Unexpected error delivering notification %s: %s",
+                        notif_id,
+                        error,
+                        exc_info=True,
+                    )
+                    delivered = False
+
+                if delivered:
+                    db.delete_notification(notif_id)
+                    continue
+
+                attempts += 1
+                if attempts >= max_attempts:
+                    logger.error(
+                        "Giving up on notification %s after %s attempts.",
+                        notif_id,
+                        attempts,
+                    )
+                    db.delete_notification(notif_id)
+                else:
+                    backoff = min(60 * attempts, 600)
+                    db.reschedule_notification(
+                        notif_id, attempts, time.time() + backoff
+                    )
+                    logger.warning(
+                        "Notification %s not delivered (attempt %s); "
+                        "retrying in %ss.",
+                        notif_id,
+                        attempts,
+                        backoff,
+                    )
 
     async def set_commands(self, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -634,6 +945,7 @@ class LeRobot:
                     ("approve_user", "Admin: approve an account"),
                     ("revoke_user", "Admin: revoke an account"),
                     ("users", "Admin: list bot accounts"),
+                    ("copy_my_queries", "Admin: share your searches"),
                     ("clear_allowlist", "Admin: clear country allowlist"),
                     ("add_country", "Admin: add an allowed country"),
                     ("remove_country", "Admin: remove an allowed country"),
