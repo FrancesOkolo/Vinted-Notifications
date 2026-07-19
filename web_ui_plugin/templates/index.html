@@ -93,6 +93,49 @@
     </div>
 </div>
 
+<!-- Compact live health summary -->
+<div class="row mb-4">
+    <div class="col-12">
+        <section class="card dashboard-health-card health-loading" id="dashboardHealthCard"
+                 aria-labelledby="dashboardHealthTitle">
+            <div class="card-body dashboard-health-layout">
+                <div class="dashboard-health-heading">
+                    <span class="dashboard-health-icon" id="dashboardHealthIcon" aria-hidden="true">
+                        <i class="bi bi-activity"></i>
+                    </span>
+                    <div>
+                        <h5 class="mb-1" id="dashboardHealthTitle">System Health</h5>
+                        <p class="small text-muted mb-0" id="dashboardHealthSummary" aria-live="polite">
+                            Checking application health…
+                        </p>
+                    </div>
+                </div>
+                <div class="dashboard-health-metrics">
+                    <div class="dashboard-health-metric">
+                        <span class="dashboard-health-label">Scraper</span>
+                        <strong id="dashboardHealthScraper">Checking…</strong>
+                    </div>
+                    <div class="dashboard-health-metric">
+                        <span class="dashboard-health-label">Last successful scrape</span>
+                        <strong id="dashboardHealthLastOk">—</strong>
+                    </div>
+                    <div class="dashboard-health-metric">
+                        <span class="dashboard-health-label">Pending alerts</span>
+                        <strong id="dashboardHealthPending">—</strong>
+                    </div>
+                    <div class="dashboard-health-metric">
+                        <span class="dashboard-health-label">Scraper protection</span>
+                        <strong id="dashboardHealthProtection">Checking…</strong>
+                    </div>
+                </div>
+                <a href="/config#system-health" class="btn btn-sm btn-outline-primary dashboard-health-details">
+                    Details <i class="bi bi-chevron-right ms-1" aria-hidden="true"></i>
+                </a>
+            </div>
+        </section>
+    </div>
+</div>
+
 <div class="row mb-4">
     <div class="col-md-12">
         <div class="card dashboard-section">
@@ -462,6 +505,118 @@
                     });
             });
         });
+
+        // Compact live System Health summary.
+        const dashboardHealthCard = document.getElementById('dashboardHealthCard');
+        const dashboardHealthIcon = document.querySelector('#dashboardHealthIcon i');
+        const dashboardHealthSummary = document.getElementById('dashboardHealthSummary');
+        const dashboardHealthScraper = document.getElementById('dashboardHealthScraper');
+        const dashboardHealthLastOk = document.getElementById('dashboardHealthLastOk');
+        const dashboardHealthPending = document.getElementById('dashboardHealthPending');
+        const dashboardHealthProtection = document.getElementById('dashboardHealthProtection');
+
+        function formatDashboardHealthAge(seconds) {
+            if (seconds === null || seconds === undefined) return 'Never';
+            if (seconds < 90) return Math.round(seconds) + 's ago';
+            if (seconds < 5400) return Math.round(seconds / 60) + 'm ago';
+            if (seconds < 129600) return Math.round(seconds / 3600) + 'h ago';
+            return Math.round(seconds / 86400) + 'd ago';
+        }
+
+        function setDashboardHealthState(state) {
+            dashboardHealthCard.classList.remove(
+                'health-loading',
+                'health-ok',
+                'health-warning',
+                'health-danger'
+            );
+            dashboardHealthCard.classList.add('health-' + state);
+        }
+
+        function loadDashboardHealth() {
+            if (!dashboardHealthCard) return;
+
+            fetch('/config/health', {
+                headers: {'Accept': 'application/json'}
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Health endpoint returned ' + response.status);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    const scraper = data.scraper || {};
+                    const pendingAlerts = Number(data.pending_notifications || 0);
+                    const cooldownActive = Boolean(scraper.cooldown_active);
+                    const cooldownMinutes = Math.max(
+                        1,
+                        Math.ceil(Number(scraper.cooldown_remaining || 0) / 60)
+                    );
+
+                    let state = 'ok';
+                    let scraperText = 'Healthy';
+                    let summary = 'Scraper and notification delivery are operating normally.';
+                    let iconClass = 'bi bi-check-circle-fill';
+
+                    if (scraper.status === 'stalled') {
+                        state = 'danger';
+                        scraperText = 'Stalled';
+                        summary = 'No recent scraper heartbeat has been recorded.';
+                        iconClass = 'bi bi-exclamation-octagon-fill';
+                    } else if (cooldownActive) {
+                        state = 'warning';
+                        scraperText = 'Cooldown';
+                        summary = 'Scraping is safely paused after Vinted returned HTTP ' +
+                            (scraper.last_block_status || 403) + '.';
+                        iconClass = 'bi bi-shield-exclamation';
+                    } else if (scraper.status === 'blocked') {
+                        state = 'warning';
+                        scraperText = 'Recovery check';
+                        summary = 'Waiting for a successful scrape to confirm recovery.';
+                        iconClass = 'bi bi-shield-exclamation';
+                    }
+
+                    setDashboardHealthState(state);
+                    dashboardHealthIcon.className = iconClass;
+                    dashboardHealthSummary.textContent = summary;
+                    dashboardHealthScraper.textContent = scraperText;
+                    dashboardHealthScraper.className =
+                        state === 'ok' ? 'text-success' :
+                            state === 'danger' ? 'text-danger' : 'text-warning';
+                    dashboardHealthLastOk.textContent =
+                        formatDashboardHealthAge(scraper.last_ok_age);
+                    dashboardHealthPending.textContent = String(pendingAlerts);
+                    dashboardHealthPending.className =
+                        pendingAlerts > 0 ? 'text-warning' : 'text-success';
+
+                    if (cooldownActive) {
+                        dashboardHealthProtection.textContent =
+                            cooldownMinutes + 'm remaining';
+                    } else if (Number(scraper.cooldown_level || 0) > 0) {
+                        dashboardHealthProtection.textContent = 'Awaiting recovery';
+                    } else {
+                        dashboardHealthProtection.textContent = 'Ready';
+                    }
+                })
+                .catch(error => {
+                    console.error('Dashboard health load failed:', error);
+                    setDashboardHealthState('danger');
+                    dashboardHealthIcon.className = 'bi bi-wifi-off';
+                    dashboardHealthSummary.textContent = 'Health data is temporarily unavailable.';
+                    dashboardHealthScraper.textContent = 'Unavailable';
+                    dashboardHealthScraper.className = 'text-danger';
+                    dashboardHealthLastOk.textContent = '—';
+                    dashboardHealthPending.textContent = '—';
+                    dashboardHealthPending.className = '';
+                    dashboardHealthProtection.textContent = 'Unknown';
+                });
+        }
+
+        if (dashboardHealthCard) {
+            loadDashboardHealth();
+            window.setInterval(loadDashboardHealth, 20000);
+        }
 
         // View toggle functionality
         const cardViewBtn = document.getElementById('cardViewBtn');

@@ -1406,3 +1406,22 @@ def test_dashboard_has_search_pagination_relative_times_and_collapsible_sections
     assert "data-relative-time" in template
     assert "Intl.RelativeTimeFormat" in template
     assert "items = db.get_items(limit=5)" in web_source
+
+
+def test_dashboard_has_live_system_health_summary():
+    template = (ROOT / "web_ui_plugin" / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    config = (ROOT / "web_ui_plugin" / "templates" / "config.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'id="dashboardHealthCard"' in template
+    assert 'id="dashboardHealthScraper"' in template
+    assert 'id="dashboardHealthLastOk"' in template
+    assert 'id="dashboardHealthPending"' in template
+    assert 'id="dashboardHealthProtection"' in template
+    assert "fetch('/config/health'" in template
+    assert "cooldown_remaining" in template
+    assert 'href="/config#system-health"' in template
+    assert 'id="system-health"' in config
