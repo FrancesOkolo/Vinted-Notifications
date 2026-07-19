@@ -53,7 +53,7 @@
                             <option value="title_asc" {% if sort == 'title_asc' %}selected{% endif %}>Title A–Z</option>
                         </select>
                     </div>
-                    <div class="col-12 d-flex gap-2">
+                    <div class="col-12 d-flex gap-2 items-filter-actions">
                         <button type="submit" class="btn btn-primary">
                             <i class="bi bi-search me-1"></i> Apply
                         </button>
@@ -68,7 +68,7 @@
 <div class="row">
     <div class="col-md-12">
         <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
+            <div class="card-header d-flex justify-content-between align-items-center items-results-header">
                 <div class="d-flex align-items-center">
                     <i class="bi bi-box-seam me-2 text-info"></i>
                     <h5 class="card-title mb-0">
@@ -80,7 +80,7 @@
                         <span class="badge bg-secondary ms-2">{{ total_items }}</span>
                     </h5>
                 </div>
-                <div class="btn-group" role="group" aria-label="View toggle">
+                <div class="btn-group items-view-toggle" role="group" aria-label="View toggle">
                     <button type="button" class="btn btn-sm btn-outline-primary" id="cardViewBtn">
                         <i class="bi bi-grid-3x3-gap-fill me-1"></i> Cards
                     </button>
@@ -125,8 +125,11 @@
                             </div>
                             <div class="card-footer bg-white p-3">
                                 <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer"
-                                   class="btn btn-primary w-100">
-                                    <i class="bi bi-box-arrow-up-right me-1"></i> View on Vinted
+                                   class="btn btn-primary w-100"
+                                   aria-label="View {{ item.title }} on Vinted">
+                                    <i class="bi bi-box-arrow-up-right me-1" aria-hidden="true"></i>
+                                    <span class="item-view-label-full">View on Vinted</span>
+                                    <span class="item-view-label-short">View</span>
                                 </a>
                             </div>
                         </div>
@@ -192,7 +195,7 @@
                     </table>
                 </div>
             </div>
-            <div class="card-footer d-flex justify-content-between align-items-center">
+            <div class="card-footer d-flex justify-content-between align-items-center items-pagination">
                 {% if prev_url %}
                 <a href="{{ prev_url }}" class="btn btn-sm btn-outline-secondary">
                     <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous

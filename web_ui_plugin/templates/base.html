@@ -70,11 +70,11 @@
         /* Sidebar styling */
         .sidebar {
             position: fixed;
-            top: 0;
+            top: 60px;
             bottom: 0;
             left: 0;
             z-index: 100;
-            padding: 60px 0 0;
+            padding: 0;
             box-shadow: inset -1px 0 0 rgba(0, 0, 0, .1);
             height: auto;
         }
@@ -135,6 +135,35 @@
 
         /* Responsive footer adjustments */
         @media (max-width: 767.98px) {
+            .app-header-inner {
+                gap: 0.35rem;
+                padding-left: 0.5rem;
+                padding-right: 0.5rem;
+            }
+
+            .navbar-brand {
+                flex: 0 1 auto;
+                font-size: 1.1rem;
+                min-width: 0;
+                overflow: hidden;
+                padding: 0.5rem 0;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
+            .header-btn {
+                align-items: center;
+                display: inline-flex;
+                justify-content: center;
+                min-height: 44px;
+                min-width: 44px;
+                padding: 0.4rem 0.65rem;
+            }
+
+            .app-main {
+                padding-top: 1rem;
+            }
+
             .footer .col-md-4 {
                 text-align: center !important;
                 margin-bottom: 0.5rem;
@@ -145,7 +174,24 @@
             }
 
             .sidebar {
+                background-color: var(--bs-body-bg);
                 bottom: auto;
+                box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.18);
+                max-height: calc(100vh - 60px);
+                overflow-y: auto;
+                width: 100%;
+            }
+
+            .sidebar-sticky {
+                height: auto;
+                max-height: calc(100vh - 60px);
+            }
+
+            .flash-messages {
+                left: 0.75rem;
+                max-width: none;
+                right: 0.75rem;
+                top: 68px;
             }
         }
 
@@ -197,17 +243,19 @@
 </head>
 <body>
 <header class="navbar navbar-dark sticky-top app-header flex-md-nowrap p-0 shadow">
-    <div class="container-fluid">
-        <a class="navbar-brand col-md-2 col-lg-2 me-0" href="/">
-            <i class="bi bi-bell-fill me-2"></i>Vinted Notifications
-        </a>
-        <button class="navbar-toggler position-absolute d-md-none collapsed" type="button" data-bs-toggle="collapse"
+    <div class="container-fluid app-header-inner">
+        <button class="navbar-toggler d-md-none collapsed mobile-nav-toggle" type="button" data-bs-toggle="collapse"
                 data-bs-target="#sidebarMenu" aria-controls="sidebarMenu" aria-expanded="false"
                 aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
         </button>
-        <div class="d-flex ms-auto me-3 align-items-center">
-            <button type="button" class="btn btn-outline-light btn-sm header-btn me-2" id="themeToggle"
+        <a class="navbar-brand col-md-2 col-lg-2 me-0" href="/">
+            <i class="bi bi-bell-fill me-2"></i>
+            <span class="brand-full">Vinted Notifications</span>
+            <span class="brand-short">Vinted</span>
+        </a>
+        <div class="d-flex ms-auto align-items-center app-header-actions">
+            <button type="button" class="btn btn-outline-light btn-sm header-btn header-icon-btn" id="themeToggle"
                     title="Toggle dark mode" aria-label="Toggle dark mode">
                 <i class="bi bi-moon-stars" id="themeToggleIcon" aria-hidden="true"></i>
             </button>
@@ -222,9 +270,11 @@
                             {% endif %}
                         </span>
             {% endif %}
-            <a href="{{ github_url }}" target="_blank" class="btn btn-outline-light btn-sm header-btn"
+            <a href="{{ github_url }}" target="_blank" rel="noopener noreferrer"
+               class="btn btn-outline-light btn-sm header-btn"
+               aria-label="Open GitHub repository" title="Open GitHub repository"
                style="font-weight: bold; text-shadow: 0 0 3px rgba(0,0,0,0.3);">
-                <i class="bi bi-github me-1"></i> GitHub
+                <i class="bi bi-github me-sm-1" aria-hidden="true"></i><span class="d-none d-sm-inline">GitHub</span>
             </a>
             {% endif %}
         </div>
@@ -270,7 +320,7 @@
             </div>
         </nav>
 
-        <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4">
+        <main class="col-md-10 ms-sm-auto col-lg-10 px-md-4 app-main">
             {% block content %}{% endblock %}
         </main>
     </div>

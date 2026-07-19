@@ -1343,6 +1343,27 @@ def test_dark_mode_toggle_is_wired():
     assert '[data-bs-theme="dark"]' in template  # dark overrides for custom elements
 
 
+def test_responsive_layout_hooks_are_present():
+    base = (ROOT / "web_ui_plugin" / "templates" / "base.html").read_text(
+        encoding="utf-8"
+    )
+    items = (ROOT / "web_ui_plugin" / "templates" / "items.html").read_text(
+        encoding="utf-8"
+    )
+    css = (
+        ROOT / "web_ui_plugin" / "static" / "css" / "custom.css"
+    ).read_text(encoding="utf-8")
+
+    assert "mobile-nav-toggle" in base
+    assert "brand-short" in base
+    assert "col-md-10" in base
+    assert "items-results-header" in items
+    assert "items-pagination" in items
+    assert "@media (max-width: 768px)" in css
+    assert "min-height: 44px" in css
+    assert "prefers-reduced-motion: reduce" in css
+
+
 def test_logs_viewer_renders_messages_as_text_not_html():
     template = (ROOT / "web_ui_plugin" / "templates" / "logs.html").read_text(
         encoding="utf-8"
