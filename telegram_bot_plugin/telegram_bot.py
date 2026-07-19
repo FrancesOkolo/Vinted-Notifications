@@ -723,29 +723,34 @@ class LeRobot:
             )
             return
 
-        await callback.answer("Unsubscribed from this search.")
+        await callback.answer(
+            "Unsubscribed from this search.",
+            show_alert=True,
+        )
 
-        # Leave item-link buttons available, but remove the now-used
-        # unsubscribe button from this message.
+        # Leave item-link buttons available and turn the action into a
+        # persistent confirmation. Telegram's normal callback toast is brief,
+        # so removing the button left no visible indication that it worked.
         markup = callback.message.reply_markup if callback.message else None
         if markup:
-            remaining_rows = [
+            updated_rows = [
                 [
-                    button
-                    for button in row
-                    if not (
+                    InlineKeyboardButton(
+                        text="✅ Unsubscribed",
+                        callback_data=button.callback_data,
+                    )
+                    if (
                         button.callback_data
                         and button.callback_data.startswith("unsubscribe:")
                     )
+                    else button
+                    for button in row
                 ]
                 for row in markup.inline_keyboard
             ]
-            remaining_rows = [row for row in remaining_rows if row]
             try:
                 await callback.edit_message_reply_markup(
-                    InlineKeyboardMarkup(remaining_rows)
-                    if remaining_rows
-                    else None
+                    InlineKeyboardMarkup(updated_rows)
                 )
             except BadRequest:
                 logger.debug(

@@ -534,28 +534,72 @@ def update_query(query_id):
     return redirect(url_for("queries"))
 
 
+_VALID_ITEM_SORTS = {
+    "date_desc",
+    "date_asc",
+    "price_asc",
+    "price_desc",
+    "title_asc",
+}
+_ITEMS_PAGE_SIZE = 24
+
+
 @app.route("/items")
 def items():
-    query_id = request.args.get("query", "")  # Default to empty string instead of None
-    try:
-        limit = max(1, min(int(request.args.get("limit", 50)), 500))
-    except ValueError:
-        limit = 50
+    query_id = request.args.get("query", "").strip()
+    search = request.args.get("search", "").strip()
+    sort = request.args.get("sort", "date_desc")
+    if sort not in _VALID_ITEM_SORTS:
+        sort = "date_desc"
 
-    # Get items
+    def _parse_price(name):
+        raw = request.args.get(name, "").strip()
+        if not raw:
+            return None
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return None
+
+    price_min = _parse_price("price_min")
+    price_max = _parse_price("price_max")
+
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except ValueError:
+        page = 1
+
+    # Resolve the selected query id to its stored URL for filtering.
     query_string = None
     if query_id:
-        # Get the actual query string for the given ID
-        queries = db.get_queries()
-        for q in queries:
+        for q in db.get_queries():
             if str(q[0]) == query_id:
                 query_string = q[1]
                 break
 
-    items_data = db.get_items(limit=limit, query=query_string)
-    formatted_items = []
+    total = db.count_items(
+        query=query_string,
+        search=search or None,
+        price_min=price_min,
+        price_max=price_max,
+    )
+    total_pages = max(1, (total + _ITEMS_PAGE_SIZE - 1) // _ITEMS_PAGE_SIZE)
+    page = min(page, total_pages)
+    offset = (page - 1) * _ITEMS_PAGE_SIZE
 
+    items_data = db.get_items(
+        limit=_ITEMS_PAGE_SIZE,
+        offset=offset,
+        query=query_string,
+        search=search or None,
+        price_min=price_min,
+        price_max=price_max,
+        sort=sort,
+    )
+
+    formatted_items = []
     for item in items_data:
+        search_text = parse_qs(urlparse(item[5]).query).get("search_text", [None])[0]
         formatted_items.append(
             {
                 "title": item[1],
@@ -564,35 +608,47 @@ def items():
                 "timestamp": datetime.fromtimestamp(item[4]).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 ),
-                # Ugly Ugly Ugly very Ugly eeew but I have to do a proper migration of existing db later else it'll break
-                # Eeew bad me >:c
-                "query": (
-                    item[7] if item[7] else parse_qs(urlparse(item[5]).query).get("search_text", [None])[0]
-                    if parse_qs(urlparse(item[5]).query).get("search_text", [None])[0]
-                    else item[5]
+                "timestamp_raw": item[4],
+                "query": item[7] or search_text or item[5],
+                "url": (
+                    f"{urlparse(item[5]).scheme}://{urlparse(item[5]).netloc}"
+                    f"/items/{item[0]}"
                 ),
-                "url": f"{urlparse(item[5]).scheme}://{urlparse(item[5]).netloc}/items/{item[0]}",
                 "photo_url": item[6],
             }
         )
 
-    # Get queries for filter dropdown
-    queries = db.get_queries()
+    # Queries for the filter dropdown.
     formatted_queries = []
     selected_query_display = None
-    for i, q in enumerate(queries):
-        parsed_query = urlparse(q[1])
-        query_params = parse_qs(parsed_query.query)
+    for i, q in enumerate(db.get_queries()):
+        query_params = parse_qs(urlparse(q[1]).query)
         query_name = (
             q[3] if q[3] is not None else query_params.get("search_text", [None])[0]
         )
         display_name = query_name if query_name else q[0]
-        # Store display name for selected query
         if query_id == str(q[0]):
             selected_query_display = display_name
         formatted_queries.append(
             {"id": i + 1, "query_id": q[0], "query": q[1], "display": display_name}
         )
+
+    # Pagination links that preserve the active filters.
+    filter_args = {}
+    if query_id:
+        filter_args["query"] = query_id
+    if search:
+        filter_args["search"] = search
+    if request.args.get("price_min", "").strip():
+        filter_args["price_min"] = request.args.get("price_min").strip()
+    if request.args.get("price_max", "").strip():
+        filter_args["price_max"] = request.args.get("price_max").strip()
+    if sort != "date_desc":
+        filter_args["sort"] = sort
+    prev_url = url_for("items", page=page - 1, **filter_args) if page > 1 else None
+    next_url = (
+        url_for("items", page=page + 1, **filter_args) if page < total_pages else None
+    )
 
     return render_template(
         "items.html",
@@ -600,7 +656,15 @@ def items():
         queries=formatted_queries,
         selected_query=query_id,
         selected_query_display=selected_query_display,
-        limit=limit,
+        search=search,
+        price_min=request.args.get("price_min", "").strip(),
+        price_max=request.args.get("price_max", "").strip(),
+        sort=sort,
+        page=page,
+        total_pages=total_pages,
+        total_items=total,
+        prev_url=prev_url,
+        next_url=next_url,
     )
 
 
@@ -743,6 +807,10 @@ def config_health():
                 "heartbeat_age": health["heartbeat_age"],
                 "last_ok_age": health["last_ok_age"],
                 "failed_cycles": health["failed_cycles"],
+                "cooldown_active": health["cooldown_active"],
+                "cooldown_remaining": health["cooldown_remaining"],
+                "cooldown_level": health["cooldown_level"],
+                "last_block_status": health["last_block_status"],
             },
             "queries": {
                 "total": len(enabled_map),

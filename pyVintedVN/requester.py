@@ -100,8 +100,10 @@ class Requester:
         """
         Make a GET request with retry logic.
 
-        If a 401 status code is received, it will attempt to refresh cookies
-        and retry the request up to MAX_RETRIES times.
+        Authentication failures may refresh cookies and retry. Blocking and
+        rate-limit responses are returned immediately so the scraper-level
+        circuit breaker can stop the whole cycle instead of multiplying a
+        Vinted rejection across hidden retries.
 
         Args:
             url (str): The URL to request
@@ -119,49 +121,45 @@ class Requester:
         if self.debug and proxy_configured:
             logger.debug(f"Using proxy: {self.session.proxies}")
 
-        tried = 0
-        new_session = False
-        while tried < self.MAX_RETRIES:
-            tried += 1
+        for attempt in range(1, self.MAX_RETRIES + 1):
             with self.session.get(
                 url,
                 params=params,
                 timeout=REQUEST_TIMEOUT,
             ) as response:
-                if response.status_code in (401, 404) and tried < self.MAX_RETRIES:
-                    print(f"Cookies invalid, retrying {tried}/{self.MAX_RETRIES}")
+                if response.status_code == 200:
+                    return response
+
+                # A 403 is normally an anti-bot/IP rejection and a 429 is an
+                # explicit rate limit. Retrying either response here used to
+                # create up to six catalogue requests before core.py even knew
+                # that one query had failed.
+                if response.status_code in (403, 429):
+                    logger.warning(
+                        "Vinted returned HTTP %s; deferring retry policy to "
+                        "the scraper circuit breaker.",
+                        response.status_code,
+                    )
+                    return response
+
+                if (
+                    response.status_code in (401, 404)
+                    and attempt < self.MAX_RETRIES
+                ):
+                    print(
+                        "Cookies invalid, retrying "
+                        f"{attempt}/{self.MAX_RETRIES}"
+                    )
                     if self.debug:
                         logger.debug(
-                            f"Cookies invalid retrying {tried}/{self.MAX_RETRIES}"
+                            "Cookies invalid retrying %s/%s",
+                            attempt,
+                            self.MAX_RETRIES,
                         )
                     self.set_cookies()
-                elif response.status_code == 200:
-                    return response
-                elif tried == self.MAX_RETRIES:
-                    # If we've reached max retries, return the last response
-                    # even if it's not a 200 status code
+                    continue
 
-                    # New try : if we still get a 401 or 403, we reset the session
-                    if response.status_code in (401, 403) and not new_session:
-                        # Log the error details for 401 and 403 errors, including headers and body snippet
-                        logger.error(
-                            f"Received {response.status_code} error for URL: {url}\n"
-                            f"Response headers: {dict(response.headers)}\n"
-                            f"Response body (first 500 chars): {response.text[:500]}"
-                        )
-
-                        new_session = True
-                        self.session = requests.Session()
-                        self.session.headers.update(self.HEADER)
-                        # proxy
-                        proxy_configured = proxies.configure_proxy(self.session)
-                        if self.debug:
-                            logger.debug(
-                                f"Session reset due to {response.status_code} error"
-                            )
-                        tried = 0
-                        continue
-                    return response
+                return response
 
         # This should only happen if the loop exits without returning
         raise HTTPError(

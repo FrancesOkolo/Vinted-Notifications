@@ -282,6 +282,21 @@ def check_scraper_watchdog():
         if problem:
             if health["stalled"]:
                 reason = "has stalled with no recent scrape activity"
+            elif health["cooldown_active"]:
+                minutes = max(
+                    1,
+                    (health["cooldown_remaining"] + 59) // 60,
+                )
+                reason = (
+                    "paused itself after Vinted returned HTTP "
+                    f"{health['last_block_status'] or 403}; retrying in "
+                    f"about {minutes} minute(s)"
+                )
+            elif health["cooldown_level"] > 0:
+                reason = (
+                    "is waiting for a successful Vinted scrape after HTTP "
+                    f"{health['last_block_status'] or 403}"
+                )
             else:
                 reason = (
                     "appears to be blocked by Vinted "

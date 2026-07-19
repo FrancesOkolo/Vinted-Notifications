@@ -12,42 +12,52 @@
         <div class="card">
             <div class="card-header d-flex align-items-center">
                 <i class="bi bi-funnel-fill me-2 text-info"></i>
-                <h5 class="card-title mb-0">Filter Items</h5>
+                <h5 class="card-title mb-0">Filter &amp; Sort</h5>
             </div>
             <div class="card-body">
-                <form action="/items" method="get">
-                    <div class="row">
-                        <div class="col-md-5">
-                            <div class="form-group mb-3">
-                                <label for="query" class="form-label fw-semibold">Search by Query</label>
-                                <select class="form-select" id="query" name="query">
-                                    <option value="">All Queries</option>
-                                    {% for query in queries %}
-                                    <option value="{{ query.query_id }}" {% if selected_query== query.query_id
-                                            %}selected{%
-                                            endif %}>
-                                        {{ query.display }}
-                                    </option>
-                                    {% endfor %}
-                                </select>
-                            </div>
-                        </div>
-                        <div class="col-md-5">
-                            <div class="form-group mb-3">
-                                <label for="limit" class="form-label fw-semibold">Number of Items</label>
-                                <select class="form-select" id="limit" name="limit">
-                                    <option value="10" {% if limit== 10 %}selected{% endif %}>10 items</option>
-                                    <option value="25" {% if limit== 25 %}selected{% endif %}>25 items</option>
-                                    <option value="50" {% if limit== 50 %}selected{% endif %}>50 items</option>
-                                    <option value="100" {% if limit== 100 %}selected{% endif %}>100 items</option>
-                                </select>
-                            </div>
-                        </div>
-                        <div class="col-md-2 d-flex align-items-center">
-                            <button type="submit" class="btn btn-primary w-100">
-                                <i class="bi bi-search me-1"></i> Apply Filter
-                            </button>
-                        </div>
+                <form action="/items" method="get" class="row g-3 align-items-end">
+                    <div class="col-md-3">
+                        <label for="query" class="form-label fw-semibold">Query</label>
+                        <select class="form-select" id="query" name="query">
+                            <option value="">All queries</option>
+                            {% for q in queries %}
+                            <option value="{{ q.query_id }}"
+                                    {% if selected_query == q.query_id|string %}selected{% endif %}>
+                                {{ q.display }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-3">
+                        <label for="search" class="form-label fw-semibold">Search title</label>
+                        <input type="search" class="form-control" id="search" name="search"
+                               value="{{ search }}" placeholder="e.g. nike" autocomplete="off">
+                    </div>
+                    <div class="col-6 col-md-2">
+                        <label for="price_min" class="form-label fw-semibold">Min price</label>
+                        <input type="number" class="form-control" id="price_min" name="price_min"
+                               value="{{ price_min }}" min="0" step="0.01" placeholder="0">
+                    </div>
+                    <div class="col-6 col-md-2">
+                        <label for="price_max" class="form-label fw-semibold">Max price</label>
+                        <input type="number" class="form-control" id="price_max" name="price_max"
+                               value="{{ price_max }}" min="0" step="0.01" placeholder="∞">
+                    </div>
+                    <div class="col-md-2">
+                        <label for="sort" class="form-label fw-semibold">Sort</label>
+                        <select class="form-select" id="sort" name="sort">
+                            <option value="date_desc" {% if sort == 'date_desc' %}selected{% endif %}>Newest first</option>
+                            <option value="date_asc" {% if sort == 'date_asc' %}selected{% endif %}>Oldest first</option>
+                            <option value="price_asc" {% if sort == 'price_asc' %}selected{% endif %}>Price: low to high</option>
+                            <option value="price_desc" {% if sort == 'price_desc' %}selected{% endif %}>Price: high to low</option>
+                            <option value="title_asc" {% if sort == 'title_asc' %}selected{% endif %}>Title A–Z</option>
+                        </select>
+                    </div>
+                    <div class="col-12 d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-search me-1"></i> Apply
+                        </button>
+                        <a href="/items" class="btn btn-outline-secondary">Reset</a>
                     </div>
                 </form>
             </div>
@@ -63,10 +73,11 @@
                     <i class="bi bi-box-seam me-2 text-info"></i>
                     <h5 class="card-title mb-0">
                         {% if selected_query %}
-                        Items for query: <span class="text-info">{{ selected_query_display if selected_query_display else selected_query }}</span>
+                        Items for: <span class="text-info">{{ selected_query_display if selected_query_display else selected_query }}</span>
                         {% else %}
                         All Items
                         {% endif %}
+                        <span class="badge bg-secondary ms-2">{{ total_items }}</span>
                     </h5>
                 </div>
                 <div class="btn-group" role="group" aria-label="View toggle">
@@ -82,32 +93,39 @@
                 <!-- Card View -->
                 <div class="row" id="cardView">
                     {% for item in items %}
-                    <div class="col-md-3 col-lg-2 mb-4">
-                        <div class="card h-100">
-                            {% if item.photo_url %}
+                    <div class="col-6 col-md-4 col-lg-3 mb-4">
+                        <div class="card h-100" data-item-ts="{{ item.timestamp_raw }}">
                             <div class="position-relative">
-                                <img src="{{ item.photo_url }}" class="card-img-top" alt="{{ item.title }}">
-                                <span class="position-absolute top-0 end-0 m-2 badge bg-primary d-flex align-items-center"><i
-                                        class="bi bi-search me-1"></i> {{ item.query|truncate(20) }}</span>
+                                {% if item.photo_url %}
+                                <img src="{{ item.photo_url }}" class="card-img-top" alt="{{ item.title }}"
+                                     loading="lazy"
+                                     style="height: 180px; object-fit: cover; background-color: #e9ecef;">
+                                {% else %}
+                                <div class="card-img-top bg-light d-flex align-items-center justify-content-center"
+                                     style="height: 180px;">
+                                    <i class="bi bi-image text-muted" style="font-size: 2rem;"></i>
+                                </div>
+                                {% endif %}
+                                <span class="position-absolute top-0 end-0 m-2 badge bg-primary d-flex align-items-center">
+                                    <i class="bi bi-search me-1"></i> {{ item.query|truncate(20) }}
+                                </span>
+                                <span class="position-absolute top-0 start-0 m-2 badge bg-success item-new-badge"
+                                      hidden>New</span>
                             </div>
-                            {% else %}
-                            <div class="card-img-top bg-light d-flex align-items-center justify-content-center position-relative">
-                                <i class="bi bi-image text-muted" style="font-size: 2rem;"></i>
-                                <span class="position-absolute top-0 end-0 m-2 badge bg-primary d-flex align-items-center"><i
-                                        class="bi bi-search me-1"></i> {{ item.query|truncate(20) }}</span>
-                            </div>
-                            {% endif %}
                             <div class="card-body p-3">
                                 <h6 class="card-title mb-2">{{ item.title }}</h6>
                                 <p class="card-text mb-1">
                                     <span class="fw-bold text-dark" style="font-size: 1.1rem;">{{ item.price }} {{ item.currency }}</span>
                                 </p>
                                 <p class="card-text small text-muted mb-0">
-                                    <i class="bi bi-calendar me-1"></i> {{ item.timestamp }}
+                                    <i class="bi bi-calendar me-1"></i>
+                                    <time data-relative-time="{{ item.timestamp_raw }}"
+                                          title="{{ item.timestamp }}">{{ item.timestamp }}</time>
                                 </p>
                             </div>
                             <div class="card-footer bg-white p-3">
-                                <a href="{{ item.url }}" target="_blank" class="btn btn-primary w-100">
+                                <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer"
+                                   class="btn btn-primary w-100">
                                     <i class="bi bi-box-arrow-up-right me-1"></i> View on Vinted
                                 </a>
                             </div>
@@ -115,7 +133,7 @@
                     </div>
                     {% else %}
                     <div class="col-12 text-center py-5">
-                        <p class="text-muted">No items found</p>
+                        <p class="text-muted mb-0">No items match your filters.</p>
                     </div>
                     {% endfor %}
                 </div>
@@ -135,11 +153,12 @@
                         </thead>
                         <tbody>
                         {% for item in items %}
-                        <tr>
+                        <tr data-item-ts="{{ item.timestamp_raw }}">
                             <td style="width: 60px;">
                                 {% if item.photo_url %}
                                 <img src="{{ item.photo_url }}" alt="{{ item.title }}" class="img-thumbnail"
-                                     style="width: 50px; height: 50px; object-fit: cover;">
+                                     loading="lazy"
+                                     style="width: 50px; height: 50px; object-fit: cover; background-color: #e9ecef;">
                                 {% else %}
                                 <div class="bg-light d-flex align-items-center justify-content-center"
                                      style="width: 50px; height: 50px;">
@@ -147,66 +166,114 @@
                                 </div>
                                 {% endif %}
                             </td>
-                            <td>{{ item.title }}</td>
+                            <td>
+                                {{ item.title }}
+                                <span class="badge bg-success ms-1 item-new-badge" hidden>New</span>
+                            </td>
                             <td>{{ item.price }} {{ item.currency }}</td>
                             <td>{{ item.query|truncate(30) }}</td>
-                            <td>{{ item.timestamp }}</td>
                             <td>
-                                <a href="{{ item.url }}" target="_blank" class="btn btn-sm btn-primary">
+                                <time data-relative-time="{{ item.timestamp_raw }}"
+                                      title="{{ item.timestamp }}">{{ item.timestamp }}</time>
+                            </td>
+                            <td>
+                                <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer"
+                                   class="btn btn-sm btn-primary">
                                     <i class="bi bi-box-arrow-up-right me-1"></i> View on Vinted
                                 </a>
                             </td>
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="6" class="text-center">No items found</td>
+                            <td colspan="6" class="text-center">No items match your filters.</td>
                         </tr>
                         {% endfor %}
                         </tbody>
                     </table>
                 </div>
             </div>
+            <div class="card-footer d-flex justify-content-between align-items-center">
+                {% if prev_url %}
+                <a href="{{ prev_url }}" class="btn btn-sm btn-outline-secondary">
+                    <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous
+                </a>
+                {% else %}
+                <button type="button" class="btn btn-sm btn-outline-secondary" disabled>
+                    <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous
+                </button>
+                {% endif %}
+                <span class="small text-muted">Page {{ page }} of {{ total_pages }}</span>
+                {% if next_url %}
+                <a href="{{ next_url }}" class="btn btn-sm btn-outline-secondary">
+                    Next <i class="bi bi-chevron-right" aria-hidden="true"></i>
+                </a>
+                {% else %}
+                <button type="button" class="btn btn-sm btn-outline-secondary" disabled>
+                    Next <i class="bi bi-chevron-right" aria-hidden="true"></i>
+                </button>
+                {% endif %}
+            </div>
         </div>
     </div>
 </div>
+{% endblock %}
 
+{% block scripts %}
 <script>
     document.addEventListener('DOMContentLoaded', function () {
+        // Card / list view toggle (remembered per device).
         const cardViewBtn = document.getElementById('cardViewBtn');
         const listViewBtn = document.getElementById('listViewBtn');
         const cardView = document.getElementById('cardView');
         const listView = document.getElementById('listView');
 
-        // Load saved view preference from localStorage
-        const viewPreference = localStorage.getItem('vintedViewPreference') || 'card';
-
-        // Function to set active view
         function setActiveView(view) {
-            if (view === 'card') {
-                cardView.style.display = 'flex';
-                listView.style.display = 'none';
-                cardViewBtn.classList.add('active');
-                listViewBtn.classList.remove('active');
-                localStorage.setItem('vintedViewPreference', 'card');
-            } else {
+            if (view === 'list') {
                 cardView.style.display = 'none';
                 listView.style.display = 'block';
                 listViewBtn.classList.add('active');
                 cardViewBtn.classList.remove('active');
                 localStorage.setItem('vintedViewPreference', 'list');
+            } else {
+                cardView.style.display = 'flex';
+                listView.style.display = 'none';
+                cardViewBtn.classList.add('active');
+                listViewBtn.classList.remove('active');
+                localStorage.setItem('vintedViewPreference', 'card');
             }
         }
 
-        // Initialize with saved preference
-        setActiveView(viewPreference);
+        setActiveView(localStorage.getItem('vintedViewPreference') || 'card');
+        cardViewBtn.addEventListener('click', () => setActiveView('card'));
+        listViewBtn.addEventListener('click', () => setActiveView('list'));
 
-        // Add event listeners
-        cardViewBtn.addEventListener('click', function () {
-            setActiveView('card');
+        // Relative "time ago" with the exact time in a tooltip.
+        const relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, {numeric: 'auto'});
+
+        function relativeTimeFromTimestamp(timestamp) {
+            const seconds = Math.round((Number(timestamp) * 1000 - Date.now()) / 1000);
+            const abs = Math.abs(seconds);
+            if (abs < 60) return relativeTimeFormatter.format(seconds, 'second');
+            if (abs < 3600) return relativeTimeFormatter.format(Math.round(seconds / 60), 'minute');
+            if (abs < 86400) return relativeTimeFormatter.format(Math.round(seconds / 3600), 'hour');
+            if (abs < 2592000) return relativeTimeFormatter.format(Math.round(seconds / 86400), 'day');
+            if (abs < 31536000) return relativeTimeFormatter.format(Math.round(seconds / 2592000), 'month');
+            return relativeTimeFormatter.format(Math.round(seconds / 31536000), 'year');
+        }
+
+        document.querySelectorAll('[data-relative-time]').forEach(el => {
+            el.textContent = relativeTimeFromTimestamp(el.dataset.relativeTime);
         });
 
-        listViewBtn.addEventListener('click', function () {
-            setActiveView('list');
+        // Flag items found within the last 12 hours as "New".
+        const NEW_WINDOW_MS = 12 * 60 * 60 * 1000;
+        document.querySelectorAll('[data-item-ts]').forEach(el => {
+            const ts = Number(el.dataset.itemTs) * 1000;
+            if (ts && (Date.now() - ts) < NEW_WINDOW_MS) {
+                el.querySelectorAll('.item-new-badge').forEach(badge => {
+                    badge.hidden = false;
+                });
+            }
         });
     });
 </script>

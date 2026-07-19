@@ -669,7 +669,14 @@
                         stalled: ['Stalled', 'text-danger'],
                         blocked: ['Blocked', 'text-warning']
                     };
-                    const [text, cls] = map[data.scraper.status] || ['Unknown', 'text-muted'];
+                    let [text, cls] = map[data.scraper.status] || ['Unknown', 'text-muted'];
+                    if (data.scraper.cooldown_active) {
+                        const minutes = Math.max(
+                            1,
+                            Math.ceil(data.scraper.cooldown_remaining / 60)
+                        );
+                        text = 'Cooldown (' + minutes + 'm)';
+                    }
                     scraper.textContent = text;
                     scraper.className = 'fs-5 fw-bold ' + cls;
                     document.getElementById('healthHeartbeat').textContent =

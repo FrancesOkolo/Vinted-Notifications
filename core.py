@@ -22,6 +22,11 @@ _VERSION_CACHE_TIME = 0.0
 _VERSION_CACHE_TTL_SECONDS = 6 * 60 * 60
 _VERSION_CACHE_LOCK = threading.Lock()
 _ITEM_PAGE_REQUEST_TIMEOUT = (5, 10)
+_SCRAPER_FORBIDDEN_LIMIT = 2
+_SCRAPER_COOLDOWN_SECONDS = (15 * 60, 30 * 60, 60 * 60)
+_SCRAPER_MIN_CYCLE_WINDOW_SECONDS = 9 * 60
+_SCRAPER_MIN_QUERY_SPACING_SECONDS = 4.0
+_SCRAPER_MAX_QUERY_SPACING_SECONDS = 15.0
 _ITEM_PAGE_NAVIGATION_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -352,9 +357,87 @@ def _get_query_spacing_seconds(query_count):
     except (TypeError, ValueError):
         refresh_delay = 600
 
-    usable_window = max(60, refresh_delay * 0.80)
-    calculated_spacing = usable_window / query_count
-    return max(2.0, min(15.0, calculated_spacing))
+    # Even when the configured scheduler interval is short, distribute a large
+    # query set across at least nine minutes. For 133 queries this produces
+    # roughly four seconds between catalogue requests instead of two.
+    usable_window = max(
+        _SCRAPER_MIN_CYCLE_WINDOW_SECONDS,
+        refresh_delay * 0.80,
+    )
+    calculated_spacing = usable_window / max(1, query_count - 1)
+    return max(
+        _SCRAPER_MIN_QUERY_SPACING_SECONDS,
+        min(_SCRAPER_MAX_QUERY_SPACING_SECONDS, calculated_spacing),
+    )
+
+
+def _parameter_int(key, default=0):
+    try:
+        return int(db.get_parameter(key) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_scraper_cooldown(now=None):
+    """Return the persisted Vinted-block cooldown state."""
+    now = int(now if now is not None else time.time())
+    until = max(0, _parameter_int("scraper_cooldown_until"))
+    level = max(0, _parameter_int("scraper_cooldown_level"))
+    status_code = _parameter_int("scraper_last_block_status") or None
+    remaining = max(0, until - now)
+    return {
+        "active": remaining > 0,
+        "until": until,
+        "remaining": remaining,
+        "level": level,
+        "status_code": status_code,
+    }
+
+
+def _activate_scraper_cooldown(status_code, now=None):
+    """Open or escalate the persistent 15/30/60-minute circuit breaker."""
+    now = int(now if now is not None else time.time())
+    current_level = min(
+        get_scraper_cooldown(now=now)["level"],
+        len(_SCRAPER_COOLDOWN_SECONDS),
+    )
+    duration = _SCRAPER_COOLDOWN_SECONDS[
+        min(current_level, len(_SCRAPER_COOLDOWN_SECONDS) - 1)
+    ]
+    new_level = min(current_level + 1, len(_SCRAPER_COOLDOWN_SECONDS))
+    until = now + duration
+    if not db.set_parameters(
+        {
+            "scraper_cooldown_until": str(until),
+            "scraper_cooldown_level": str(new_level),
+            "scraper_last_block_status": str(status_code),
+            "scraper_consecutive_403s": "0",
+        }
+    ):
+        logger.warning("Could not persist the scraper cooldown state.")
+    return {
+        "active": True,
+        "until": until,
+        "remaining": duration,
+        "level": new_level,
+        "status_code": status_code,
+    }
+
+
+def _clear_scraper_cooldown():
+    """Reset the circuit breaker after a successful scrape cycle."""
+    cooldown = get_scraper_cooldown()
+    consecutive_403s = _parameter_int("scraper_consecutive_403s")
+    if cooldown["level"] or cooldown["until"] or consecutive_403s:
+        if not db.set_parameters(
+            {
+                "scraper_cooldown_until": "0",
+                "scraper_cooldown_level": "0",
+                "scraper_last_block_status": "",
+                "scraper_consecutive_403s": "0",
+            }
+        ):
+            logger.warning("Could not clear the scraper cooldown state.")
 
 
 def record_scraper_heartbeat():
@@ -370,21 +453,26 @@ def record_scraper_heartbeat():
         logger.warning("Could not record scraper heartbeat.", exc_info=True)
 
 
-def _finalize_scrape_cycle(successful_fetches, query_count):
+def _finalize_scrape_cycle(
+    successful_fetches,
+    query_count,
+    blocked_status=None,
+):
     """Update health counters after a scrape cycle completes."""
     now = int(time.time())
     try:
         db.set_parameter("scraper_last_cycle", str(now))
-        if successful_fetches > 0:
+        if blocked_status is not None:
+            failed = _parameter_int("scraper_failed_cycles")
+            db.set_parameter("scraper_failed_cycles", str(failed + 1))
+        elif successful_fetches > 0:
             db.set_parameter("scraper_last_ok", str(now))
             db.set_parameter("scraper_failed_cycles", "0")
+            _clear_scraper_cooldown()
         elif query_count > 0:
             # A full cycle that reached nothing usually means Vinted is
             # blocking every request (403/429), not an empty marketplace.
-            try:
-                failed = int(db.get_parameter("scraper_failed_cycles") or 0)
-            except (TypeError, ValueError):
-                failed = 0
+            failed = _parameter_int("scraper_failed_cycles")
             db.set_parameter("scraper_failed_cycles", str(failed + 1))
     except Exception:
         logger.warning("Could not update scrape-cycle health.", exc_info=True)
@@ -426,14 +514,21 @@ def get_scraper_health(now=None):
         failed_cycles = int(db.get_parameter("scraper_failed_cycles") or 0)
     except (TypeError, ValueError):
         failed_cycles = 0
+    cooldown = get_scraper_cooldown(now=now)
 
     return {
         "heartbeat_age": heartbeat_age,
         "stalled": heartbeat_age is not None and heartbeat_age > stale_after,
-        "blocked": failed_cycles >= 3,
+        # Keep reporting a block after the timer expires until a successful
+        # cycle proves that Vinted is accepting requests again.
+        "blocked": cooldown["level"] > 0 or failed_cycles >= 3,
         "failed_cycles": failed_cycles,
         "last_ok_age": last_ok_age,
         "stale_after": stale_after,
+        "cooldown_active": cooldown["active"],
+        "cooldown_remaining": cooldown["remaining"],
+        "cooldown_level": cooldown["level"],
+        "last_block_status": cooldown["status_code"],
     }
 
 
@@ -453,6 +548,16 @@ def process_items(queue):
             quiet_start,
             quiet_end,
             quiet_timezone,
+        )
+        return
+
+    cooldown = get_scraper_cooldown()
+    if cooldown["active"]:
+        logger.warning(
+            "Scraper circuit breaker is open after HTTP %s; skipping this "
+            "cycle with approximately %s minute(s) remaining.",
+            cooldown["status_code"] or "403",
+            max(1, (cooldown["remaining"] + 59) // 60),
         )
         return
 
@@ -485,6 +590,8 @@ def process_items(queue):
 
     total_429s = 0
     successful_fetches = 0
+    consecutive_403s = _parameter_int("scraper_consecutive_403s")
+    cycle_block_status = None
 
     for position, query in enumerate(all_queries, start=1):
         if _quiet_hours_active():
@@ -511,6 +618,7 @@ def process_items(queue):
                     query_url,
                     nbr_items=items_per_query,
                 )
+                consecutive_403s = 0
                 break
             except requests.exceptions.HTTPError as error:
                 response = error.response
@@ -518,6 +626,29 @@ def process_items(queue):
                     response.status_code if response is not None else None
                 )
 
+                if status_code == 403:
+                    consecutive_403s += 1
+                    logger.warning(
+                        "Vinted rejected query %s/%s with HTTP 403 "
+                        "(%s/%s consecutive).",
+                        position,
+                        query_count,
+                        consecutive_403s,
+                        _SCRAPER_FORBIDDEN_LIMIT,
+                    )
+                    if consecutive_403s >= _SCRAPER_FORBIDDEN_LIMIT:
+                        cooldown = _activate_scraper_cooldown(403)
+                        cycle_block_status = 403
+                        logger.error(
+                            "Scraper circuit breaker opened after %s "
+                            "consecutive HTTP 403 responses. Stopping the "
+                            "cycle and cooling down for %s minutes.",
+                            consecutive_403s,
+                            cooldown["remaining"] // 60,
+                        )
+                    break
+
+                consecutive_403s = 0
                 if status_code != 429:
                     logger.error(
                         "HTTP error while scraping query %s/%s: %s",
@@ -529,6 +660,11 @@ def process_items(queue):
                     break
 
                 total_429s += 1
+                if total_429s >= 3:
+                    # The outer loop logs and stops the complete cycle. Do not
+                    # sleep and issue a fourth rate-limited request first.
+                    break
+
                 fallback = 60 * (attempt + 1)
                 wait_seconds = _get_retry_after_seconds(
                     response,
@@ -570,6 +706,9 @@ def process_items(queue):
                 )
                 break
 
+        if cycle_block_status is not None:
+            break
+
         if all_items is not None:
             successful_fetches += 1
             data = [item for item in all_items if item.is_new_item()]
@@ -594,7 +733,16 @@ def process_items(queue):
             jittered_spacing = base_spacing * random.uniform(0.85, 1.15)
             time.sleep(jittered_spacing)
 
-    _finalize_scrape_cycle(successful_fetches, query_count)
+    if cycle_block_status is None:
+        db.set_parameter(
+            "scraper_consecutive_403s",
+            str(consecutive_403s),
+        )
+    _finalize_scrape_cycle(
+        successful_fetches,
+        query_count,
+        blocked_status=cycle_block_status,
+    )
 
 
 class _ProductJsonLdParser(HTMLParser):

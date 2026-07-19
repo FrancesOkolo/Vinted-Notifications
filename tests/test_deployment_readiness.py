@@ -381,6 +381,241 @@ def test_remove_description_migration_repairs_stored_template(database):
     assert db.get_parameter("message_template") == migrated
 
 
+@pytest.mark.parametrize("status_code", [403, 429])
+def test_requester_does_not_multiply_block_responses(
+    database,
+    monkeypatch,
+    status_code,
+):
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+
+    class Response:
+        def __init__(self):
+            self.status_code = status_code
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            return Response()
+
+    monkeypatch.setattr(
+        requester_module.proxies,
+        "configure_proxy",
+        lambda session: False,
+    )
+    client = requester_module.Requester()
+    client.session = Session()
+
+    response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
+
+    assert response.status_code == status_code
+    assert client.session.calls == 1
+
+
+def test_query_spacing_spreads_133_queries_over_at_least_nine_minutes(
+    database,
+):
+    core = _core()
+    db.set_parameter("query_refresh_delay", "300")
+
+    spacing = core._get_query_spacing_seconds(133)
+
+    assert spacing >= 4
+    assert 9 * 60 <= spacing * 132 <= 12 * 60
+
+
+def test_403_circuit_breaker_stops_cycle_and_escalates_cooldown(
+    database,
+    monkeypatch,
+):
+    import requests
+
+    core = _core()
+    db.set_parameter("quiet_hours_enabled", "False")
+    db.set_parameter("query_refresh_delay", "300")
+
+    conn = db.get_db_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO queries(query, query_name) VALUES (?, ?)",
+            [
+                (
+                    f"https://www.vinted.co.uk/catalog?search_text=item-{index}",
+                    f"Item {index}",
+                )
+                for index in range(1, 6)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    search_calls = []
+
+    class Items:
+        def search(self, url, nbr_items):
+            search_calls.append(url)
+            response = type(
+                "Response",
+                (),
+                {"status_code": 403, "headers": {}},
+            )()
+            raise requests.exceptions.HTTPError(
+                "403 Client Error",
+                response=response,
+            )
+
+    class FakeVinted:
+        def __init__(self):
+            self.items = Items()
+
+    clock = [1_000_000]
+    monkeypatch.setattr(core, "Vinted", FakeVinted)
+    monkeypatch.setattr(core.time, "time", lambda: clock[0])
+    monkeypatch.setattr(core.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(core.random, "uniform", lambda low, high: 1.0)
+
+    # Two rejected catalogue requests stop the first cycle. The remaining
+    # queries are never contacted.
+    core.process_items(queue.Queue())
+    assert len(search_calls) == 2
+    cooldown = core.get_scraper_cooldown(now=clock[0])
+    assert cooldown["active"]
+    assert cooldown["remaining"] == 15 * 60
+    assert cooldown["level"] == 1
+    assert cooldown["status_code"] == 403
+
+    # Scheduled runs during the cooldown make no Vinted requests.
+    core.process_items(queue.Queue())
+    assert len(search_calls) == 2
+
+    # A repeated block after each timer expires escalates to 30 then 60 min.
+    clock[0] += 15 * 60 + 1
+    core.process_items(queue.Queue())
+    assert len(search_calls) == 4
+    assert core.get_scraper_cooldown(now=clock[0])["remaining"] == 30 * 60
+
+    clock[0] += 30 * 60 + 1
+    core.process_items(queue.Queue())
+    assert len(search_calls) == 6
+    cooldown = core.get_scraper_cooldown(now=clock[0])
+    assert cooldown["remaining"] == 60 * 60
+    assert cooldown["level"] == 3
+
+
+def test_429_handling_stops_after_three_catalogue_requests(
+    database,
+    monkeypatch,
+):
+    import requests
+
+    core = _core()
+    db.set_parameter("quiet_hours_enabled", "False")
+
+    conn = db.get_db_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO queries(query, query_name) VALUES (?, ?)",
+            [
+                (
+                    f"https://www.vinted.co.uk/catalog?search_text=rate-{index}",
+                    f"Rate {index}",
+                )
+                for index in range(1, 6)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    search_calls = []
+    waits = []
+
+    class Items:
+        def search(self, url, nbr_items):
+            search_calls.append(url)
+            response = type(
+                "Response",
+                (),
+                {"status_code": 429, "headers": {}},
+            )()
+            raise requests.exceptions.HTTPError(
+                "429 Client Error",
+                response=response,
+            )
+
+    class FakeVinted:
+        def __init__(self):
+            self.items = Items()
+
+    monkeypatch.setattr(core, "Vinted", FakeVinted)
+    monkeypatch.setattr(core.time, "sleep", waits.append)
+    monkeypatch.setattr(core.random, "uniform", lambda low, high: 1.0)
+
+    core.process_items(queue.Queue())
+
+    assert len(search_calls) == 3
+    # The first two responses retain the existing bounded backoff. The third
+    # opens the rate-limit circuit immediately instead of waiting for a fourth.
+    assert waits[:2] == [60, 120]
+
+
+def test_successful_scrape_clears_persisted_cooldown(database, monkeypatch):
+    core = _core()
+    db.set_parameter("quiet_hours_enabled", "False")
+    db.set_parameters(
+        {
+            "scraper_cooldown_until": "999",
+            "scraper_cooldown_level": "3",
+            "scraper_last_block_status": "403",
+            "scraper_failed_cycles": "2",
+        }
+    )
+
+    conn = db.get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO queries(query, query_name) VALUES (?, ?)",
+            (
+                "https://www.vinted.co.uk/catalog?search_text=recovery",
+                "Recovery",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class Items:
+        def search(self, url, nbr_items):
+            return []
+
+    class FakeVinted:
+        def __init__(self):
+            self.items = Items()
+
+    monkeypatch.setattr(core, "Vinted", FakeVinted)
+    monkeypatch.setattr(core.time, "time", lambda: 1_000)
+
+    core.process_items(queue.Queue())
+
+    cooldown = core.get_scraper_cooldown(now=1_000)
+    assert cooldown["level"] == 0
+    assert cooldown["status_code"] is None
+    assert not cooldown["active"]
+    assert not core.get_scraper_health(now=1_000)["blocked"]
+
+
 def test_scraper_health_reports_stall_block_and_recovery(database):
     core = _core()
     import time as _time
@@ -651,14 +886,22 @@ def test_telegram_unsubscribe_button_removes_only_clicking_user(
     callback = asyncio.run(exercise_button())
 
     assert set(db.get_query_subscribers(query_id)) == {"111"}
-    assert callback.answers == [("Unsubscribed from this search.", False)]
+    assert callback.answers == [("Unsubscribed from this search.", True)]
     remaining_callbacks = [
         button.callback_data
         for row in callback.edited_markup.inline_keyboard
         for button in row
         if button.callback_data
     ]
-    assert remaining_callbacks == []
+    assert remaining_callbacks == [f"unsubscribe:{query_id}"]
+    unsubscribe_labels = [
+        button.text
+        for row in callback.edited_markup.inline_keyboard
+        for button in row
+        if button.callback_data
+        and button.callback_data.startswith("unsubscribe:")
+    ]
+    assert unsubscribe_labels == ["✅ Unsubscribed"]
 
 
 def test_send_only_notifications_do_not_offer_server_callbacks(
@@ -986,6 +1229,12 @@ def test_config_health_endpoint(database):
     data = web.app.test_client().get("/config/health").get_json()
     assert "pending_notifications" in data
     assert data["scraper"]["status"] in {"ok", "stalled", "blocked"}
+    assert {
+        "cooldown_active",
+        "cooldown_remaining",
+        "cooldown_level",
+        "last_block_status",
+    }.issubset(data["scraper"])
     assert set(data["queries"]) == {"total", "active", "paused"}
 
 
@@ -1029,6 +1278,69 @@ def test_test_telegram_route(database, monkeypatch):
     response = client.post("/test_telegram", headers={"X-CSRF-Token": token})
     assert response.status_code == 400
     assert "chat not found" in response.get_json()["message"]
+
+
+def test_items_filter_sort_and_pagination(database, monkeypatch):
+    import web_ui_plugin.web_ui as web
+
+    monkeypatch.setattr(
+        web.core, "check_version", lambda: (True, "t", "t", "https://x/y")
+    )
+
+    conn = db.get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO queries (query, last_item, query_name) VALUES (?, ?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=nike", 100, "Nike"),
+        )
+        qid = cur.lastrowid
+        cur.executemany(
+            "INSERT INTO items (item, title, price, currency, timestamp, photo_url, query_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1, "Nike Air", 25.0, "GBP", 1000, None, qid),
+                (2, "Nike Boots", 10.0, "GBP", 2000, None, qid),
+                (3, "Adidas Cap", 5.0, "GBP", 3000, None, qid),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Title search + price filters.
+    assert db.count_items(search="nike") == 2
+    assert db.count_items(price_min=10) == 2
+    assert db.count_items(price_max=10) == 2
+    assert db.count_items(price_min=10, price_max=25) == 2
+
+    # Sort ascending by price.
+    prices = [row[2] for row in db.get_items(sort="price_asc")]
+    assert prices == sorted(prices)
+
+    # Pagination via limit/offset.
+    page1 = db.get_items(limit=2, offset=0, sort="price_asc")
+    page2 = db.get_items(limit=2, offset=2, sort="price_asc")
+    assert len(page1) == 2 and len(page2) == 1
+
+    # The route renders the new controls and preserves the sort selection.
+    html_text = web.app.test_client().get("/items?search=nike&sort=price_asc").data.decode()
+    assert 'name="search"' in html_text
+    assert 'name="price_min"' in html_text
+    assert 'name="sort"' in html_text
+    assert "data-relative-time" in html_text
+    assert "Page 1 of" in html_text
+    assert 'value="price_asc" selected' in html_text
+
+
+def test_dark_mode_toggle_is_wired():
+    template = (ROOT / "web_ui_plugin" / "templates" / "base.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="themeToggle"' in template  # header toggle button
+    assert "vintedTheme" in template  # preference persisted to localStorage
+    assert "prefers-color-scheme" in template  # OS default applied before paint
+    assert '[data-bs-theme="dark"]' in template  # dark overrides for custom elements
 
 
 def test_logs_viewer_renders_messages_as_text_not_html():

@@ -405,34 +405,98 @@ def get_all_parameters():
             conn.close()
 
 
-def get_items(limit=50, query=None):
+_ITEM_SORTS = {
+    "date_desc": "i.timestamp DESC",
+    "date_asc": "i.timestamp ASC",
+    "price_asc": "CAST(i.price AS REAL) ASC",
+    "price_desc": "CAST(i.price AS REAL) DESC",
+    "title_asc": "i.title COLLATE NOCASE ASC",
+}
+
+
+def _items_filter_sql(cursor, query, search, price_min, price_max):
+    """Build a parameterised WHERE clause for item lookups.
+
+    Returns (where_sql, params). Returns (None, None) when a query filter names
+    a query that does not exist, so the caller can short-circuit to empty.
+    All user values go into params, never into the SQL text.
+    """
+    clauses = []
+    params = []
+    if query:
+        cursor.execute("SELECT id FROM queries WHERE query=?", (query,))
+        row = cursor.fetchone()
+        if not row:
+            return None, None
+        clauses.append("i.query_id = ?")
+        params.append(row[0])
+    if search:
+        clauses.append("i.title LIKE ?")
+        params.append(f"%{search}%")
+    if price_min is not None:
+        clauses.append("CAST(i.price AS REAL) >= ?")
+        params.append(price_min)
+    if price_max is not None:
+        clauses.append("CAST(i.price AS REAL) <= ?")
+        params.append(price_max)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def get_items(
+    limit=50,
+    query=None,
+    offset=0,
+    search=None,
+    price_min=None,
+    price_max=None,
+    sort="date_desc",
+):
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        if query:
-            # Get the query_id for the given query
-            cursor.execute("SELECT id FROM queries WHERE query=?", (query,))
-            result = cursor.fetchone()
-            if result:
-                query_id = result[0]
-                # Get items with the matching query_id
-                cursor.execute(
-                    "SELECT i.item, i.title, i.price, i.currency, i.timestamp, q.query, i.photo_url, q.query_name FROM items i JOIN queries q ON i.query_id = q.id WHERE i.query_id=? ORDER BY i.timestamp DESC LIMIT ?",
-                    (query_id, limit),
-                )
-            else:
-                return []
-        else:
-            # Join with queries table to get the query text
-            cursor.execute(
-                "SELECT i.item, i.title, i.price, i.currency, i.timestamp, q.query, i.photo_url, q.query_name FROM items i JOIN queries q ON i.query_id = q.id ORDER BY i.timestamp DESC LIMIT ?",
-                (limit,),
-            )
+        where, params = _items_filter_sql(cursor, query, search, price_min, price_max)
+        if where is None:
+            return []
+        order_by = _ITEM_SORTS.get(sort, _ITEM_SORTS["date_desc"])
+        cursor.execute(
+            f"""
+            SELECT i.item, i.title, i.price, i.currency, i.timestamp,
+                   q.query, i.photo_url, q.query_name
+            FROM items i JOIN queries q ON i.query_id = q.id
+            {where}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+            """,
+            params + [limit, offset],
+        )
         return cursor.fetchall()
     except Exception:
         print_exc()
         return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def count_items(query=None, search=None, price_min=None, price_max=None):
+    """Count items matching the same filters as get_items (for pagination)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        where, params = _items_filter_sql(cursor, query, search, price_min, price_max)
+        if where is None:
+            return 0
+        cursor.execute(
+            f"SELECT COUNT(*) FROM items i JOIN queries q ON i.query_id = q.id {where}",
+            params,
+        )
+        return cursor.fetchone()[0]
+    except Exception:
+        print_exc()
+        return 0
     finally:
         if conn:
             conn.close()
