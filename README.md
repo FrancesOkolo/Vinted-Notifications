@@ -3,6 +3,10 @@
 A real-time notification system for Vinted listings that works across all Vinted country domains. Get instant alerts
 when items matching your search criteria are posted.
 
+For Frances' existing server, use the short
+[server update and rollback guide](DEPLOYMENT.md). It preserves the current
+Docker command, private environment file, and bind-mounted data and logs.
+
 ![Vinted-Notifications](https://github.com/user-attachments/assets/f2788511-5a8a-4a8d-8198-a4135081a3d8)
 
 ---
