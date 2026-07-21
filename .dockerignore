@@ -27,6 +27,7 @@ var/
 *.egg
 venv/
 .pytest_cache/
+.pytest-temp/
 .ruff_cache/
 .coverage
 htmlcov/
