@@ -43,9 +43,7 @@ class ExcludeFilter(logging.Filter):
 _TELEGRAM_TOKEN_PATTERN = re.compile(
     r"(?i)(api\.telegram\.org/bot|\bbot)(\d{6,12}:[A-Za-z0-9_-]{20,})"
 )
-_URL_CREDENTIAL_PATTERN = re.compile(
-    r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@"
-)
+_URL_CREDENTIAL_PATTERN = re.compile(r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@")
 
 
 def redact_secrets(value):

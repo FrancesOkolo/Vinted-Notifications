@@ -6,7 +6,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-
 ROOT_FILES = [
     "db.py",
     "core.py",
@@ -74,14 +73,10 @@ def main() -> int:
         return 1
 
     missing_package_files = [
-        str(Path(name))
-        for name in ROOT_FILES
-        if not (package / name).is_file()
+        str(Path(name)) for name in ROOT_FILES if not (package / name).is_file()
     ]
     missing_package_files.extend(
-        str(relative)
-        for relative in PLUGIN_FILES
-        if not (package / relative).is_file()
+        str(relative) for relative in PLUGIN_FILES if not (package / relative).is_file()
     )
     if missing_package_files:
         print("ERROR: The extracted upgrade package is incomplete:")

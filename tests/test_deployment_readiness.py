@@ -1,20 +1,21 @@
 import base64
+import os
 import queue
 import re
 import sqlite3
 import sys
+from contextlib import closing
 from datetime import time
 from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import db
-from url_normalizer import normalise_vinted_url
+import db  # noqa: E402
+from url_normalizer import normalise_vinted_url  # noqa: E402
 
 
 @pytest.fixture
@@ -83,9 +84,7 @@ def test_shared_query_is_created_once_for_multiple_users(database):
     assert db.migrate_query_uniqueness()
     assert db.approve_telegram_user("222", "Tester")
 
-    url = normalise_vinted_url(
-        "https://www.vinted.co.uk/catalog?search_text=coat"
-    )
+    url = normalise_vinted_url("https://www.vinted.co.uk/catalog?search_text=coat")
     query_id, created, subscribed = db.add_query_to_db(
         url,
         name="Coats",
@@ -131,8 +130,7 @@ def test_duplicate_migration_preserves_items_and_subscriptions(tmp_path, monkeyp
     database_path = tmp_path / "legacy.db"
     monkeypatch.setattr(db, "DB_PATH", str(database_path))
     conn = sqlite3.connect(database_path)
-    conn.executescript(
-        """
+    conn.executescript("""
         PRAGMA foreign_keys=ON;
         CREATE TABLE queries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,8 +160,7 @@ def test_duplicate_migration_preserves_items_and_subscriptions(tmp_path, monkeyp
         INSERT INTO telegram_users(chat_id,status,is_admin) VALUES ('111','approved',1);
         INSERT INTO query_subscriptions(query_id,chat_id) VALUES (2,'111');
         INSERT INTO items(item,title,query_id) VALUES (9,'Item',2);
-        """
-    )
+        """)
     conn.commit()
     conn.close()
 
@@ -171,9 +168,7 @@ def test_duplicate_migration_preserves_items_and_subscriptions(tmp_path, monkeyp
     conn = db.get_db_connection()
     try:
         assert conn.execute("SELECT COUNT(*) FROM queries").fetchone()[0] == 1
-        row = conn.execute(
-            "SELECT id,last_item,query_name FROM queries"
-        ).fetchone()
+        row = conn.execute("SELECT id,last_item,query_name FROM queries").fetchone()
         assert row == (1, 20, "Named")
         assert conn.execute("SELECT query_id FROM items").fetchone()[0] == 1
         assert conn.execute(
@@ -360,7 +355,10 @@ def test_web_auth_csrf_health_and_token_masking(database, monkeypatch):
     assert bootstrap_js.status_code == 200
     assert bootstrap_js.mimetype == "application/javascript"
 
-    assert client.post("/add_country", headers=headers, data={"country": "GB"}).status_code == 400
+    assert (
+        client.post("/add_country", headers=headers, data={"country": "GB"}).status_code
+        == 400
+    )
 
     match = re.search(
         rb'name="_csrf_token" value="([^"]+)"',
@@ -805,9 +803,8 @@ def test_notification_outbox_persists_and_retries(database):
 def test_outbox_migration_adds_query_id_to_existing_table(tmp_path, monkeypatch):
     database_path = tmp_path / "legacy-outbox.db"
     monkeypatch.setattr(db, "DB_PATH", str(database_path))
-    with sqlite3.connect(database_path) as conn:
-        conn.execute(
-            """
+    with closing(sqlite3.connect(database_path)) as conn:
+        conn.execute("""
             CREATE TABLE pending_notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT NOT NULL,
@@ -818,14 +815,13 @@ def test_outbox_migration_adds_query_id_to_existing_table(tmp_path, monkeypatch)
                 next_attempt_at REAL NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
-            """
-        )
+            """)
+        conn.commit()
 
     assert db.migrate_pending_notifications_table()
-    with sqlite3.connect(database_path) as conn:
+    with closing(sqlite3.connect(database_path)) as conn:
         columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(pending_notifications)")
+            row[1] for row in conn.execute("PRAGMA table_info(pending_notifications)")
         }
     assert "query_id" in columns
 
@@ -869,9 +865,7 @@ def test_telegram_subscription_button_toggles_only_clicking_user(
         )
         assert delivered
 
-        sister_markup = next(
-            markup for chat_id, _, markup in sent if chat_id == "222"
-        )
+        sister_markup = next(markup for chat_id, _, markup in sent if chat_id == "222")
         unsubscribe_buttons = [
             button
             for row in sister_markup.inline_keyboard
@@ -1046,7 +1040,9 @@ def test_retryable_telegram_error_classification():
     assert not is_retryable_telegram_error(ValueError("boom"))
 
 
-def test_queries_page_has_search_sort_pagination_and_shared_modals(database, monkeypatch):
+def test_queries_page_has_search_sort_pagination_and_shared_modals(
+    database, monkeypatch
+):
     import web_ui_plugin.web_ui as web
 
     monkeypatch.setattr(
@@ -1054,6 +1050,7 @@ def test_queries_page_has_search_sort_pagination_and_shared_modals(database, mon
         "check_version",
         lambda: (True, "test", "test", "https://github.com/x/y"),
     )
+    assert db.migrate_pending_notifications_table()
 
     # Two queries: one with a last-found timestamp, one that never found an item.
     conn = db.get_db_connection()
@@ -1164,9 +1161,11 @@ def test_query_pause_enable_counts_and_bulk_remove(database, monkeypatch):
 
     client = web.app.test_client()
     token_page = client.get("/queries")
-    token = re.search(
-        rb'name="_csrf_token" value="([^"]+)"', token_page.data
-    ).group(1).decode()
+    token = (
+        re.search(rb'name="_csrf_token" value="([^"]+)"', token_page.data)
+        .group(1)
+        .decode()
+    )
 
     # Pause B through the toggle route; the scraper then skips it.
     response = client.post(f"/toggle_query/{qid_b}", headers={"X-CSRF-Token": token})
@@ -1218,21 +1217,62 @@ def test_query_pause_enable_counts_and_bulk_remove(database, monkeypatch):
     assert {row[0] for row in db.get_queries()} == {qid_b}
 
 
+def test_network_web_bind_requires_auth_and_persistent_secret(monkeypatch):
+    import web_ui_plugin.web_ui as web
+
+    monkeypatch.setattr(web, "WEB_USERNAME", "")
+    monkeypatch.setattr(web, "WEB_PASSWORD", "")
+    monkeypatch.setattr(web, "WEB_SECRET_KEY", "")
+    web._validate_web_bind_security("127.0.0.1")
+    web._validate_web_bind_security("::1")
+    with pytest.raises(RuntimeError, match="without authentication"):
+        web._validate_web_bind_security("0.0.0.0")
+
+    monkeypatch.setattr(web, "WEB_USERNAME", "admin")
+    monkeypatch.setattr(web, "WEB_PASSWORD", "correct-horse")
+    with pytest.raises(RuntimeError, match="persistent VN_SECRET_KEY"):
+        web._validate_web_bind_security("0.0.0.0")
+
+    monkeypatch.setattr(web, "WEB_SECRET_KEY", "persistent-test-secret")
+    web._validate_web_bind_security("0.0.0.0")
+
+
+def test_repeated_web_auth_failures_are_throttled(monkeypatch):
+    import web_ui_plugin.web_ui as web
+
+    monkeypatch.setattr(web, "WEB_USERNAME", "admin")
+    monkeypatch.setattr(web, "WEB_PASSWORD", "correct-horse")
+    monkeypatch.setattr(web, "AUTH_MAX_FAILURES", 3)
+    monkeypatch.setattr(web, "AUTH_BLOCK_SECONDS", 60)
+    with web._auth_lock:
+        web._auth_failures.clear()
+        web._auth_blocked_until.clear()
+
+    client = web.app.test_client()
+    asset = "/static/vendor/bootstrap/bootstrap.bundle.min.js"
+    wrong_headers = _basic_header(password="wrong-password")
+    assert client.get(asset, headers=wrong_headers).status_code == 401
+    assert client.get(asset, headers=wrong_headers).status_code == 401
+    blocked = client.get(asset, headers=wrong_headers)
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) > 0
+
+    # Correct credentials always recover the legitimate administrator.
+    assert client.get(asset, headers=_basic_header()).status_code == 200
+    assert client.get(asset, headers=wrong_headers).status_code == 401
+
+
 def test_https_mode_adds_hsts(database, monkeypatch):
     import web_ui_plugin.web_ui as web
 
     monkeypatch.setattr(web, "WEB_HTTPS_ENABLED", True)
     response = web.app.test_client().get("/healthz")
     assert response.status_code == 200
-    assert response.headers["Strict-Transport-Security"].startswith(
-        "max-age=31536000"
-    )
+    assert response.headers["Strict-Transport-Security"].startswith("max-age=31536000")
 
 
 def test_dynamic_configuration_content_is_rendered_as_text():
-    config = (ROOT / "web_ui_plugin/templates/config.html").read_text(
-        encoding="utf-8"
-    )
+    config = (ROOT / "web_ui_plugin/templates/config.html").read_text(encoding="utf-8")
     dashboard = (ROOT / "web_ui_plugin/templates/index.html").read_text(
         encoding="utf-8"
     )
@@ -1265,6 +1305,10 @@ def test_secret_redaction_covers_telegram_tokens_and_proxy_passwords():
 
 def test_rss_token_protects_feed(database, monkeypatch):
     from rss_feed_plugin.rss_feed import RSSFeed
+
+    monkeypatch.delenv("VN_RSS_TOKEN", raising=False)
+    unconfigured_feed = RSSFeed(queue.Queue())
+    assert unconfigured_feed.app.test_client().get("/").status_code == 503
 
     monkeypatch.setenv("VN_RSS_TOKEN", "long-private-rss-token")
     feed = RSSFeed(queue.Queue())
@@ -1321,9 +1365,11 @@ def test_bulk_add_reports_added_and_duplicates(database, monkeypatch):
     assert db.migrate_multi_user_schema()
 
     client = web.app.test_client()
-    token = re.search(
-        rb'name="_csrf_token" value="([^"]+)"', client.get("/queries").data
-    ).group(1).decode()
+    token = (
+        re.search(rb'name="_csrf_token" value="([^"]+)"', client.get("/queries").data)
+        .group(1)
+        .decode()
+    )
 
     body = (
         "https://www.vinted.co.uk/catalog?search_text=coat\n"
@@ -1391,9 +1437,11 @@ def test_test_telegram_route(database, monkeypatch):
         web.core, "check_version", lambda: (True, "t", "t", "https://x/y")
     )
     client = web.app.test_client()
-    token = re.search(
-        rb'name="_csrf_token" value="([^"]+)"', client.get("/config").data
-    ).group(1).decode()
+    token = (
+        re.search(rb'name="_csrf_token" value="([^"]+)"', client.get("/config").data)
+        .group(1)
+        .decode()
+    )
 
     # Unconfigured -> 400 with guidance, no network call.
     response = client.post("/test_telegram", headers={"X-CSRF-Token": token})
@@ -1470,7 +1518,9 @@ def test_items_filter_sort_and_pagination(database, monkeypatch):
     assert len(page1) == 2 and len(page2) == 1
 
     # The route renders the new controls and preserves the sort selection.
-    html_text = web.app.test_client().get("/items?search=nike&sort=price_asc").data.decode()
+    html_text = (
+        web.app.test_client().get("/items?search=nike&sort=price_asc").data.decode()
+    )
     assert 'name="search"' in html_text
     assert 'name="price_min"' in html_text
     assert 'name="sort"' in html_text
@@ -1507,10 +1557,13 @@ def test_frontend_assets_are_self_hosted_and_image_fallback_is_wired():
         ROOT / "web_ui_plugin/static/vendor/bootstrap/bootstrap.min.css",
         ROOT / "web_ui_plugin/static/vendor/bootstrap/bootstrap.bundle.min.js",
         ROOT / "web_ui_plugin/static/vendor/bootstrap-icons/bootstrap-icons.css",
-        ROOT / "web_ui_plugin/static/vendor/bootstrap-icons/fonts/bootstrap-icons.woff2",
+        ROOT
+        / "web_ui_plugin/static/vendor/bootstrap-icons/fonts/bootstrap-icons.woff2",
         ROOT / "web_ui_plugin/static/vendor/bootstrap-icons/fonts/bootstrap-icons.woff",
     ]
-    assert all(path.is_file() and path.stat().st_size > 1000 for path in required_assets)
+    assert all(
+        path.is_file() and path.stat().st_size > 1000 for path in required_assets
+    )
 
 
 def test_responsive_layout_hooks_are_present():
@@ -1520,9 +1573,9 @@ def test_responsive_layout_hooks_are_present():
     items = (ROOT / "web_ui_plugin" / "templates" / "items.html").read_text(
         encoding="utf-8"
     )
-    css = (
-        ROOT / "web_ui_plugin" / "static" / "css" / "custom.css"
-    ).read_text(encoding="utf-8")
+    css = (ROOT / "web_ui_plugin" / "static" / "css" / "custom.css").read_text(
+        encoding="utf-8"
+    )
 
     assert "mobile-nav-toggle" in base
     assert "brand-short" in base
@@ -1539,12 +1592,7 @@ def test_responsive_layout_hooks_are_present():
 
 def test_frontend_and_dependency_audit_use_supported_release_paths():
     bootstrap_css = (
-        ROOT
-        / "web_ui_plugin"
-        / "static"
-        / "vendor"
-        / "bootstrap"
-        / "bootstrap.min.css"
+        ROOT / "web_ui_plugin" / "static" / "vendor" / "bootstrap" / "bootstrap.min.css"
     ).read_text(encoding="utf-8")
     workflow = (ROOT / ".github/workflows/linter.yml").read_text(encoding="utf-8")
 
@@ -1553,6 +1601,23 @@ def test_frontend_and_dependency_audit_use_supported_release_paths():
     assert "pypa/gh-action-pip-audit@v1.1.0" in workflow
     assert "frances/current-working-version" in workflow
     assert 'cron: "17 4 * * 1"' in workflow
+
+
+def test_container_and_manual_deployment_are_private_by_default():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    entrypoint = (ROOT / "docker-entrypoint.sh").read_text(encoding="utf-8")
+    deployment = (ROOT / "DEPLOYMENT.md").read_text(encoding="utf-8")
+
+    assert '"127.0.0.1:${VN_WEB_PORT:-8000}:8000"' in compose
+    assert '"127.0.0.1:${VN_RSS_PORT:-8080}:8080"' in compose
+    assert "read_only: true" in compose
+    assert "tmpfs:" in compose
+    assert "umask 0077" in entrypoint
+    assert 'find "$directory" -type d -exec chmod 700 {} +' in entrypoint
+    assert 'find "$directory" -type f -exec chmod 600 {} +' in entrypoint
+    assert "-p 127.0.0.1:8000:8000" in deployment
+    assert "--read-only" in deployment
+    assert "--tmpfs /tmp:rw,noexec,nosuid,size=64m" in deployment
 
 
 def test_logs_viewer_renders_messages_as_text_not_html():
@@ -1572,7 +1637,9 @@ def test_logs_viewer_renders_messages_as_text_not_html():
     assert 'id="logCards"' in template
 
 
-def test_logs_api_search_module_and_routine_request_filters(database, monkeypatch, tmp_path):
+def test_logs_api_search_module_and_routine_request_filters(
+    database, monkeypatch, tmp_path
+):
     import web_ui_plugin.web_ui as web
 
     monkeypatch.setattr(
@@ -1581,7 +1648,7 @@ def test_logs_api_search_module_and_routine_request_filters(database, monkeypatc
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     (log_dir / "vinted.log").write_text(
-        "2026-07-21 10:00:00,000 - werkzeug - INFO - 127.0.0.1 - \"\x1b[36mGET /api/logs HTTP/1.1\x1b[0m\" 200 -\n"
+        '2026-07-21 10:00:00,000 - werkzeug - INFO - 127.0.0.1 - "\x1b[36mGET /api/logs HTTP/1.1\x1b[0m" 200 -\n'
         "2026-07-21 10:00:01,000 - core - ERROR - Catalogue request failed\n"
         "2026-07-21 10:00:02,000 - core - INFO - Scrape completed\n",
         encoding="utf-8",
@@ -1612,7 +1679,9 @@ def test_allowlist_country_picker_uppercases_and_validates(database, monkeypatch
     )
     client = web.app.test_client()
     page = client.get("/allowlist")
-    token = re.search(rb'name="_csrf_token" value="([^"]+)"', page.data).group(1).decode()
+    token = (
+        re.search(rb'name="_csrf_token" value="([^"]+)"', page.data).group(1).decode()
+    )
     html = page.data.decode()
     assert 'list="countryOptions"' in html
     assert 'value="GB">United Kingdom' in html
@@ -1638,9 +1707,7 @@ def test_configuration_collapses_and_warns_about_unsaved_changes():
 
 
 def test_dashboard_stat_cards_are_links_and_images_have_fallbacks():
-    template = (ROOT / "web_ui_plugin/templates/index.html").read_text(
-        encoding="utf-8"
-    )
+    template = (ROOT / "web_ui_plugin/templates/index.html").read_text(encoding="utf-8")
     assert 'href="/items"' in template
     assert 'href="/queries?status=active"' in template
     assert template.count("dashboard-stat-link") == 3
@@ -1674,7 +1741,9 @@ def test_dashboard_has_search_pagination_relative_times_and_collapsible_sections
     assert 'id="queryPreviousPage"' in template
     assert 'id="queryNextPage"' in template
     assert "const pageSize = 10" in template
-    assert 'class="btn btn-sm btn-outline-secondary dashboard-collapse-toggle"' in template
+    assert (
+        'class="btn btn-sm btn-outline-secondary dashboard-collapse-toggle"' in template
+    )
     assert "vintedDashboardSection:" in template
     assert "data-relative-time" in template
     assert "Intl.RelativeTimeFormat" in template
@@ -1698,3 +1767,69 @@ def test_dashboard_has_live_system_health_summary():
     assert "cooldown_remaining" in template
     assert 'href="/config#system-health"' in template
     assert 'id="system-health"' in config
+
+
+def test_real_browser_smoke_csp_xss_and_responsive_layout(database, monkeypatch):
+    if os.environ.get("VN_RUN_BROWSER_TESTS") != "1":
+        pytest.skip("Set VN_RUN_BROWSER_TESTS=1 to run the browser smoke test")
+
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    import threading
+    from werkzeug.serving import make_server
+    import web_ui_plugin.web_ui as web
+
+    monkeypatch.setattr(web, "WEB_USERNAME", "")
+    monkeypatch.setattr(web, "WEB_PASSWORD", "")
+    monkeypatch.setattr(
+        web.core,
+        "check_version",
+        lambda: (True, "test", "test", "https://github.com/x/y"),
+    )
+
+    server = make_server("127.0.0.1", 0, web.app, threaded=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    browser = None
+    try:
+        with playwright_api.sync_playwright() as playwright:
+            launch_options = {"headless": True}
+            browser_channel = os.environ.get("VN_E2E_BROWSER_CHANNEL", "").strip()
+            if browser_channel:
+                launch_options["channel"] = browser_channel
+            browser = playwright.chromium.launch(**launch_options)
+            page = browser.new_page(viewport={"width": 390, "height": 844})
+            page_errors = []
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+            response = page.goto(
+                f"http://127.0.0.1:{server.server_port}/config",
+                wait_until="networkidle",
+            )
+            assert response.status == 200
+            assert (
+                "script-src 'self' 'nonce-"
+                in response.headers["content-security-policy"]
+            )
+            assert page.evaluate("typeof window.bootstrap !== 'undefined'")
+            assert page.locator("h1", has_text="Configuration").count() == 1
+            assert page.evaluate(
+                "document.documentElement.scrollWidth <= "
+                "document.documentElement.clientWidth"
+            )
+
+            probe = '<img src=x onerror="window.__securityProbe=1">'
+            page.locator('[data-config-target="configAdvancedBody"]').click()
+            page.locator("#message_template").fill(probe)
+            page.wait_for_timeout(100)
+            preview = page.locator("#templatePreview")
+            assert preview.text_content() == probe
+            assert preview.locator("img").count() == 0
+            assert not page.evaluate("window.__securityProbe === 1")
+            assert page_errors == []
+            browser.close()
+            browser = None
+    finally:
+        if browser:
+            browser.close()
+        server.shutdown()
+        thread.join(timeout=5)

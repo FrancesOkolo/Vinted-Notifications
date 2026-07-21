@@ -36,7 +36,29 @@ have not been pushed or deployed.
 ### Deployment impact
 
 - No new production dependency.
-- No new required environment variable.
 - No new database schema migration.
 - Existing `data/`, `logs/`, and `/root/vinted.env` continue to be used.
-- Full automated suite: 43 tests passing.
+- Network-facing Web UI startup now requires `VN_WEB_USERNAME`,
+  `VN_WEB_PASSWORD`, and a persistent `VN_SECRET_KEY`.
+- RSS now requires `VN_RSS_TOKEN` whenever it is enabled.
+- The recommended Docker launch binds ports to loopback, uses a read-only root
+  filesystem, limits Docker logs, and is accessed through an encrypted SSH
+  tunnel unless an HTTPS reverse proxy is configured.
+- Full automated suite: 56 tests passing, one optional real-browser smoke test
+  passing, and 50% measured coverage against a 48% minimum.
+
+### Security and release quality
+
+- Add CSP nonces, secure browser headers, strict session cookies, CSRF
+  enforcement, request-size limits, and safe text rendering for dynamic UI
+  content.
+- Redact Telegram tokens and proxy credentials from logs.
+- Temporarily throttle repeated incorrect Web UI credentials.
+- Fail closed when a network-facing Web UI lacks credentials or a persistent
+  session key, and when RSS lacks its access token.
+- Keep runtime data private to the unprivileged container account.
+- Add pinned Black, Ruff, coverage, and Playwright development tooling.
+- Enforce formatting, linting, dependency auditing, a coverage floor, and a
+  real-browser CSP/XSS/responsiveness smoke test in CI.
+- Gate Docker Hub release publishing on both the Python suite and browser smoke
+  test.

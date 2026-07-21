@@ -33,9 +33,9 @@ def _load_env_file():
 # Populate the environment before importing anything that reads VN_* settings.
 _env_loaded, _env_detail = _load_env_file()
 
-import db
-from apscheduler.schedulers.background import BackgroundScheduler
-from logger import get_logger
+import db  # noqa: E402
+from apscheduler.schedulers.background import BackgroundScheduler  # noqa: E402
+from logger import get_logger  # noqa: E402
 
 # Get logger for this module
 logger = get_logger(__name__)

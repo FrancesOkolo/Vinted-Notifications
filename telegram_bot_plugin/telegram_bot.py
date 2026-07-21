@@ -39,9 +39,7 @@ async def hello(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         chat_id = str(update.effective_chat.id)
         display_name = (
-            update.effective_user.full_name
-            if update.effective_user
-            else None
+            update.effective_user.full_name if update.effective_user else None
         )
 
         db.register_telegram_user(chat_id, display_name)
@@ -73,9 +71,7 @@ async def hello(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "An error occurred. Please try again later."
             )
         except Exception as reply_error:
-            logger.error(
-                f"Error sending error message: {str(reply_error)}"
-            )
+            logger.error(f"Error sending error message: {str(reply_error)}")
 
 
 class LeRobot:
@@ -116,12 +112,8 @@ class LeRobot:
             self.app.add_handler(CommandHandler("remove_query", self.remove_query))
             self.app.add_handler(CommandHandler("queries", self.queries))
             self.app.add_handler(CommandHandler("my_id", self.my_id))
-            self.app.add_handler(
-                CommandHandler("approve_user", self.approve_user)
-            )
-            self.app.add_handler(
-                CommandHandler("revoke_user", self.revoke_user)
-            )
+            self.app.add_handler(CommandHandler("approve_user", self.approve_user))
+            self.app.add_handler(CommandHandler("revoke_user", self.revoke_user))
             self.app.add_handler(CommandHandler("users", self.users))
             self.app.add_handler(
                 CommandHandler("copy_my_queries", self.copy_my_queries)
@@ -198,16 +190,12 @@ class LeRobot:
                     "(e.g. stop the local copy if the server is live)."
                 )
         else:
-            logger.error(
-                "Unhandled Telegram error: %s", error, exc_info=error
-            )
+            logger.error("Unhandled Telegram error: %s", error, exc_info=error)
 
     async def require_approved(self, update: Update) -> bool:
         chat_id = str(update.effective_chat.id)
         display_name = (
-            update.effective_user.full_name
-            if update.effective_user
-            else None
+            update.effective_user.full_name if update.effective_user else None
         )
         db.register_telegram_user(chat_id, display_name)
 
@@ -239,9 +227,7 @@ class LeRobot:
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         chat_id = str(update.effective_chat.id)
-        await update.message.reply_text(
-            f"Your Telegram chat ID is {chat_id}."
-        )
+        await update.message.reply_text(f"Your Telegram chat ID is {chat_id}.")
 
     async def approve_user(
         self,
@@ -265,9 +251,7 @@ class LeRobot:
             return
 
         if db.approve_telegram_user(chat_id, display_name):
-            await update.message.reply_text(
-                f"Approved Telegram account {chat_id}."
-            )
+            await update.message.reply_text(f"Approved Telegram account {chat_id}.")
             try:
                 await self.bot.send_message(
                     chat_id=chat_id,
@@ -284,9 +268,7 @@ class LeRobot:
                     exc_info=True,
                 )
         else:
-            await update.message.reply_text(
-                "The account could not be approved."
-            )
+            await update.message.reply_text("The account could not be approved.")
 
     async def revoke_user(
         self,
@@ -297,16 +279,12 @@ class LeRobot:
             return
 
         if not context.args:
-            await update.message.reply_text(
-                "Usage: /revoke_user CHAT_ID"
-            )
+            await update.message.reply_text("Usage: /revoke_user CHAT_ID")
             return
 
         chat_id = context.args[0]
         if db.revoke_telegram_user(chat_id):
-            await update.message.reply_text(
-                f"Revoked Telegram account {chat_id}."
-            )
+            await update.message.reply_text(f"Revoked Telegram account {chat_id}.")
         else:
             await update.message.reply_text(
                 "Account not found, already revoked, or is the administrator."
@@ -328,13 +306,9 @@ class LeRobot:
         lines = []
         for chat_id, name, status, is_admin in users:
             role = "admin" if int(is_admin) == 1 else "user"
-            lines.append(
-                f"{chat_id} | {name or 'Unnamed'} | {status} | {role}"
-            )
+            lines.append(f"{chat_id} | {name or 'Unnamed'} | {status} | {role}")
 
-        await update.message.reply_text(
-            "Telegram users:\n" + "\n".join(lines)
-        )
+        await update.message.reply_text("Telegram users:\n" + "\n".join(lines))
 
     async def copy_my_queries(
         self,
@@ -346,9 +320,7 @@ class LeRobot:
             return
 
         if not context.args:
-            await update.message.reply_text(
-                "Usage: /copy_my_queries CHAT_ID"
-            )
+            await update.message.reply_text("Usage: /copy_my_queries CHAT_ID")
             return
 
         target_chat_id = context.args[0]
@@ -358,8 +330,7 @@ class LeRobot:
 
         if not db.is_telegram_user_approved(target_chat_id):
             await update.message.reply_text(
-                "That Telegram account is not approved yet. "
-                "Use /approve_user first."
+                "That Telegram account is not approved yet. " "Use /approve_user first."
             )
             return
 
@@ -432,9 +403,7 @@ class LeRobot:
             )
 
             if is_new_query:
-                query_list = core.get_formatted_query_list(
-                    chat_id=chat_id
-                )
+                query_list = core.get_formatted_query_list(chat_id=chat_id)
                 await update.message.reply_text(
                     f"{message}\nYour current queries:\n{query_list}"
                 )
@@ -448,9 +417,7 @@ class LeRobot:
                 f"Error adding query: {str(error)}",
                 exc_info=True,
             )
-            await update.message.reply_text(
-                "An error occurred while adding the query."
-            )
+            await update.message.reply_text("An error occurred while adding the query.")
 
     # Remove a query from the db
     async def remove_query(
@@ -493,9 +460,7 @@ class LeRobot:
                 )
 
             if success:
-                query_list = core.get_formatted_query_list(
-                    chat_id=chat_id
-                )
+                query_list = core.get_formatted_query_list(chat_id=chat_id)
                 await update.message.reply_text(
                     f"{message}\nYour current queries:\n{query_list}"
                 )
@@ -522,12 +487,8 @@ class LeRobot:
 
         try:
             chat_id = str(update.effective_chat.id)
-            query_list = core.get_formatted_query_list(
-                chat_id=chat_id
-            )
-            await update.message.reply_text(
-                f"Your current queries:\n{query_list}"
-            )
+            query_list = core.get_formatted_query_list(chat_id=chat_id)
+            await update.message.reply_text(f"Your current queries:\n{query_list}")
         except Exception as error:
             logger.error(
                 f"Error retrieving queries: {str(error)}",
@@ -685,9 +646,7 @@ class LeRobot:
                 )
                 continue
 
-            delivered = await self._send_message_with_retries(
-                chat_id, content, markup
-            )
+            delivered = await self._send_message_with_retries(chat_id, content, markup)
             all_delivered = all_delivered and delivered
 
         # True when every approved recipient received it (or there were none to
@@ -803,29 +762,27 @@ class LeRobot:
             else "Resubscribe to this search"
         )
         action_data = (
-            f"unsubscribe:{query_id}"
-            if subscribed
-            else f"resubscribe:{query_id}"
+            f"unsubscribe:{query_id}" if subscribed else f"resubscribe:{query_id}"
         )
         updated_rows = [
             [
-                InlineKeyboardButton(
-                    text=action_text,
-                    callback_data=action_data,
+                (
+                    InlineKeyboardButton(
+                        text=action_text,
+                        callback_data=action_data,
+                    )
+                    if (
+                        button.callback_data
+                        and button.callback_data.startswith(action_prefixes)
+                    )
+                    else button
                 )
-                if (
-                    button.callback_data
-                    and button.callback_data.startswith(action_prefixes)
-                )
-                else button
                 for button in row
             ]
             for row in markup.inline_keyboard
         ]
         try:
-            await callback.edit_message_reply_markup(
-                InlineKeyboardMarkup(updated_rows)
-            )
+            await callback.edit_message_reply_markup(InlineKeyboardMarkup(updated_rows))
         except BadRequest:
             logger.debug(
                 "Subscription changed, but the Telegram message buttons "
@@ -907,9 +864,7 @@ class LeRobot:
         context: ContextTypes.DEFAULT_TYPE,
     ):
         try:
-            should_update, current_version, latest_version, url = (
-                core.check_version()
-            )
+            should_update, current_version, latest_version, url = core.check_version()
 
             if not should_update:
                 admin_chat_id = db.get_parameter("telegram_chat_id")
@@ -942,9 +897,7 @@ class LeRobot:
             try:
                 due = db.get_due_notifications(limit=10)
             except Exception:
-                logger.error(
-                    "Could not read the notification outbox.", exc_info=True
-                )
+                logger.error("Could not read the notification outbox.", exc_info=True)
                 await asyncio.sleep(5)
                 continue
 
@@ -962,9 +915,7 @@ class LeRobot:
                 attempts,
             ) in due:
                 try:
-                    chat_ids = (
-                        json.loads(chat_ids_json) if chat_ids_json else None
-                    )
+                    chat_ids = json.loads(chat_ids_json) if chat_ids_json else None
                 except (TypeError, ValueError):
                     chat_ids = None
 

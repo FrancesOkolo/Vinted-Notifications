@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-
 REMOVE_PARAMETERS = {
     "search_by_image_uuid",
     "search_by_image_id",
@@ -81,14 +80,7 @@ def normalise_vinted_url(raw_url: str) -> str:
         parameters.append(("currency", "GBP"))
 
     # Replace any existing order value so all alerts use newest first.
-    parameters = [
-        (key, value)
-        for key, value in parameters
-        if key != "order"
-    ]
+    parameters = [(key, value) for key, value in parameters if key != "order"]
     parameters.append(("order", "newest_first"))
 
-    return (
-        "https://www.vinted.co.uk/catalog?"
-        + urlencode(parameters)
-    )
+    return "https://www.vinted.co.uk/catalog?" + urlencode(parameters)

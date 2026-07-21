@@ -73,6 +73,7 @@ def process_query(query, name=None, chat_id=None):
 
     return "Query already existed; you are now subscribed to it.", True
 
+
 def get_formatted_query_list(chat_id=None):
     """
     Return a numbered query list. Telegram users see only searches to
@@ -98,6 +99,7 @@ def get_formatted_query_list(chat_id=None):
         f"{index}. {query_name}"
         for index, query_name in enumerate(queries_keywords, start=1)
     )
+
 
 def process_remove_query(number, chat_id=None):
     """
@@ -128,9 +130,7 @@ def process_remove_query(number, chat_id=None):
     if chat_id is None:
         success = db.remove_query_from_db(query_id)
         return (
-            ("Query removed.", True)
-            if success
-            else ("Failed to remove query.", False)
+            ("Query removed.", True) if success else ("Failed to remove query.", False)
         )
 
     success = db.remove_query_subscription(query_id, chat_id)
@@ -139,6 +139,7 @@ def process_remove_query(number, chat_id=None):
         if success
         else ("Query not found in your account.", False)
     )
+
 
 def process_update_query(query_id, query, name):
     """
@@ -150,6 +151,7 @@ def process_update_query(query_id, query, name):
         return "Query updated.", True
 
     return "Failed to update query.", False
+
 
 def process_add_country(country):
     """
@@ -269,9 +271,10 @@ def get_quiet_hours_status(now=None):
 
     start_text = str(db.get_parameter("quiet_hours_start") or "01:00")
     end_text = str(db.get_parameter("quiet_hours_end") or "06:00")
-    timezone_name = str(
-        db.get_parameter("quiet_hours_timezone") or "Europe/London"
-    ).strip() or "Europe/London"
+    timezone_name = (
+        str(db.get_parameter("quiet_hours_timezone") or "Europe/London").strip()
+        or "Europe/London"
+    )
 
     if not enabled:
         return False, start_text, end_text, timezone_name
@@ -287,9 +290,7 @@ def get_quiet_hours_status(now=None):
         try:
             quiet_timezone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
-            logger.error(
-                "Timezone data is unavailable; quiet hours are disabled."
-            )
+            logger.error("Timezone data is unavailable; quiet hours are disabled.")
             return False, start_text, end_text, timezone_name
 
     start = _parse_quiet_time(start_text, "01:00")
@@ -338,9 +339,7 @@ def _get_retry_after_seconds(response, fallback_seconds):
         retry_at = parsedate_to_datetime(retry_after)
         if retry_at.tzinfo is None:
             retry_at = retry_at.replace(tzinfo=timezone.utc)
-        seconds = int(
-            (retry_at - datetime.now(timezone.utc)).total_seconds()
-        )
+        seconds = int((retry_at - datetime.now(timezone.utc)).total_seconds())
         return max(1, seconds)
     except (TypeError, ValueError, OverflowError):
         return fallback_seconds
@@ -351,9 +350,7 @@ def _get_query_spacing_seconds(query_count):
         return 0.0
 
     try:
-        refresh_delay = int(
-            db.get_parameter("query_refresh_delay") or 600
-        )
+        refresh_delay = int(db.get_parameter("query_refresh_delay") or 600)
     except (TypeError, ValueError):
         refresh_delay = 600
 
@@ -539,9 +536,7 @@ def process_items(queue):
     """
     record_scraper_heartbeat()
 
-    quiet_active, quiet_start, quiet_end, quiet_timezone = (
-        get_quiet_hours_status()
-    )
+    quiet_active, quiet_start, quiet_end, quiet_timezone = get_quiet_hours_status()
     if quiet_active:
         logger.info(
             "Quiet hours active (%s-%s, %s); skipping this scrape cycle.",
@@ -572,9 +567,7 @@ def process_items(queue):
     vinted = Vinted()
 
     try:
-        items_per_query = int(
-            db.get_parameter("items_per_query") or 20
-        )
+        items_per_query = int(db.get_parameter("items_per_query") or 20)
     except (TypeError, ValueError):
         items_per_query = 20
 
@@ -622,9 +615,7 @@ def process_items(queue):
                 break
             except requests.exceptions.HTTPError as error:
                 response = error.response
-                status_code = (
-                    response.status_code if response is not None else None
-                )
+                status_code = response.status_code if response is not None else None
 
                 if status_code == 403:
                     consecutive_403s += 1
@@ -673,8 +664,7 @@ def process_items(queue):
                 wait_seconds = min(max(wait_seconds, 30), 300)
 
                 logger.warning(
-                    "Vinted rate-limited query %s/%s. Waiting %s seconds "
-                    "before %s.",
+                    "Vinted rate-limited query %s/%s. Waiting %s seconds " "before %s.",
                     position,
                     query_count,
                     wait_seconds,
@@ -758,10 +748,7 @@ class _ProductJsonLdParser(HTMLParser):
         if tag.lower() != "script":
             return
 
-        attributes = {
-            str(name).lower(): value or ""
-            for name, value in attrs
-        }
+        attributes = {str(name).lower(): value or "" for name, value in attrs}
         if attributes.get("type", "").lower() == "application/ld+json":
             self._capturing = True
             self._chunks = []
@@ -824,7 +811,11 @@ def _get_item_description(item):
 
     item_url = urlparse(str(getattr(item, "url", "")))
     item_id = str(getattr(item, "id", ""))
-    if item_url.scheme not in ("http", "https") or not item_url.netloc or not item_id.isdigit():
+    if (
+        item_url.scheme not in ("http", "https")
+        or not item_url.netloc
+        or not item_id.isdigit()
+    ):
         logger.warning("Could not build a safe detail URL for Vinted item %r", item_id)
         return None
 
@@ -906,8 +897,7 @@ def clear_item_queue(items_queue, new_items_queue):
             else:
                 # We create the message
                 message_template = (
-                    db.get_parameter("message_template")
-                    or db.DEFAULT_MESSAGE_TEMPLATE
+                    db.get_parameter("message_template") or db.DEFAULT_MESSAGE_TEMPLATE
                 )
                 description = (
                     _get_item_description(item)
@@ -916,9 +906,7 @@ def clear_item_queue(items_queue, new_items_queue):
                 )
                 format_values = dict(
                     title=_notification_value(item.title),
-                    price=_notification_value(
-                        str(item.price) + " " + item.currency
-                    ),
+                    price=_notification_value(str(item.price) + " " + item.currency),
                     brand=_notification_value(
                         item.brand_title,
                         fallback="Not specified",

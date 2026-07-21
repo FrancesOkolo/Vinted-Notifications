@@ -142,14 +142,8 @@ class Requester:
                     )
                     return response
 
-                if (
-                    response.status_code in (401, 404)
-                    and attempt < self.MAX_RETRIES
-                ):
-                    print(
-                        "Cookies invalid, retrying "
-                        f"{attempt}/{self.MAX_RETRIES}"
-                    )
+                if response.status_code in (401, 404) and attempt < self.MAX_RETRIES:
+                    print("Cookies invalid, retrying " f"{attempt}/{self.MAX_RETRIES}")
                     if self.debug:
                         logger.debug(
                             "Cookies invalid retrying %s/%s",

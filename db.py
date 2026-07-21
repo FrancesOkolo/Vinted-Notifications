@@ -129,116 +129,6 @@ def add_item_to_db(id, title, query_id, price, timestamp, photo_url, currency="E
             conn.close()
 
 
-def get_queries():
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, query, last_item, query_name FROM queries")
-        return cursor.fetchall()
-    except Exception:
-        print_exc()
-    finally:
-        if conn:
-            conn.close()
-
-
-def is_query_in_db(processed_query):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # replace spaces in searched_text by % to match any query containing the searched text
-
-        cursor.execute(
-            "SELECT COUNT() FROM queries WHERE query = ?", (processed_query,)
-        )
-        if cursor.fetchone()[0]:
-            return True
-        return False
-    except Exception:
-        print_exc()
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-
-def add_query_to_db(query, name=None):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        if name:
-            cursor.execute(
-                "INSERT INTO queries (query, last_item, query_name) VALUES (?, NULL, ?)",
-                (query, name),
-            )
-        else:
-            cursor.execute(
-                "INSERT INTO queries (query, last_item) VALUES (?, NULL)", (query,)
-            )
-        conn.commit()
-    except Exception:
-        print_exc()
-    finally:
-        if conn:
-            conn.close()
-
-
-def get_query_id_by_rowid(rowid):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        query = f"SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY ROWID) rn FROM queries) t WHERE rn={rowid}"
-        cursor.execute(query)
-        result = cursor.fetchone()
-        if result:
-            return result[0]
-        return None
-    except Exception:
-        print_exc()
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-
-def remove_query_from_db(query_number):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # Delete items associated with this query using query_id
-        cursor.execute("DELETE FROM items WHERE query_id=?", (query_number,))
-        # Delete the query
-        cursor.execute("DELETE FROM queries WHERE id=?", (query_number,))
-        conn.commit()
-    except Exception:
-        print_exc()
-    finally:
-        if conn:
-            conn.close()
-
-
-def remove_all_queries_from_db():
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # Delete all items first to maintain foreign key integrity
-        cursor.execute("DELETE FROM items")
-        # Then delete all queries
-        cursor.execute("DELETE FROM queries")
-        conn.commit()
-    except Exception:
-        print_exc()
-    finally:
-        if conn:
-            conn.close()
-
-
 def update_query_in_db(query_id, query, name):
     """
     Update an existing query in the database.
@@ -626,6 +516,7 @@ def migrate_quiet_hours_schema():
 # Multi-user Telegram support
 # ============================================================
 
+
 def migrate_multi_user_schema():
     """
     Create the multi-user Telegram tables for an existing installation.
@@ -639,8 +530,7 @@ def migrate_multi_user_schema():
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        cursor.executescript(
-            """
+        cursor.executescript("""
             CREATE TABLE IF NOT EXISTS telegram_users
             (
                 chat_id      TEXT PRIMARY KEY,
@@ -669,12 +559,9 @@ def migrate_multi_user_schema():
 
             CREATE INDEX IF NOT EXISTS idx_query_subscriptions_query
                 ON query_subscriptions (query_id);
-            """
-        )
+            """)
 
-        cursor.execute(
-            "SELECT value FROM parameters WHERE key='telegram_chat_id'"
-        )
+        cursor.execute("SELECT value FROM parameters WHERE key='telegram_chat_id'")
         row = cursor.fetchone()
         admin_chat_id = str(row[0]).strip() if row and row[0] is not None else ""
 
@@ -702,13 +589,11 @@ def migrate_multi_user_schema():
                 (admin_chat_id,),
             )
         else:
-            cursor.execute(
-                """
+            cursor.execute("""
                 UPDATE telegram_users
                 SET is_admin=0, updated_at=CURRENT_TIMESTAMP
                 WHERE is_admin=1
-                """
-            )
+                """)
 
             # Preserve all existing searches by assigning otherwise-unowned
             # queries to the configured primary Telegram account.
@@ -746,14 +631,12 @@ def migrate_query_uniqueness():
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT query
             FROM queries
             GROUP BY query
             HAVING COUNT(*) > 1
-            """
-        )
+            """)
 
         for (query_url,) in cursor.fetchall():
             cursor.execute(
@@ -812,12 +695,10 @@ def migrate_query_uniqueness():
                     (duplicate_id,),
                 )
 
-        cursor.execute(
-            """
+        cursor.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_queries_query_unique
             ON queries (query)
-            """
-        )
+            """)
         conn.commit()
         return True
     except Exception:
@@ -835,14 +716,12 @@ def migrate_fork_identity():
     conn = None
     try:
         conn = get_db_connection()
-        conn.execute(
-            """
+        conn.execute("""
             UPDATE parameters
             SET value='https://github.com/FrancesOkolo/Vinted-Notifications'
             WHERE key='github_url'
               AND value='https://github.com/Fuyucch1/Vinted-Notifications'
-            """
-        )
+            """)
         conn.commit()
         return True
     except Exception:
@@ -963,13 +842,11 @@ def get_telegram_users():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT chat_id, display_name, status, is_admin
             FROM telegram_users
             ORDER BY is_admin DESC, status, display_name, chat_id
-            """
-        )
+            """)
         return cursor.fetchall()
     except Exception:
         print_exc()
@@ -1004,14 +881,12 @@ def get_queries(chat_id=None, enabled_only=False):
         cursor = conn.cursor()
 
         if chat_id is None:
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT id, query, last_item, query_name
                 FROM queries
                 {where}
                 ORDER BY id
-                """.format(where="WHERE enabled=1" if enabled_only else "")
-            )
+                """.format(where="WHERE enabled=1" if enabled_only else ""))
         else:
             cursor.execute(
                 """
@@ -1594,8 +1469,7 @@ def migrate_pending_notifications_table():
     conn = None
     try:
         conn = get_db_connection()
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS pending_notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT NOT NULL,
@@ -1607,11 +1481,9 @@ def migrate_pending_notifications_table():
                 next_attempt_at REAL NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
-            """
-        )
+            """)
         columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(pending_notifications)")
+            row[1] for row in conn.execute("PRAGMA table_info(pending_notifications)")
         }
         if "query_id" not in columns:
             conn.execute(
@@ -1631,9 +1503,7 @@ def enqueue_notification(content, url, button_text, chat_ids, query_id=None):
     """Persist one Telegram notification for delivery. Returns the new row id."""
     conn = None
     try:
-        chat_ids_json = (
-            json.dumps([str(c) for c in chat_ids]) if chat_ids else None
-        )
+        chat_ids_json = json.dumps([str(c) for c in chat_ids]) if chat_ids else None
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -1699,9 +1569,7 @@ def delete_notification(notification_id):
     conn = None
     try:
         conn = get_db_connection()
-        conn.execute(
-            "DELETE FROM pending_notifications WHERE id=?", (notification_id,)
-        )
+        conn.execute("DELETE FROM pending_notifications WHERE id=?", (notification_id,))
         conn.commit()
         return True
     except Exception:

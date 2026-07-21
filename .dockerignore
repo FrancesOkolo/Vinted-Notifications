@@ -1,6 +1,7 @@
 # Git
 .git
 .gitignore
+.github/
 
 # Python
 __pycache__/
@@ -25,6 +26,14 @@ var/
 .installed.cfg
 *.egg
 venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+tests/
+requirements-dev.txt
+requirements-browser.txt
+pytest.ini
 
 # Database
 data/

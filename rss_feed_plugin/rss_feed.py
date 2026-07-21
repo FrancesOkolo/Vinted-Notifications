@@ -87,24 +87,30 @@ class RSSFeed:
             self.items.pop(0)
 
     def serve_rss(self):
-        if self.access_token:
-            authorization = request.headers.get("Authorization", "")
-            bearer_token = (
-                authorization[7:].strip()
-                if authorization.lower().startswith("bearer ")
-                else ""
+        if not self.access_token:
+            return Response(
+                "RSS authentication is not configured.",
+                status=503,
+                mimetype="text/plain",
             )
-            supplied_token = bearer_token or request.args.get("token", "")
-            if not supplied_token or not hmac.compare_digest(
-                supplied_token,
-                self.access_token,
-            ):
-                return Response(
-                    "Authentication required.",
-                    status=401,
-                    headers={"WWW-Authenticate": 'Bearer realm="Vinted RSS"'},
-                    mimetype="text/plain",
-                )
+
+        authorization = request.headers.get("Authorization", "")
+        bearer_token = (
+            authorization[7:].strip()
+            if authorization.lower().startswith("bearer ")
+            else ""
+        )
+        supplied_token = bearer_token or request.args.get("token", "")
+        if not supplied_token or not hmac.compare_digest(
+            supplied_token,
+            self.access_token,
+        ):
+            return Response(
+                "Authentication required.",
+                status=401,
+                headers={"WWW-Authenticate": 'Bearer realm="Vinted RSS"'},
+                mimetype="text/plain",
+            )
 
         response = Response(self.fg.rss_str(), mimetype="application/rss+xml")
         response.headers["Cache-Control"] = "private, no-store"
@@ -120,6 +126,11 @@ class RSSFeed:
             # from the host/network. Set VN_RSS_HOST=127.0.0.1 to restrict to
             # localhost-only.
             host = os.environ.get("VN_RSS_HOST", "0.0.0.0")
+            if not self.access_token:
+                raise RuntimeError(
+                    "Refusing to start RSS without VN_RSS_TOKEN. Disable RSS "
+                    "or configure a long random token."
+                )
             logger.info("Starting RSS feed server on %s:%s", host, port)
             from waitress import serve
 

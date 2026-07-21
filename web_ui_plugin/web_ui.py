@@ -13,8 +13,8 @@ from flask import (
 )
 import db
 import core
-import html
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -22,6 +22,9 @@ import re
 import requests
 import secrets
 import string
+import threading
+import time
+from collections import deque
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -62,7 +65,22 @@ def _positive_int_env(name, default):
     return value if value > 0 else default
 
 
+def _is_loopback_host(host):
+    """Return True only for explicit loopback bind addresses."""
+    candidate = (host or "").strip().lower().strip("[]")
+    if candidate == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
 WEB_HTTPS_ENABLED = _env_flag("VN_WEB_HTTPS")
+WEB_SECRET_KEY = os.environ.get("VN_SECRET_KEY", "")
+AUTH_MAX_FAILURES = _positive_int_env("VN_WEB_AUTH_MAX_FAILURES", 10)
+AUTH_WINDOW_SECONDS = _positive_int_env("VN_WEB_AUTH_WINDOW_SECONDS", 300)
+AUTH_BLOCK_SECONDS = _positive_int_env("VN_WEB_AUTH_BLOCK_SECONDS", 900)
 app.config.update(
     MAX_CONTENT_LENGTH=_positive_int_env("VN_WEB_MAX_REQUEST_BYTES", 256 * 1024),
     MAX_FORM_MEMORY_SIZE=_positive_int_env(
@@ -86,7 +104,7 @@ if trusted_hosts:
 
 # A persistent key is mandatory in Docker. Localhost-only development can use
 # an ephemeral key without placing a secret in source control.
-app.secret_key = os.environ.get("VN_SECRET_KEY") or os.urandom(32)
+app.secret_key = WEB_SECRET_KEY or os.urandom(32)
 
 WEB_USERNAME = os.environ.get("VN_WEB_USERNAME", "").strip()
 WEB_PASSWORD = os.environ.get("VN_WEB_PASSWORD", "")
@@ -94,6 +112,57 @@ if bool(WEB_USERNAME) != bool(WEB_PASSWORD):
     raise RuntimeError(
         "VN_WEB_USERNAME and VN_WEB_PASSWORD must either both be set or both be empty."
     )
+
+_auth_failures = {}
+_auth_blocked_until = {}
+_auth_lock = threading.Lock()
+
+
+def _validate_web_bind_security(host):
+    """Refuse an unauthenticated or ephemeral-key network-facing Web UI."""
+    if _is_loopback_host(host):
+        return
+    if not WEB_USERNAME:
+        raise RuntimeError(
+            "Refusing to expose the Web UI without authentication. Set "
+            "VN_WEB_USERNAME and VN_WEB_PASSWORD, or bind VN_WEB_HOST to "
+            "127.0.0.1 for local-only access."
+        )
+    if not WEB_SECRET_KEY:
+        raise RuntimeError(
+            "Refusing to expose the Web UI without a persistent VN_SECRET_KEY."
+        )
+
+
+def _auth_client_key():
+    return request.remote_addr or "unknown"
+
+
+def _clear_auth_failures(client_key):
+    with _auth_lock:
+        _auth_failures.pop(client_key, None)
+        _auth_blocked_until.pop(client_key, None)
+
+
+def _record_auth_failure(client_key, now=None):
+    """Record a failed login and return the block duration, if activated."""
+    now = time.monotonic() if now is None else now
+    cutoff = now - AUTH_WINDOW_SECONDS
+    with _auth_lock:
+        blocked_until = _auth_blocked_until.get(client_key, 0)
+        if blocked_until > now:
+            return max(1, int(blocked_until - now))
+
+        failures = _auth_failures.setdefault(client_key, deque())
+        while failures and failures[0] < cutoff:
+            failures.popleft()
+        failures.append(now)
+        if len(failures) >= AUTH_MAX_FAILURES:
+            blocked_until = now + AUTH_BLOCK_SECONDS
+            _auth_blocked_until[client_key] = blocked_until
+            failures.clear()
+            return AUTH_BLOCK_SECONDS
+    return 0
 
 
 def csrf_token():
@@ -125,20 +194,34 @@ def protect_web_interface():
         return None
 
     if not _basic_auth_valid():
+        retry_after = _record_auth_failure(_auth_client_key())
+        if retry_after:
+            return Response(
+                "Too many failed authentication attempts. Try again later.",
+                429,
+                {"Retry-After": str(retry_after)},
+            )
         return Response(
             "Authentication required.",
             401,
             {"WWW-Authenticate": 'Basic realm="Vinted Notifications"'},
         )
 
+    if WEB_USERNAME:
+        _clear_auth_failures(_auth_client_key())
+
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         supplied = request.form.get("_csrf_token") or request.headers.get(
             "X-CSRF-Token"
         )
         expected = session.get("_csrf_token")
-        if not supplied or not expected or not hmac.compare_digest(
-            supplied,
-            expected,
+        if (
+            not supplied
+            or not expected
+            or not hmac.compare_digest(
+                supplied,
+                expected,
+            )
         ):
             abort(400, description="Invalid or missing CSRF token.")
 
@@ -268,9 +351,9 @@ def index():
         else:
             try:
                 last_found_timestamp = float(last_timestamp)
-                last_found_item = datetime.fromtimestamp(
-                    last_found_timestamp
-                ).strftime("%Y-%m-%d %H:%M:%S")
+                last_found_item = datetime.fromtimestamp(last_found_timestamp).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
             except (TypeError, ValueError, OSError, OverflowError) as error:
                 logger.warning(
                     "Could not format last_item %r for query %s: %s",
@@ -340,7 +423,7 @@ def index():
             "timestamp_raw": last_item_timestamp,
             "query": last_item[5],
             "photo_url": last_item[6],
-            "url": f"{urlparse(last_item[5]).scheme}://{urlparse(last_item[5]).netloc}/items/{last_item[0]}"
+            "url": f"{urlparse(last_item[5]).scheme}://{urlparse(last_item[5]).netloc}/items/{last_item[0]}",
         }
     else:
         stats["last_item"] = None
@@ -359,11 +442,31 @@ def index():
 _CURRENCY_SYMBOLS = {"GBP": "£", "EUR": "€", "USD": "$"}
 
 _VINTED_COUNTRY = {
-    "co.uk": "UK", "fr": "FR", "de": "DE", "com": "COM", "it": "IT",
-    "es": "ES", "nl": "NL", "be": "BE", "pl": "PL", "at": "AT",
-    "lt": "LT", "cz": "CZ", "pt": "PT", "lu": "LU", "sk": "SK",
-    "ie": "IE", "se": "SE", "ro": "RO", "hu": "HU", "fi": "FI",
-    "dk": "DK", "gr": "GR", "hr": "HR", "us": "US", "ca": "CA",
+    "co.uk": "UK",
+    "fr": "FR",
+    "de": "DE",
+    "com": "COM",
+    "it": "IT",
+    "es": "ES",
+    "nl": "NL",
+    "be": "BE",
+    "pl": "PL",
+    "at": "AT",
+    "lt": "LT",
+    "cz": "CZ",
+    "pt": "PT",
+    "lu": "LU",
+    "sk": "SK",
+    "ie": "IE",
+    "se": "SE",
+    "ro": "RO",
+    "hu": "HU",
+    "fi": "FI",
+    "dk": "DK",
+    "gr": "GR",
+    "hr": "HR",
+    "us": "US",
+    "ca": "CA",
 }
 
 
@@ -450,9 +553,9 @@ def queries():
         else:
             try:
                 last_found_timestamp = float(last_timestamp)
-                last_found_item = datetime.fromtimestamp(
-                    last_found_timestamp
-                ).strftime("%Y-%m-%d %H:%M:%S")
+                last_found_item = datetime.fromtimestamp(last_found_timestamp).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
             except (TypeError, ValueError, OSError, OverflowError) as error:
                 logger.warning(
                     "Could not format last_item %r for query %s: %s",
@@ -811,7 +914,9 @@ def _validated_int(name, default, minimum, maximum):
     try:
         value = int(raw_value)
     except ValueError as error:
-        raise ValueError(f"{name.replace('_', ' ').title()} must be a number.") from error
+        raise ValueError(
+            f"{name.replace('_', ' ').title()} must be a number."
+        ) from error
     if not minimum <= value <= maximum:
         raise ValueError(
             f"{name.replace('_', ' ').title()} must be between "
@@ -923,7 +1028,9 @@ def test_telegram():
         # bot token. Record the error type without copying credentials to logs.
         logger.warning("Telegram test message failed (%s)", type(error).__name__)
         return (
-            jsonify({"status": "error", "message": f"Could not reach Telegram: {error}"}),
+            jsonify(
+                {"status": "error", "message": f"Could not reach Telegram: {error}"}
+            ),
             502,
         )
 
@@ -1013,9 +1120,7 @@ def update_config():
         ):
             raise ValueError("User Agents must be a JSON list of strings.")
 
-        default_headers = (
-            request.form.get("default_headers", "{}").strip() or "{}"
-        )
+        default_headers = request.form.get("default_headers", "{}").strip() or "{}"
         parsed_headers = json.loads(default_headers)
         if not isinstance(parsed_headers, dict) or not all(
             isinstance(key, str) and isinstance(value, str)
@@ -1310,11 +1415,11 @@ def web_ui_process():
     try:
         from waitress import serve
 
-        # Bind to all interfaces by default so the container is reachable from
-        # the host/network out of the box. Set VN_WEB_HOST=127.0.0.1 to restrict
-        # to localhost-only (e.g. behind an authenticated reverse proxy).
+        # Network-facing binds must have credentials and a persistent session
+        # key. Localhost-only development may omit both.
         host = os.environ.get("VN_WEB_HOST", "0.0.0.0")
         port = int(os.environ.get("VN_WEB_PORT", "8000"))
+        _validate_web_bind_security(host)
         logger.info("Serving Web UI on %s:%s", host, port)
         serve(app, host=host, port=port, threads=4)
     except (KeyboardInterrupt, SystemExit):
