@@ -809,7 +809,7 @@ def test_outbox_migration_adds_query_id_to_existing_table(tmp_path, monkeypatch)
     assert "query_id" in columns
 
 
-def test_telegram_unsubscribe_button_removes_only_clicking_user(
+def test_telegram_subscription_button_toggles_only_clicking_user(
     database,
     monkeypatch,
 ):
@@ -862,12 +862,11 @@ def test_telegram_unsubscribe_button_removes_only_clicking_user(
         ]
 
         class Callback:
-            data = f"unsubscribe:{query_id}"
-            message = SimpleNamespace(reply_markup=sister_markup)
-
-            def __init__(self):
+            def __init__(self, data, markup):
+                self.data = data
+                self.message = SimpleNamespace(reply_markup=markup)
                 self.answers = []
-                self.edited_markup = sister_markup
+                self.edited_markup = markup
 
             async def answer(self, text, show_alert=False):
                 self.answers.append((text, show_alert))
@@ -875,18 +874,38 @@ def test_telegram_unsubscribe_button_removes_only_clicking_user(
             async def edit_message_reply_markup(self, markup):
                 self.edited_markup = markup
 
-        callback = Callback()
+        callback = Callback(f"unsubscribe:{query_id}", sister_markup)
         update = SimpleNamespace(
             callback_query=callback,
             effective_chat=SimpleNamespace(id=222),
         )
         await robot.unsubscribe_query(update, None)
+        assert set(db.get_query_subscribers(query_id)) == {"111"}
+        assert callback.answers == [("Unsubscribed from this search.", True)]
+        action_buttons = [
+            button
+            for row in callback.edited_markup.inline_keyboard
+            for button in row
+            if button.callback_data
+            and button.callback_data.startswith(("unsubscribe:", "resubscribe:"))
+        ]
+        assert [button.callback_data for button in action_buttons] == [
+            f"resubscribe:{query_id}"
+        ]
+        assert [button.text for button in action_buttons] == [
+            "Resubscribe to this search"
+        ]
+
+        callback.message.reply_markup = callback.edited_markup
+        callback.data = f"resubscribe:{query_id}"
+        callback.answers = []
+        await robot.resubscribe_query(update, None)
         return callback
 
     callback = asyncio.run(exercise_button())
 
-    assert set(db.get_query_subscribers(query_id)) == {"111"}
-    assert callback.answers == [("Unsubscribed from this search.", True)]
+    assert set(db.get_query_subscribers(query_id)) == {"111", "222"}
+    assert callback.answers == [("Resubscribed to this search.", True)]
     remaining_callbacks = [
         button.callback_data
         for row in callback.edited_markup.inline_keyboard
@@ -894,14 +913,14 @@ def test_telegram_unsubscribe_button_removes_only_clicking_user(
         if button.callback_data
     ]
     assert remaining_callbacks == [f"unsubscribe:{query_id}"]
-    unsubscribe_labels = [
+    subscription_labels = [
         button.text
         for row in callback.edited_markup.inline_keyboard
         for button in row
         if button.callback_data
-        and button.callback_data.startswith("unsubscribe:")
+        and button.callback_data.startswith(("unsubscribe:", "resubscribe:"))
     ]
-    assert unsubscribe_labels == ["✅ Unsubscribed"]
+    assert subscription_labels == ["Unsubscribe from this search"]
 
 
 def test_send_only_notifications_do_not_offer_server_callbacks(

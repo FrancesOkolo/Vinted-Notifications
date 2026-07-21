@@ -139,6 +139,12 @@ class LeRobot:
                     pattern=r"^unsubscribe:\d+$",
                 )
             )
+            self.app.add_handler(
+                CallbackQueryHandler(
+                    self.resubscribe_query,
+                    pattern=r"^resubscribe:\d+$",
+                )
+            )
 
             # TODO : Help command
 
@@ -716,48 +722,116 @@ class LeRobot:
             return
 
         removed = db.remove_query_subscription(query_id, chat_id)
-        if not removed:
+        await callback.answer(
+            (
+                "Unsubscribed from this search."
+                if removed
+                else "You are already unsubscribed from this search."
+            ),
+            show_alert=True,
+        )
+        await self._update_subscription_button(
+            callback,
+            query_id,
+            subscribed=False,
+        )
+
+    async def resubscribe_query(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Restore only the Telegram account that clicked Resubscribe."""
+        callback = update.callback_query
+        if callback is None:
+            return
+
+        try:
+            query_id = int((callback.data or "").split(":", 1)[1])
+        except (IndexError, TypeError, ValueError):
             await callback.answer(
-                "You are already unsubscribed from this search.",
+                "This resubscribe button is invalid.",
+                show_alert=True,
+            )
+            return
+
+        chat_id = str(update.effective_chat.id)
+        if not db.is_telegram_user_approved(chat_id):
+            await callback.answer(
+                "This Telegram account is not approved.",
+                show_alert=True,
+            )
+            return
+
+        added = db.add_query_subscription(query_id, chat_id)
+        if added is None:
+            await callback.answer(
+                "This search is no longer available.",
                 show_alert=True,
             )
             return
 
         await callback.answer(
-            "Unsubscribed from this search.",
+            (
+                "Resubscribed to this search."
+                if added
+                else "You are already subscribed to this search."
+            ),
             show_alert=True,
         )
+        await self._update_subscription_button(
+            callback,
+            query_id,
+            subscribed=True,
+        )
 
-        # Leave item-link buttons available and turn the action into a
-        # persistent confirmation. Telegram's normal callback toast is brief,
-        # so removing the button left no visible indication that it worked.
+    async def _update_subscription_button(
+        self,
+        callback,
+        query_id,
+        subscribed,
+    ) -> None:
+        """Turn the notification's subscription action into a toggle."""
         markup = callback.message.reply_markup if callback.message else None
-        if markup:
-            updated_rows = [
-                [
-                    InlineKeyboardButton(
-                        text="✅ Unsubscribed",
-                        callback_data=button.callback_data,
-                    )
-                    if (
-                        button.callback_data
-                        and button.callback_data.startswith("unsubscribe:")
-                    )
-                    else button
-                    for button in row
-                ]
-                for row in markup.inline_keyboard
+        if not markup:
+            return
+
+        action_prefixes = ("unsubscribe:", "resubscribe:")
+        action_text = (
+            "Unsubscribe from this search"
+            if subscribed
+            else "Resubscribe to this search"
+        )
+        action_data = (
+            f"unsubscribe:{query_id}"
+            if subscribed
+            else f"resubscribe:{query_id}"
+        )
+        updated_rows = [
+            [
+                InlineKeyboardButton(
+                    text=action_text,
+                    callback_data=action_data,
+                )
+                if (
+                    button.callback_data
+                    and button.callback_data.startswith(action_prefixes)
+                )
+                else button
+                for button in row
             ]
-            try:
-                await callback.edit_message_reply_markup(
-                    InlineKeyboardMarkup(updated_rows)
-                )
-            except BadRequest:
-                logger.debug(
-                    "Subscription removed, but the Telegram message buttons "
-                    "could not be updated.",
-                    exc_info=True,
-                )
+            for row in markup.inline_keyboard
+        ]
+        try:
+            await callback.edit_message_reply_markup(
+                InlineKeyboardMarkup(updated_rows)
+            )
+        except BadRequest:
+            logger.debug(
+                "Subscription changed, but the Telegram message buttons "
+                "could not be updated.",
+                exc_info=True,
+            )
 
     async def _send_message_with_retries(self, chat_id, content, markup):
         """Send one message, retrying transient failures with backoff.

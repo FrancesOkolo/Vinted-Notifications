@@ -1181,6 +1181,57 @@ def get_query_subscribers(query_id):
             conn.close()
 
 
+def add_query_subscription(query_id, chat_id):
+    """Subscribe an approved Telegram user to an existing shared query.
+
+    Returns ``True`` when a subscription was added, ``False`` when it already
+    existed, and ``None`` when the user/query is unavailable or the database
+    operation fails.
+    """
+    conn = None
+    try:
+        query_id = int(query_id)
+        chat_id = str(chat_id)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT 1 FROM queries WHERE id=?", (query_id,))
+        if cursor.fetchone() is None:
+            return None
+
+        cursor.execute(
+            """
+            SELECT 1
+            FROM telegram_users
+            WHERE chat_id=? AND status='approved'
+            """,
+            (chat_id,),
+        )
+        if cursor.fetchone() is None:
+            return None
+
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO query_subscriptions (query_id, chat_id)
+            VALUES (?, ?)
+            """,
+            (query_id, chat_id),
+        )
+        added = cursor.rowcount > 0
+        conn.commit()
+        return added
+    except (TypeError, ValueError):
+        return None
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
 def copy_query_subscriptions(source_chat_id, target_chat_id):
     """Copy one approved user's subscriptions to another approved user.
 

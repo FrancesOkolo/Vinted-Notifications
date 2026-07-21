@@ -16,6 +16,11 @@ have not been pushed or deployed.
 - Keep local Telegram testing compatible with a live server through
   `VN_TELEGRAM_POLLING=false` or `--telegram-send-only`.
 
+### Telegram
+
+- Turn notification subscription actions into an Unsubscribe / Resubscribe
+  toggle for each recipient.
+
 ### Items and interface
 
 - Add a bulk action to pause selected queries across filtered and paginated
