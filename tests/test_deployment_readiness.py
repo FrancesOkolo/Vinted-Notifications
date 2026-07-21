@@ -338,6 +338,27 @@ def test_web_auth_csrf_health_and_token_masking(database, monkeypatch):
     assert response.status_code == 200
     assert b"SECRET_TOKEN_MUST_NOT_APPEAR" not in response.data
     assert b"Configured" in response.data
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "camera=()" in response.headers["Permissions-Policy"]
+    csp = response.headers["Content-Security-Policy"]
+    nonce_match = re.search(r"script-src 'self' 'nonce-([^']+)'", csp)
+    assert nonce_match
+    assert f'<script nonce="{nonce_match.group(1)}">'.encode() in response.data
+    assert "object-src 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+    session_cookie = response.headers.get("Set-Cookie", "")
+    assert "HttpOnly" in session_cookie
+    assert "SameSite=Strict" in session_cookie
+    assert web.app.config["MAX_CONTENT_LENGTH"] <= 256 * 1024
+
+    bootstrap_js = client.get(
+        "/static/vendor/bootstrap/bootstrap.bundle.min.js",
+        headers=headers,
+    )
+    assert bootstrap_js.status_code == 200
+    assert bootstrap_js.mimetype == "application/javascript"
 
     assert client.post("/add_country", headers=headers, data={"country": "GB"}).status_code == 400
 
@@ -1080,12 +1101,19 @@ def test_queries_page_has_search_sort_pagination_and_shared_modals(database, mon
     assert 'class="form-check-input query-select"' in html
     assert 'id="bulkPauseButton"' in html
     assert 'formaction="/pause_query/bulk"' in html
+    assert 'id="bulkResumeButton"' in html
+    assert 'formaction="/resume_query/bulk"' in html
     assert 'id="bulkRemoveButton"' in html
     assert 'action="/remove_query/bulk"' in html
     assert 'data-sort-key="items"' in html
     assert "data-item-count=" in html
     assert "query-toggle" in html
     assert "data-relative-time=" in html
+    assert 'id="queryStatusFilter"' in html
+    assert 'id="queryMobileSort"' in html
+    assert 'id="querySelectAllMobile"' in html
+    assert "data-enabled=" in html
+    assert 'id="toggleAddQuery"' in html
 
     # Tier 3: bulk add, Open-on-Vinted link, filter chips.
     assert 'action="/add_query/bulk"' in html
@@ -1170,6 +1198,17 @@ def test_query_pause_enable_counts_and_bulk_remove(database, monkeypatch):
     assert response.status_code == 302
     assert db.get_query_enabled_map() == enabled
 
+    # The matching bulk action resumes both paused queries without touching B.
+    response = client.post(
+        "/resume_query/bulk",
+        data={"_csrf_token": token, "query_ids": [str(qid_a), str(qid_c)]},
+    )
+    assert response.status_code == 302
+    assert all(db.get_query_enabled_map().values())
+
+    # Pause A and C again for the existing bulk-removal assertion below.
+    db.set_queries_enabled([qid_a, qid_c], False)
+
     # Bulk-remove A and C, leaving only B.
     response = client.post(
         "/remove_query/bulk",
@@ -1177,6 +1216,74 @@ def test_query_pause_enable_counts_and_bulk_remove(database, monkeypatch):
     )
     assert response.status_code == 302
     assert {row[0] for row in db.get_queries()} == {qid_b}
+
+
+def test_https_mode_adds_hsts(database, monkeypatch):
+    import web_ui_plugin.web_ui as web
+
+    monkeypatch.setattr(web, "WEB_HTTPS_ENABLED", True)
+    response = web.app.test_client().get("/healthz")
+    assert response.status_code == 200
+    assert response.headers["Strict-Transport-Security"].startswith(
+        "max-age=31536000"
+    )
+
+
+def test_dynamic_configuration_content_is_rendered_as_text():
+    config = (ROOT / "web_ui_plugin/templates/config.html").read_text(
+        encoding="utf-8"
+    )
+    dashboard = (ROOT / "web_ui_plugin/templates/index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "templatePreview.textContent = rendered" in config
+    assert "templatePreview.innerHTML" not in config
+    assert "tag.innerHTML" not in config
+    assert "document.createTextNode(String(message))" in config
+    assert "${data.message}" not in config
+    assert "${data.message}" not in dashboard
+    assert "document.createTextNode(String(data.message))" in dashboard
+
+
+def test_secret_redaction_covers_telegram_tokens_and_proxy_passwords():
+    from logger import redact_secrets
+
+    # Build the token shape at runtime so secret scanners do not mistake this
+    # regression fixture for a committed live credential.
+    token = "123456789:" + ("A" * 35)
+    message = (
+        f"POST https://api.telegram.org/bot{token}/sendMessage via "
+        "http://proxy-user:proxy-password@proxy.example:8080"
+    )
+    redacted = redact_secrets(message)
+    assert token not in redacted
+    assert "proxy-user" not in redacted
+    assert "proxy-password" not in redacted
+    assert redacted.count("[REDACTED]") == 2
+
+
+def test_rss_token_protects_feed(database, monkeypatch):
+    from rss_feed_plugin.rss_feed import RSSFeed
+
+    monkeypatch.setenv("VN_RSS_TOKEN", "long-private-rss-token")
+    feed = RSSFeed(queue.Queue())
+    client = feed.app.test_client()
+
+    denied = client.get("/")
+    assert denied.status_code == 401
+    assert denied.headers["WWW-Authenticate"].startswith("Bearer")
+
+    response = client.get("/?token=long-private-rss-token")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+    response = client.get(
+        "/",
+        headers={"Authorization": "Bearer long-private-rss-token"},
+    )
+    assert response.status_code == 200
 
 
 def test_query_filter_summary_chips():
@@ -1370,6 +1477,9 @@ def test_items_filter_sort_and_pagination(database, monkeypatch):
     assert "data-relative-time" in html_text
     assert "Page 1 of" in html_text
     assert 'value="price_asc" selected' in html_text
+    assert "item-result-card" in html_text
+    assert "item-query-meta" in html_text
+    assert "data-image-fallback" in html_text
 
 
 def test_dark_mode_toggle_is_wired():
@@ -1380,6 +1490,27 @@ def test_dark_mode_toggle_is_wired():
     assert "vintedTheme" in template  # preference persisted to localStorage
     assert "prefers-color-scheme" in template  # OS default applied before paint
     assert '[data-bs-theme="dark"]' in template  # dark overrides for custom elements
+
+
+def test_frontend_assets_are_self_hosted_and_image_fallback_is_wired():
+    template = (ROOT / "web_ui_plugin" / "templates" / "base.html").read_text(
+        encoding="utf-8"
+    )
+    assert "cdn.jsdelivr.net" not in template
+    assert "vendor/bootstrap/bootstrap.min.css" in template
+    assert "vendor/bootstrap/bootstrap.bundle.min.js" in template
+    assert "vendor/bootstrap-icons/bootstrap-icons.css" in template
+    assert "data-image-fallback" in template
+    assert "Image unavailable" in template
+
+    required_assets = [
+        ROOT / "web_ui_plugin/static/vendor/bootstrap/bootstrap.min.css",
+        ROOT / "web_ui_plugin/static/vendor/bootstrap/bootstrap.bundle.min.js",
+        ROOT / "web_ui_plugin/static/vendor/bootstrap-icons/bootstrap-icons.css",
+        ROOT / "web_ui_plugin/static/vendor/bootstrap-icons/fonts/bootstrap-icons.woff2",
+        ROOT / "web_ui_plugin/static/vendor/bootstrap-icons/fonts/bootstrap-icons.woff",
+    ]
+    assert all(path.is_file() and path.stat().st_size > 1000 for path in required_assets)
 
 
 def test_responsive_layout_hooks_are_present():
@@ -1398,9 +1529,30 @@ def test_responsive_layout_hooks_are_present():
     assert "col-md-10" in base
     assert "items-results-header" in items
     assert "items-pagination" in items
+    assert "item-result-card" in items
     assert "@media (max-width: 768px)" in css
     assert "min-height: 44px" in css
+    assert "#queriesTable tr[data-query-row]" in css
+    assert "grid-template-columns: 7.25rem" in css
     assert "prefers-reduced-motion: reduce" in css
+
+
+def test_frontend_and_dependency_audit_use_supported_release_paths():
+    bootstrap_css = (
+        ROOT
+        / "web_ui_plugin"
+        / "static"
+        / "vendor"
+        / "bootstrap"
+        / "bootstrap.min.css"
+    ).read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/linter.yml").read_text(encoding="utf-8")
+
+    assert re.search(r"Bootstrap\s+v5\.3\.8", bootstrap_css)
+    assert "5.3.0-alpha1" not in bootstrap_css
+    assert "pypa/gh-action-pip-audit@v1.1.0" in workflow
+    assert "frances/current-working-version" in workflow
+    assert 'cron: "17 4 * * 1"' in workflow
 
 
 def test_logs_viewer_renders_messages_as_text_not_html():
@@ -1413,6 +1565,88 @@ def test_logs_viewer_renders_messages_as_text_not_html():
     assert "${log.message}" not in template
     assert "${log.module}" not in template
     assert "messageCell.textContent = log.message" in template
+    assert "message.textContent = log.message" in template
+    assert "? 25 : 50" in template
+    assert 'id="logSearchInput"' in template
+    assert 'id="logModuleInput"' in template
+    assert 'id="logCards"' in template
+
+
+def test_logs_api_search_module_and_routine_request_filters(database, monkeypatch, tmp_path):
+    import web_ui_plugin.web_ui as web
+
+    monkeypatch.setattr(
+        web.core, "check_version", lambda: (True, "t", "t", "https://x/y")
+    )
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "vinted.log").write_text(
+        "2026-07-21 10:00:00,000 - werkzeug - INFO - 127.0.0.1 - \"\x1b[36mGET /api/logs HTTP/1.1\x1b[0m\" 200 -\n"
+        "2026-07-21 10:00:01,000 - core - ERROR - Catalogue request failed\n"
+        "2026-07-21 10:00:02,000 - core - INFO - Scrape completed\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    client = web.app.test_client()
+
+    default_data = client.get("/api/logs").get_json()
+    assert default_data["total"] == 2
+    assert all(entry["module"] == "core" for entry in default_data["logs"])
+
+    all_data = client.get("/api/logs?hide_http=0").get_json()
+    assert all_data["total"] == 3
+    assert all("\x1b" not in entry["message"] for entry in all_data["logs"])
+
+    error_data = client.get(
+        "/api/logs", query_string={"search": "failed", "module": "core"}
+    ).get_json()
+    assert error_data["total"] == 1
+    assert error_data["logs"][0]["level"] == "ERROR"
+
+
+def test_allowlist_country_picker_uppercases_and_validates(database, monkeypatch):
+    import web_ui_plugin.web_ui as web
+
+    monkeypatch.setattr(
+        web.core, "check_version", lambda: (True, "t", "t", "https://x/y")
+    )
+    client = web.app.test_client()
+    page = client.get("/allowlist")
+    token = re.search(rb'name="_csrf_token" value="([^"]+)"', page.data).group(1).decode()
+    html = page.data.decode()
+    assert 'list="countryOptions"' in html
+    assert 'value="GB">United Kingdom' in html
+    assert "toUpperCase()" in html
+
+    client.post("/add_country", data={"_csrf_token": token, "country": "1!"})
+    assert db.get_allowlist() == 0
+
+    client.post("/add_country", data={"_csrf_token": token, "country": "gb"})
+    assert db.get_allowlist() == ["GB"]
+
+
+def test_configuration_collapses_and_warns_about_unsaved_changes():
+    template = (ROOT / "web_ui_plugin/templates/config.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="configForm"' in template
+    assert template.count("config-section-toggle") >= 6
+    assert 'id="configSaveBar"' in template
+    assert "Unsaved changes" in template
+    assert "beforeunload" in template
+    assert "data-collapsed-mobile" in template
+
+
+def test_dashboard_stat_cards_are_links_and_images_have_fallbacks():
+    template = (ROOT / "web_ui_plugin/templates/index.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'href="/items"' in template
+    assert 'href="/queries?status=active"' in template
+    assert template.count("dashboard-stat-link") == 3
+    assert template.count("data-image-fallback") >= 3
+    assert "stats.active_queries" in template
+    assert "stats.paused_queries" in template
 
 
 def test_dashboard_query_table_has_accessible_sort_controls():
@@ -1444,7 +1678,7 @@ def test_dashboard_has_search_pagination_relative_times_and_collapsible_sections
     assert "vintedDashboardSection:" in template
     assert "data-relative-time" in template
     assert "Intl.RelativeTimeFormat" in template
-    assert "items = db.get_items(limit=5)" in web_source
+    assert "items = db.get_items(limit=6)" in web_source
 
 
 def test_dashboard_has_live_system_health_summary():

@@ -15,10 +15,15 @@
 
     .query-bulk-actions {
         display: flex;
+        flex: 1 0 100%;
         flex-wrap: wrap;
         gap: 0.5rem;
         justify-content: flex-end;
         margin-left: auto;
+    }
+
+    .query-table-toolbar {
+        flex-wrap: wrap;
     }
 
     @media (max-width: 767.98px) {
@@ -42,12 +47,19 @@
 
 <div class="row mb-4">
     <div class="col-md-12">
-        <div class="card">
-            <div class="card-header d-flex align-items-center">
-                <i class="bi bi-plus-circle me-2 text-info"></i>
-                <h5 class="card-title mb-0">Add New Query</h5>
+        <div class="card" id="addQueryCard">
+            <div class="card-header d-flex align-items-center justify-content-between">
+                <div class="d-flex align-items-center">
+                    <i class="bi bi-plus-circle me-2 text-info"></i>
+                    <h5 class="card-title mb-0">Add New Query</h5>
+                </div>
+                <button type="button" class="btn btn-sm btn-outline-secondary d-md-none" id="toggleAddQuery"
+                        aria-expanded="false" aria-controls="addQueryContent">
+                    <i class="bi bi-chevron-down" aria-hidden="true"></i>
+                    <span class="visually-hidden">Expand Add New Query</span>
+                </button>
             </div>
-            <div class="card-body">
+            <div class="card-body" id="addQueryContent">
                 <form action="/add_query" method="post">
                     <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                     <div class="row g-3">
@@ -129,12 +141,39 @@
                             <i class="bi bi-x-lg" aria-hidden="true"></i>
                         </button>
                     </div>
+                    <div class="query-toolbar-filters">
+                        <label class="visually-hidden" for="queryStatusFilter">Filter by status</label>
+                        <select class="form-select form-select-sm" id="queryStatusFilter">
+                            <option value="all">All statuses</option>
+                            <option value="active">Active only</option>
+                            <option value="paused">Paused only</option>
+                        </select>
+                        <label class="visually-hidden" for="queryMobileSort">Sort queries</label>
+                        <select class="form-select form-select-sm d-md-none" id="queryMobileSort">
+                            <option value="lastFound:descending">Recently found</option>
+                            <option value="lastFound:ascending">Oldest found</option>
+                            <option value="query:ascending">Query A-Z</option>
+                            <option value="query:descending">Query Z-A</option>
+                            <option value="items:descending">Most items</option>
+                            <option value="items:ascending">Fewest items</option>
+                        </select>
+                    </div>
                     <small class="text-muted query-results-count" id="queryResultsCount" aria-live="polite"></small>
+                    <label class="form-check d-flex align-items-center gap-2 mb-0 d-md-none query-select-all-mobile">
+                        <input type="checkbox" class="form-check-input m-0" id="querySelectAllMobile"
+                               aria-label="Select all matching queries">
+                        <span>Select all matching</span>
+                    </label>
                     <div class="query-bulk-actions">
                         <button type="submit" class="btn btn-sm btn-outline-warning" id="bulkPauseButton"
                                 form="bulkRemoveForm" formaction="/pause_query/bulk" formmethod="post" disabled>
                             <i class="bi bi-pause-fill"></i> Pause selected
                             (<span id="bulkPauseSelectedCount">0</span>)
+                        </button>
+                        <button type="submit" class="btn btn-sm btn-outline-success" id="bulkResumeButton"
+                                form="bulkRemoveForm" formaction="/resume_query/bulk" formmethod="post" disabled>
+                            <i class="bi bi-play-fill"></i> Resume selected
+                            (<span id="bulkResumeSelectedCount">0</span>)
                         </button>
                         <button type="button" class="btn btn-sm btn-danger" id="bulkRemoveButton"
                                 data-bs-toggle="modal" data-bs-target="#bulkDeleteModal" disabled>
@@ -186,6 +225,7 @@
                             <tbody>
                             {% for query in queries %}
                             <tr data-query-row data-query="{{ query.display|e }}"
+                                data-enabled="{{ 'true' if query.enabled else 'false' }}"
                                 data-item-count="{{ query.item_count }}"
                                 data-last-found="{{ query.last_found_timestamp if query.last_found_timestamp is not none else '' }}"
                                 class="{{ 'query-paused' if not query.enabled else '' }}">
@@ -193,8 +233,8 @@
                                     <input type="checkbox" class="form-check-input query-select" name="query_ids"
                                            value="{{ query.query_id }}" aria-label="Select {{ query.display }}">
                                 </td>
-                                <td data-row-number>{{ query.id }}</td>
-                                <td>
+                                <td class="query-row-number" data-row-number>{{ query.id }}</td>
+                                <td class="query-name-cell">
                                     <a href="{{ query.query }}" target="_blank" rel="noopener noreferrer"
                                        title="Open this search on Vinted">{{ query.display }}<i
                                             class="bi bi-box-arrow-up-right ms-1 small"></i></a>
@@ -208,8 +248,8 @@
                                     </div>
                                     {% endif %}
                                 </td>
-                                <td>{{ query.item_count }}</td>
-                                <td class="last-found-cell">
+                                <td class="query-item-count-cell" data-label="Items">{{ query.item_count }}</td>
+                                <td class="last-found-cell" data-label="Last found">
                                     {% if query.last_found_timestamp is not none %}
                                     <time datetime="{{ query.last_found_item|replace(' ', 'T') }}"
                                           data-relative-time="{{ query.last_found_timestamp }}"
@@ -388,9 +428,36 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
     document.addEventListener('DOMContentLoaded', function () {
         const csrfToken = '{{ csrf_token() }}';
+
+        // Keep the management list near the top on phones. The add form is
+        // collapsed by default there and remembers the user's preference.
+        const addQueryToggle = document.getElementById('toggleAddQuery');
+        const addQueryContent = document.getElementById('addQueryContent');
+        if (addQueryToggle && addQueryContent) {
+            const mobile = window.matchMedia('(max-width: 767.98px)').matches;
+            const savedState = localStorage.getItem('vintedAddQueryPanel');
+            let expanded = !mobile || savedState === 'expanded';
+
+            const setAddQueryExpanded = function (nextExpanded) {
+                expanded = nextExpanded;
+                addQueryContent.hidden = !expanded;
+                addQueryToggle.setAttribute('aria-expanded', String(expanded));
+                addQueryToggle.title = expanded ? 'Collapse Add New Query' : 'Expand Add New Query';
+                const icon = addQueryToggle.querySelector('i');
+                const label = addQueryToggle.querySelector('.visually-hidden');
+                if (icon) icon.className = expanded ? 'bi bi-chevron-up' : 'bi bi-chevron-down';
+                if (label) label.textContent = expanded ? 'Collapse Add New Query' : 'Expand Add New Query';
+            };
+
+            setAddQueryExpanded(expanded);
+            addQueryToggle.addEventListener('click', function () {
+                setAddQueryExpanded(!expanded);
+                localStorage.setItem('vintedAddQueryPanel', expanded ? 'expanded' : 'collapsed');
+            });
+        }
 
         // Populate the single shared Edit modal from the clicked row's data.
         const editQueryModal = document.getElementById('editQueryModal');
@@ -462,6 +529,7 @@
             const row = button.closest('[data-query-row]');
             if (row) {
                 row.classList.toggle('query-paused', !enabled);
+                row.dataset.enabled = String(enabled);
                 const badge = row.querySelector('.query-paused-badge');
                 if (badge) {
                     badge.hidden = enabled;
@@ -478,6 +546,9 @@
                 icon.className = enabled ? 'bi bi-pause-fill' : 'bi bi-play-fill';
             }
             button.title = enabled ? 'Pause this query' : 'Resume this query';
+            if (row) {
+                row.dispatchEvent(new CustomEvent('query-state-changed', {bubbles: true}));
+            }
         }
 
         document.querySelectorAll('.query-toggle').forEach(button => {
@@ -515,9 +586,16 @@
             const previousPageButton = document.getElementById('queryPreviousPage');
             const nextPageButton = document.getElementById('queryNextPage');
             const pageStatus = document.getElementById('queryPageStatus');
-            const selectAll = document.getElementById('querySelectAll');
+            const statusFilter = document.getElementById('queryStatusFilter');
+            const mobileSort = document.getElementById('queryMobileSort');
+            const selectAllControls = [
+                document.getElementById('querySelectAll'),
+                document.getElementById('querySelectAllMobile')
+            ].filter(Boolean);
             const bulkPauseButton = document.getElementById('bulkPauseButton');
             const bulkPauseSelectedCount = document.getElementById('bulkPauseSelectedCount');
+            const bulkResumeButton = document.getElementById('bulkResumeButton');
+            const bulkResumeSelectedCount = document.getElementById('bulkResumeSelectedCount');
             const bulkButton = document.getElementById('bulkRemoveButton');
             const bulkSelectedCount = document.getElementById('bulkSelectedCount');
             const bulkDeleteCount = document.getElementById('bulkDeleteCount');
@@ -527,9 +605,21 @@
             let activeSortDirection = 'descending';
             let currentPage = 1;
 
-            function matchingRowsForTerm() {
+            const requestedStatus = new URLSearchParams(window.location.search).get('status');
+            if (['active', 'paused'].includes(requestedStatus)) {
+                statusFilter.value = requestedStatus;
+            }
+
+            function matchingRowsForFilters() {
                 const term = searchInput.value.trim().toLocaleLowerCase();
-                return queryRows.filter(row => row.dataset.query.toLocaleLowerCase().includes(term));
+                const status = statusFilter.value;
+                return queryRows.filter(row => {
+                    const enabled = row.dataset.enabled === 'true';
+                    return row.dataset.query.toLocaleLowerCase().includes(term)
+                        && (status === 'all'
+                            || (status === 'active' && enabled)
+                            || (status === 'paused' && !enabled));
+                });
             }
 
             function updateBulkUI() {
@@ -544,6 +634,9 @@
                 if (bulkPauseSelectedCount) {
                     bulkPauseSelectedCount.textContent = count;
                 }
+                if (bulkResumeSelectedCount) {
+                    bulkResumeSelectedCount.textContent = count;
+                }
                 if (bulkDeleteCount) {
                     bulkDeleteCount.textContent = count;
                 }
@@ -556,12 +649,15 @@
                 if (bulkPauseButton) {
                     bulkPauseButton.disabled = count === 0;
                 }
-                if (selectAll) {
-                    const matching = matchingRowsForTerm();
+                if (bulkResumeButton) {
+                    bulkResumeButton.disabled = count === 0;
+                }
+                selectAllControls.forEach(selectAll => {
+                    const matching = matchingRowsForFilters();
                     const matchingChecked = matching.filter(row => row.querySelector('.query-select').checked);
                     selectAll.checked = matching.length > 0 && matchingChecked.length === matching.length;
                     selectAll.indeterminate = matchingChecked.length > 0 && matchingChecked.length < matching.length;
-                }
+                });
             }
 
             function compareQueryRows(leftRow, rightRow, sortKey, direction) {
@@ -624,9 +720,13 @@
                 const orderedRows = queryRows.slice().sort((leftRow, rightRow) =>
                     compareQueryRows(leftRow, rightRow, activeSortKey, activeSortDirection)
                 );
-                const matchingRows = orderedRows.filter(row =>
-                    row.dataset.query.toLocaleLowerCase().includes(searchTerm)
-                );
+                const matchingRows = orderedRows.filter(row => {
+                    const enabled = row.dataset.enabled === 'true';
+                    const matchesStatus = statusFilter.value === 'all'
+                        || (statusFilter.value === 'active' && enabled)
+                        || (statusFilter.value === 'paused' && !enabled);
+                    return row.dataset.query.toLocaleLowerCase().includes(searchTerm) && matchesStatus;
+                });
                 const pageCount = Math.max(1, Math.ceil(matchingRows.length / pageSize));
                 currentPage = Math.min(currentPage, pageCount);
                 const firstResultIndex = (currentPage - 1) * pageSize;
@@ -651,10 +751,11 @@
                 nextPageButton.disabled = currentPage >= pageCount || matchingRows.length === 0;
                 pageStatus.textContent = `Page ${currentPage} of ${pageCount}`;
 
+                const statusLabel = statusFilter.value === 'all' ? '' : statusFilter.value + ' ';
                 if (matchingRows.length === 0) {
                     resultsCount.textContent = searchTerm
-                        ? `No queries match "${searchInput.value.trim()}"`
-                        : 'No queries found';
+                        ? `No ${statusLabel}queries match "${searchInput.value.trim()}"`
+                        : `No ${statusLabel}queries found`;
                 } else {
                     const firstNumber = firstResultIndex + 1;
                     const lastNumber = firstResultIndex + pageRows.length;
@@ -671,6 +772,9 @@
                 activeSortDirection = direction;
                 currentPage = 1;
                 updateSortHeaders(sortKey, direction);
+                if (mobileSort && mobileSort.querySelector(`option[value="${sortKey}:${direction}"]`)) {
+                    mobileSort.value = `${sortKey}:${direction}`;
+                }
                 renderQueryTable();
 
                 if (sortStatus) {
@@ -700,6 +804,25 @@
                 searchInput.focus();
             });
 
+            statusFilter.addEventListener('change', function () {
+                currentPage = 1;
+                const url = new URL(window.location.href);
+                if (this.value === 'all') {
+                    url.searchParams.delete('status');
+                } else {
+                    url.searchParams.set('status', this.value);
+                }
+                window.history.replaceState({}, '', url);
+                renderQueryTable();
+            });
+
+            if (mobileSort) {
+                mobileSort.addEventListener('change', function () {
+                    const [sortKey, direction] = this.value.split(':');
+                    sortQueryTable(sortKey, direction);
+                });
+            }
+
             previousPageButton.addEventListener('click', function () {
                 if (currentPage > 1) {
                     currentPage -= 1;
@@ -716,20 +839,25 @@
 
             // Bulk selection: the header checkbox selects every matching row
             // (across pages), and selections persist while paging/searching.
-            if (selectAll) {
+            selectAllControls.forEach(selectAll => {
                 selectAll.addEventListener('change', function () {
-                    matchingRowsForTerm().forEach(row => {
+                    matchingRowsForFilters().forEach(row => {
                         row.querySelector('.query-select').checked = selectAll.checked;
                     });
                     updateBulkUI();
                 });
-            }
+            });
 
             queryRows.forEach(row => {
                 const checkbox = row.querySelector('.query-select');
                 if (checkbox) {
                     checkbox.addEventListener('change', updateBulkUI);
                 }
+            });
+
+            queryTable.addEventListener('query-state-changed', function () {
+                currentPage = 1;
+                renderQueryTable();
             });
 
             updateSortHeaders(activeSortKey, activeSortDirection);

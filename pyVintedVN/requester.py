@@ -119,7 +119,7 @@ class Requester:
         # Set a random proxy for this request
         proxy_configured = proxies.configure_proxy(self.session)
         if self.debug and proxy_configured:
-            logger.debug(f"Using proxy: {self.session.proxies}")
+            logger.debug("Using configured proxy")
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             with self.session.get(
@@ -183,7 +183,7 @@ class Requester:
         # Set a random proxy for this request
         proxy_configured = proxies.configure_proxy(self.session)
         if self.debug and proxy_configured:
-            logger.debug(f"Using proxy: {self.session.proxies}")
+            logger.debug("Using configured proxy")
 
         response = self.session.post(
             url,

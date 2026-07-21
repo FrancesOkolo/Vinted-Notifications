@@ -1,4 +1,5 @@
-from flask import Flask, Response
+from flask import Flask, Response, request
+import hmac
 import threading
 import time
 import db
@@ -18,6 +19,7 @@ class RSSFeed:
         self.queue = queue
         self.items = []
         self.max_items = db.get_parameter("rss_max_items")
+        self.access_token = os.environ.get("VN_RSS_TOKEN", "").strip()
 
         # Initialize feed generator
         self.fg = FeedGenerator()
@@ -85,7 +87,30 @@ class RSSFeed:
             self.items.pop(0)
 
     def serve_rss(self):
-        return Response(self.fg.rss_str(), mimetype="application/rss+xml")
+        if self.access_token:
+            authorization = request.headers.get("Authorization", "")
+            bearer_token = (
+                authorization[7:].strip()
+                if authorization.lower().startswith("bearer ")
+                else ""
+            )
+            supplied_token = bearer_token or request.args.get("token", "")
+            if not supplied_token or not hmac.compare_digest(
+                supplied_token,
+                self.access_token,
+            ):
+                return Response(
+                    "Authentication required.",
+                    status=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="Vinted RSS"'},
+                    mimetype="text/plain",
+                )
+
+        response = Response(self.fg.rss_str(), mimetype="application/rss+xml")
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     def run(self):
 

@@ -53,16 +53,24 @@
                 <h5 class="card-title mb-0">Application Settings</h5>
             </div>
             <div class="card-body">
-                <form action="/update_config" method="post">
+                <form action="/update_config" method="post" id="configForm">
                     <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                     <div class="row mb-4">
                         <div class="col-md-12">
-                            <div class="card h-100">
-                                <div class="card-header d-flex align-items-center">
-                                    <i class="bi bi-gear-fill me-2 text-info"></i>
-                                    <h5 class="card-title mb-0">System Settings</h5>
+                            <div class="card h-100 config-section-card">
+                                <div class="card-header d-flex align-items-center justify-content-between">
+                                    <div class="d-flex align-items-center">
+                                        <i class="bi bi-gear-fill me-2 text-info"></i>
+                                        <h5 class="card-title mb-0">System Settings</h5>
+                                    </div>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary config-section-toggle"
+                                            data-config-target="configSystemBody" aria-expanded="true"
+                                            aria-controls="configSystemBody" title="Collapse System Settings">
+                                        <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                                        <span class="visually-hidden">Collapse System Settings</span>
+                                    </button>
                                 </div>
-                                <div class="card-body">
+                                <div class="card-body" id="configSystemBody">
                                     <div class="row">
                                         <div class="col-md-6">
                                             <div class="mb-3">
@@ -126,12 +134,20 @@
                     </div>
                     <div class="row mb-4">
                         <div class="col-md-6">
-                            <div class="card h-100">
-                                <div class="card-header d-flex align-items-center">
-                                    <i class="bi bi-telegram me-2 text-info"></i>
-                                    <h5 class="card-title mb-0">Telegram Bot</h5>
+                            <div class="card h-100 config-section-card">
+                                <div class="card-header d-flex align-items-center justify-content-between">
+                                    <div class="d-flex align-items-center">
+                                        <i class="bi bi-telegram me-2 text-info"></i>
+                                        <h5 class="card-title mb-0">Telegram Bot</h5>
+                                    </div>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary config-section-toggle"
+                                            data-config-target="configTelegramBody" aria-expanded="true"
+                                            aria-controls="configTelegramBody" title="Collapse Telegram Bot">
+                                        <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                                        <span class="visually-hidden">Collapse Telegram Bot</span>
+                                    </button>
                                 </div>
-                                <div class="card-body">
+                                <div class="card-body" id="configTelegramBody">
                                     <div class="mb-3">
                                         <div class="form-check form-switch">
                                             {% if params.telegram_enabled == 'True' %}
@@ -182,12 +198,20 @@
                             </div>
                         </div>
                         <div class="col-md-6">
-                            <div class="card h-100">
-                                <div class="card-header d-flex align-items-center">
-                                    <i class="bi bi-rss me-2 text-info"></i>
-                                    <h5 class="card-title mb-0">RSS Feed</h5>
+                            <div class="card h-100 config-section-card">
+                                <div class="card-header d-flex align-items-center justify-content-between">
+                                    <div class="d-flex align-items-center">
+                                        <i class="bi bi-rss me-2 text-info"></i>
+                                        <h5 class="card-title mb-0">RSS Feed</h5>
+                                    </div>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary config-section-toggle"
+                                            data-config-target="configRssBody" data-collapsed-mobile="true"
+                                            aria-expanded="true" aria-controls="configRssBody" title="Collapse RSS Feed">
+                                        <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                                        <span class="visually-hidden">Collapse RSS Feed</span>
+                                    </button>
                                 </div>
-                                <div class="card-body">
+                                <div class="card-body" id="configRssBody">
                                     <div class="mb-3">
                                         <div class="form-check form-switch">
                                             {% if params.rss_enabled == 'True' %}
@@ -222,12 +246,20 @@
                     </div>
                     <div class="row mb-4">
                         <div class="col-md-12">
-                            <div class="card h-100">
-                                <div class="card-header d-flex align-items-center">
-                                    <i class="bi bi-shield-lock me-2 text-info"></i>
-                                    <h5 class="card-title mb-0">Proxy Settings</h5>
+                            <div class="card h-100 config-section-card">
+                                <div class="card-header d-flex align-items-center justify-content-between">
+                                    <div class="d-flex align-items-center">
+                                        <i class="bi bi-shield-lock me-2 text-info"></i>
+                                        <h5 class="card-title mb-0">Proxy Settings</h5>
+                                    </div>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary config-section-toggle"
+                                            data-config-target="configProxyBody" data-collapsed-mobile="true"
+                                            aria-expanded="true" aria-controls="configProxyBody" title="Collapse Proxy Settings">
+                                        <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                                        <span class="visually-hidden">Collapse Proxy Settings</span>
+                                    </button>
                                 </div>
-                                <div class="card-body">
+                                <div class="card-body" id="configProxyBody">
                                     <div class="row">
                                         <div class="col-md-12">
                                             <div class="mb-3">
@@ -270,12 +302,20 @@
 
                     <div class="row mb-4">
                         <div class="col-md-12">
-                            <div class="card h-100">
-                                <div class="card-header d-flex align-items-center">
-                                    <i class="bi bi-gear-wide-connected me-2 text-info"></i>
-                                    <h5 class="card-title mb-0">Advanced Settings</h5>
+                            <div class="card h-100 config-section-card">
+                                <div class="card-header d-flex align-items-center justify-content-between">
+                                    <div class="d-flex align-items-center">
+                                        <i class="bi bi-gear-wide-connected me-2 text-info"></i>
+                                        <h5 class="card-title mb-0">Advanced Settings</h5>
+                                    </div>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary config-section-toggle"
+                                            data-config-target="configAdvancedBody" data-collapsed-mobile="true"
+                                            aria-expanded="true" aria-controls="configAdvancedBody" title="Collapse Advanced Settings">
+                                        <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                                        <span class="visually-hidden">Collapse Advanced Settings</span>
+                                    </button>
                                 </div>
-                                <div class="card-body">
+                                <div class="card-body" id="configAdvancedBody">
                                     <div class="row">
                                         <div class="col-md-12">
                                             <div class="mb-3">
@@ -290,7 +330,7 @@
                                                 <div class="mt-2">
                                                     <span class="form-text text-muted">Preview (sample data):</span>
                                                     <div id="templatePreview"
-                                                         class="border rounded p-2 bg-light small mt-1"></div>
+                                                         class="border rounded p-2 bg-light small mt-1 message-template-preview"></div>
                                                 </div>
                                             </div>
                                         </div>
@@ -320,12 +360,20 @@
                     </div>
                     <div class="row mb-4">
                         <div class="col-md-12">
-                            <div id="quiet-hours-settings" class="card h-100">
-                                <div class="card-header d-flex align-items-center">
-                                    <i class="bi bi-moon-stars me-2 text-info"></i>
-                                    <h5 class="card-title mb-0">Quiet Hours</h5>
+                            <div id="quiet-hours-settings" class="card h-100 config-section-card">
+                                <div class="card-header d-flex align-items-center justify-content-between">
+                                    <div class="d-flex align-items-center">
+                                        <i class="bi bi-moon-stars me-2 text-info"></i>
+                                        <h5 class="card-title mb-0">Quiet Hours</h5>
+                                    </div>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary config-section-toggle"
+                                            data-config-target="configQuietHoursBody" aria-expanded="true"
+                                            aria-controls="configQuietHoursBody" title="Collapse Quiet Hours">
+                                        <i class="bi bi-chevron-up" aria-hidden="true"></i>
+                                        <span class="visually-hidden">Collapse Quiet Hours</span>
+                                    </button>
                                 </div>
-                                <div class="card-body">
+                                <div class="card-body" id="configQuietHoursBody">
                                     <div class="form-check form-switch mb-3">
                                         <input class="form-check-input" type="checkbox" id="quiet_hours_enabled"
                                                name="quiet_hours_enabled"
@@ -364,10 +412,12 @@
                             </div>
                         </div>
                     </div>
-                    <div class="row">
-                        <div class="col-md-12">
-                            <button type="submit" class="btn btn-primary">Save Configuration</button>
+                    <div class="config-save-bar" id="configSaveBar">
+                        <div class="config-save-status" id="configSaveStatus" role="status" aria-live="polite">
+                            <i class="bi bi-check-circle text-success" aria-hidden="true"></i>
+                            <span>No unsaved changes</span>
                         </div>
+                        <button type="submit" class="btn btn-primary" id="saveConfigButton">Save Configuration</button>
                     </div>
                 </form>
             </div>
@@ -427,8 +477,62 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
     document.addEventListener('DOMContentLoaded', function () {
+        const configForm = document.getElementById('configForm');
+        const configSaveStatus = document.getElementById('configSaveStatus');
+        let configDirty = false;
+
+        function markConfigDirty() {
+            if (!configForm || configDirty) return;
+            configDirty = true;
+            configSaveStatus.classList.add('is-dirty');
+            configSaveStatus.innerHTML = '<i class="bi bi-exclamation-circle text-warning" aria-hidden="true"></i><span>Unsaved changes</span>';
+        }
+
+        if (configForm) {
+            configForm.addEventListener('input', markConfigDirty);
+            configForm.addEventListener('change', markConfigDirty);
+            configForm.addEventListener('submit', function () {
+                configDirty = false;
+                configSaveStatus.classList.remove('is-dirty');
+                configSaveStatus.innerHTML = '<span class="spinner-border spinner-border-sm" aria-hidden="true"></span><span>Saving...</span>';
+            });
+        }
+
+        window.addEventListener('beforeunload', function (event) {
+            if (!configDirty) return;
+            event.preventDefault();
+            event.returnValue = '';
+        });
+
+        // Each settings group can be collapsed independently. Optional,
+        // advanced sections start collapsed on phones and the choice persists.
+        document.querySelectorAll('.config-section-toggle').forEach(button => {
+            const target = document.getElementById(button.dataset.configTarget);
+            if (!target) return;
+            const title = button.closest('.card-header').querySelector('.card-title').textContent.trim();
+            const storageKey = `vintedConfigSection:${button.dataset.configTarget}`;
+            const saved = localStorage.getItem(storageKey);
+            const mobileDefault = window.matchMedia('(max-width: 767.98px)').matches
+                && button.dataset.collapsedMobile === 'true';
+
+            function setCollapsed(collapsed) {
+                target.hidden = collapsed;
+                button.setAttribute('aria-expanded', String(!collapsed));
+                button.title = `${collapsed ? 'Expand' : 'Collapse'} ${title}`;
+                button.querySelector('i').className = collapsed ? 'bi bi-chevron-down' : 'bi bi-chevron-up';
+                button.querySelector('.visually-hidden').textContent = button.title;
+            }
+
+            setCollapsed(saved ? saved === 'collapsed' : mobileDefault);
+            button.addEventListener('click', function () {
+                const collapsed = button.getAttribute('aria-expanded') === 'true';
+                setCollapsed(collapsed);
+                localStorage.setItem(storageKey, collapsed ? 'collapsed' : 'expanded');
+            });
+        });
+
         // Process control buttons
         const processButtons = document.querySelectorAll('.process-control');
         processButtons.forEach(button => {
@@ -450,25 +554,9 @@
                 })
                     .then(response => response.json())
                     .then(data => {
-                        // Show alert
                         const alertClass = data.status === 'success' ? 'success' :
                             data.status === 'warning' ? 'warning' : 'danger';
-
-                        const alertDiv = document.createElement('div');
-                        alertDiv.className = `alert alert-${alertClass} alert-dismissible fade show flash-message`;
-                        alertDiv.setAttribute('role', 'alert');
-                        alertDiv.innerHTML = `
-                        ${data.message}
-                        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-                    `;
-
-                        document.querySelector('.flash-messages').appendChild(alertDiv);
-
-                        // Auto-dismiss after 5 seconds
-                        setTimeout(() => {
-                            const bsAlert = new bootstrap.Alert(alertDiv);
-                            bsAlert.close();
-                        }, 5000);
+                        showConfigFlash(data.message, alertClass);
 
                         // Update status
                         checkProcessStatus();
@@ -549,12 +637,27 @@
             const tag = document.createElement('span');
             tag.className = 'badge bg-secondary me-1 mb-1 banword-tag';
             tag.dataset.word = word.trim();
-            tag.innerHTML = `${word.trim()} <i class="bi bi-x-circle" style="cursor: pointer;"></i>`;
+            tag.appendChild(document.createTextNode(`${word.trim()} `));
+
+            const removeIcon = document.createElement('i');
+            removeIcon.className = 'bi bi-x-circle';
+            removeIcon.setAttribute('role', 'button');
+            removeIcon.setAttribute('tabindex', '0');
+            removeIcon.setAttribute('aria-label', `Remove banned word ${word.trim()}`);
+            tag.appendChild(removeIcon);
 
             // Add click event to remove the tag
-            tag.querySelector('i').addEventListener('click', function () {
+            const removeTag = function () {
                 tag.remove();
                 updateHiddenInput();
+                markConfigDirty();
+            };
+            removeIcon.addEventListener('click', removeTag);
+            removeIcon.addEventListener('keydown', function (event) {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    removeTag();
+                }
             });
 
             banwordsContainer.appendChild(tag);
@@ -573,6 +676,7 @@
             createBanwordTag(banwordsInput.value);
             banwordsInput.value = '';
             banwordsInput.focus();
+            markConfigDirty();
         });
 
         // Add banword when pressing Enter in the input field
@@ -581,6 +685,7 @@
                 e.preventDefault();
                 createBanwordTag(banwordsInput.value);
                 banwordsInput.value = '';
+                markConfigDirty();
             }
         });
 
@@ -596,10 +701,18 @@
 
         // --- Shared flash helper ---
         function showConfigFlash(message, category) {
+            const allowedCategories = ['success', 'warning', 'danger', 'info'];
+            const safeCategory = allowedCategories.includes(category) ? category : 'info';
             const alertDiv = document.createElement('div');
-            alertDiv.className = `alert alert-${category} alert-dismissible fade show flash-message`;
+            alertDiv.className = `alert alert-${safeCategory} alert-dismissible fade show flash-message`;
             alertDiv.setAttribute('role', 'alert');
-            alertDiv.innerHTML = `${message}<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>`;
+            alertDiv.appendChild(document.createTextNode(String(message)));
+            const closeButton = document.createElement('button');
+            closeButton.type = 'button';
+            closeButton.className = 'btn-close';
+            closeButton.setAttribute('data-bs-dismiss', 'alert');
+            closeButton.setAttribute('aria-label', 'Close');
+            alertDiv.appendChild(closeButton);
             document.querySelector('.flash-messages').appendChild(alertDiv);
             setTimeout(() => {
                 new bootstrap.Alert(alertDiv).close();
@@ -645,7 +758,7 @@
             const renderTemplatePreview = function () {
                 const rendered = templateTextarea.value.replace(/\{(\w+)\}/g, (match, key) =>
                     Object.prototype.hasOwnProperty.call(sampleValues, key) ? sampleValues[key] : match);
-                templatePreview.innerHTML = rendered.replace(/\n/g, '<br>');
+                templatePreview.textContent = rendered;
             };
             templateTextarea.addEventListener('input', renderTemplatePreview);
             renderTemplatePreview();

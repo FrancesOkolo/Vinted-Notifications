@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 
@@ -39,6 +40,30 @@ class ExcludeFilter(logging.Filter):
         return True
 
 
+_TELEGRAM_TOKEN_PATTERN = re.compile(
+    r"(?i)(api\.telegram\.org/bot|\bbot)(\d{6,12}:[A-Za-z0-9_-]{20,})"
+)
+_URL_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@"
+)
+
+
+def redact_secrets(value):
+    """Remove known credential shapes before a message reaches any handler."""
+    text = str(value)
+    text = _TELEGRAM_TOKEN_PATTERN.sub(r"\1[REDACTED]", text)
+    return _URL_CREDENTIAL_PATTERN.sub(r"\1[REDACTED]@", text)
+
+
+class SecretRedactionFilter(logging.Filter):
+    def filter(self, record):
+        # Resolve %-style arguments first, then clear them so the sanitized
+        # message cannot be combined with the original secrets by Formatter.
+        record.msg = redact_secrets(record.getMessage())
+        record.args = ()
+        return True
+
+
 # Configure the root logger
 def configure_root_logger():
     root_logger = logging.getLogger()
@@ -62,9 +87,13 @@ def configure_root_logger():
     )
     file_handler.setFormatter(file_formatter)
 
-    # Create and add the exclude filter to both handlers
+    # Redact before filtering so neither the terminal nor the rotating file can
+    # receive Telegram tokens or proxy credentials from exception text.
+    secret_filter = SecretRedactionFilter()
     exclude_filter = ExcludeFilter()
+    console_handler.addFilter(secret_filter)
     console_handler.addFilter(exclude_filter)
+    file_handler.addFilter(secret_filter)
     file_handler.addFilter(exclude_filter)
 
     # Add handlers to root logger

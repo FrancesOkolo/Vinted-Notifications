@@ -11,9 +11,31 @@ layout unchanged:
 - web UI: port `8000`
 - RSS: port `8080`
 
-The current update needs no new package, environment variable, service, or
-manual database migration. Do not upload or replace `data/`, `logs/`, or
+The current update needs no new service or manual database migration. All new
+security environment variables are optional, so the existing launch command
+continues to work unchanged. Do not upload or replace `data/`, `logs/`, or
 `/root/vinted.env`.
+
+## Optional security settings
+
+Add these to `/root/vinted.env` when you are ready to enable them:
+
+```dotenv
+# Require this token for the RSS feed. Keep it private and use a long random value.
+VN_RSS_TOKEN=replace-with-a-long-random-token
+
+# Restrict accepted Host headers. Include the values used by Docker health checks.
+VN_WEB_TRUSTED_HOSTS=138.68.136.141,127.0.0.1,localhost
+
+# Leave false while accessing http://IP:8000 directly. Change to true only after
+# putting the app behind an HTTPS reverse proxy.
+VN_WEB_HTTPS=false
+```
+
+With `VN_RSS_TOKEN` set, an RSS client can authenticate with either an
+`Authorization: Bearer <token>` header or `?token=<token>` in its feed URL.
+The header is preferable because URLs may be retained in browser history or
+proxy logs.
 
 ## 1. Upload the source
 

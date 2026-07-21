@@ -3,6 +3,7 @@ from flask import (
     Response,
     abort,
     flash,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -15,6 +16,7 @@ import core
 import html
 import hmac
 import json
+import mimetypes
 import os
 import re
 import requests
@@ -25,6 +27,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from logger import get_logger
 from url_normalizer import normalise_vinted_url
+
+# Windows can map .js files to text/plain through its system MIME registry.
+# Define the web-safe types explicitly so nosniff browsers execute local assets
+# consistently on Windows development machines and Linux/Docker deployments.
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("application/javascript", ".mjs")
 
 # Get logger for this module
 logger = get_logger(__name__)
@@ -37,6 +45,44 @@ app = Flask(
     ),
     static_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"),
 )
+
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _positive_int_env(name, default):
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+WEB_HTTPS_ENABLED = _env_flag("VN_WEB_HTTPS")
+app.config.update(
+    MAX_CONTENT_LENGTH=_positive_int_env("VN_WEB_MAX_REQUEST_BYTES", 256 * 1024),
+    MAX_FORM_MEMORY_SIZE=_positive_int_env(
+        "VN_WEB_MAX_FORM_MEMORY_BYTES",
+        256 * 1024,
+    ),
+    MAX_FORM_PARTS=_positive_int_env("VN_WEB_MAX_FORM_PARTS", 200),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    SESSION_COOKIE_SECURE=WEB_HTTPS_ENABLED,
+    SESSION_COOKIE_NAME="vinted_notifications_session",
+)
+
+trusted_hosts = [
+    host.strip()
+    for host in os.environ.get("VN_WEB_TRUSTED_HOSTS", "").split(",")
+    if host.strip()
+]
+if trusted_hosts:
+    app.config["TRUSTED_HOSTS"] = trusted_hosts
 
 # A persistent key is mandatory in Docker. Localhost-only development can use
 # an ephemeral key without placing a secret in source control.
@@ -71,6 +117,10 @@ def _basic_auth_valid():
 
 @app.before_request
 def protect_web_interface():
+    # A fresh nonce lets the templates run their own inline scripts without
+    # allowing arbitrary injected scripts under the Content Security Policy.
+    g.csp_nonce = secrets.token_urlsafe(18)
+
     if request.path == "/healthz":
         return None
 
@@ -100,7 +150,35 @@ def add_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "same-origin")
-    if request.path == "/config":
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    )
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    nonce = getattr(g, "csp_nonce", "")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "; ".join(
+            (
+                "default-src 'self'",
+                f"script-src 'self' 'nonce-{nonce}'",
+                "style-src 'self' 'unsafe-inline'",
+                "img-src 'self' https: data:",
+                "font-src 'self' data:",
+                "connect-src 'self'",
+                "object-src 'none'",
+                "base-uri 'self'",
+                "form-action 'self'",
+                "frame-ancestors 'none'",
+            )
+        ),
+    )
+    if WEB_HTTPS_ENABLED:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    if not request.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -121,6 +199,7 @@ def inject_current_year():
     return {
         "current_year": datetime.now().year,
         "csrf_token": csrf_token,
+        "csp_nonce": getattr(g, "csp_nonce", ""),
     }
 
 
@@ -213,7 +292,7 @@ def index():
         )
 
     # Keep the dashboard concise; the Items page remains the full browsing view.
-    items = db.get_items(limit=5)
+    items = db.get_items(limit=6)
     formatted_items = []
     for item in items:
         item_timestamp = float(item[4])
@@ -236,10 +315,14 @@ def index():
     telegram_running = db.get_parameter("telegram_process_running") == "True"
     rss_running = db.get_parameter("rss_process_running") == "True"
 
-    # Get statistics for the dashboard
+    # Get statistics for the dashboard. Keep total and active query counts
+    # separate now that paused queries remain stored in the database.
+    enabled_map = db.get_query_enabled_map()
     stats = {
         "total_items": db.get_total_items_count(),
-        "total_queries": db.get_total_queries_count(),
+        "total_queries": len(enabled_map),
+        "active_queries": sum(1 for enabled in enabled_map.values() if enabled),
+        "paused_queries": sum(1 for enabled in enabled_map.values() if not enabled),
         "items_per_day": db.get_items_per_day(),
     }
 
@@ -497,13 +580,7 @@ def remove_query_bulk():
 
 @app.route("/pause_query/bulk", methods=["POST"])
 def pause_query_bulk():
-    ids = request.form.getlist("query_ids")
-    selected_ids = []
-    for raw_id in ids:
-        if str(raw_id).isdigit():
-            query_id = int(raw_id)
-            if query_id > 0 and query_id not in selected_ids:
-                selected_ids.append(query_id)
+    selected_ids = _selected_query_ids()
 
     if not selected_ids:
         flash("Select at least one query to pause.", "warning")
@@ -519,6 +596,39 @@ def pause_query_bulk():
         )
     else:
         flash("The selected queries were already paused.", "info")
+
+    return redirect(url_for("queries"))
+
+
+def _selected_query_ids():
+    """Return unique, positive query IDs submitted by a bulk-action form."""
+    ids = request.form.getlist("query_ids")
+    selected_ids = []
+    for raw_id in ids:
+        if str(raw_id).isdigit():
+            query_id = int(raw_id)
+            if query_id > 0 and query_id not in selected_ids:
+                selected_ids.append(query_id)
+    return selected_ids
+
+
+@app.route("/resume_query/bulk", methods=["POST"])
+def resume_query_bulk():
+    selected_ids = _selected_query_ids()
+    if not selected_ids:
+        flash("Select at least one query to resume.", "warning")
+        return redirect(url_for("queries"))
+
+    resumed = db.set_queries_enabled(selected_ids, True)
+    if resumed is None:
+        flash("Could not resume the selected queries.", "error")
+    elif resumed:
+        flash(
+            f"Resumed {resumed} quer{'y' if resumed == 1 else 'ies'}.",
+            "success",
+        )
+    else:
+        flash("The selected queries were already active.", "info")
 
     return redirect(url_for("queries"))
 
@@ -809,7 +919,9 @@ def test_telegram():
             400,
         )
     except (requests.RequestException, ValueError) as error:
-        logger.warning("Telegram test message failed: %s", error)
+        # Requests exceptions can contain the full Telegram URL, including the
+        # bot token. Record the error type without copying credentials to logs.
+        logger.warning("Telegram test message failed (%s)", type(error).__name__)
         return (
             jsonify({"status": "error", "message": f"Could not reach Telegram: {error}"}),
             502,
@@ -1069,8 +1181,11 @@ def allowlist():
 
 @app.route("/add_country", methods=["POST"])
 def add_country():
-    country = request.form.get("country", "").strip()
+    country = request.form.get("country", "").strip().upper()
     if country:
+        if len(country) != 2 or not country.isalpha():
+            flash("Enter a valid two-letter country code.", "warning")
+            return redirect(url_for("allowlist"))
         message, country_list = core.process_add_country(country)
         flash(message, "success" if "added" in message else "warning")
     else:
@@ -1104,10 +1219,17 @@ def logs():
 def api_logs():
     try:
         offset = max(0, int(request.args.get("offset", 0)))
-        limit = max(1, min(int(request.args.get("limit", 100)), 500))
+        limit = max(1, min(int(request.args.get("limit", 50)), 500))
     except ValueError:
         return jsonify({"error": "offset and limit must be integers"}), 400
     level_filter = request.args.get("level", "all")
+    search_filter = request.args.get("search", "").strip().casefold()
+    module_filter = request.args.get("module", "").strip().casefold()
+    hide_routine_http = request.args.get("hide_http", "1") not in {
+        "0",
+        "false",
+        "no",
+    }
 
     log_file_path = os.path.join("logs", "vinted.log")
 
@@ -1130,38 +1252,52 @@ def api_logs():
             # Format: 2023-09-15 12:34:56,789 - module_name - LEVEL - Message
             log_pattern = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - ([^-]+) - ([A-Z]+) - (.+)"
 
-            current_entry = 0
-
             for line in all_lines:
                 match = re.match(log_pattern, line.strip())
                 if match:
                     timestamp, module, level, message = match.groups()
+                    module = module.strip()
+                    # Werkzeug may colourise access-log messages even when
+                    # they are written to a file. Strip terminal escape codes
+                    # so the web viewer stays readable and filtering works.
+                    message = re.sub(r"\x1b\[[0-9;]*m", "", message)
 
                     # Apply level filter if specified
                     if level_filter != "all" and level != level_filter:
                         continue
 
-                    total_matching_entries += 1
-
-                    # Skip entries before offset
-                    if total_matching_entries <= offset:
+                    if module_filter and module_filter not in module.casefold():
                         continue
 
-                    # Add entry if within limit
-                    if current_entry < limit:
-                        log_entries.append(
-                            {
-                                "timestamp": timestamp,
-                                "module": module.strip(),
-                                "level": level,
-                                "message": message,
-                            }
-                        )
-                        current_entry += 1
+                    searchable = f"{timestamp} {module} {level} {message}".casefold()
+                    if search_filter and search_filter not in searchable:
+                        continue
 
-                    # Stop if we've reached the limit
-                    if current_entry >= limit:
-                        break
+                    if (
+                        hide_routine_http
+                        and level == "INFO"
+                        and module == "werkzeug"
+                        and re.search(
+                            r'"(?:GET|HEAD) /.* HTTP/\d(?:\.\d)?" (?:2\d\d|304) ',
+                            message,
+                        )
+                    ):
+                        continue
+
+                    total_matching_entries += 1
+
+                    result_index = total_matching_entries - 1
+                    if result_index < offset or result_index >= offset + limit:
+                        continue
+
+                    log_entries.append(
+                        {
+                            "timestamp": timestamp,
+                            "module": module,
+                            "level": level,
+                            "message": message,
+                        }
+                    )
     except Exception as e:
         logger.error(f"Error reading log file: {e}")
         return jsonify({"logs": [], "total": 0, "error": str(e)})

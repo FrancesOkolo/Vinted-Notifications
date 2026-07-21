@@ -10,7 +10,8 @@
 <!-- Statistics Section -->
 <div class="row g-3 mb-4 dashboard-stats">
     <div class="col-6 col-md-3">
-        <div class="card h-100 border-0 shadow-sm dashboard-stat-card">
+        <a href="/items" class="card h-100 border-0 shadow-sm dashboard-stat-card dashboard-stat-link text-decoration-none text-body"
+           aria-label="Browse all {{ stats.total_items }} items">
             <div class="card-body text-center d-flex flex-column justify-content-center">
                 <div class="d-flex align-items-center justify-content-center stat-icon">
                     <i class="bi bi-box-seam text-primary"></i>
@@ -19,22 +20,26 @@
                 <h2 class="fw-bold text-primary stat-value">{{ stats.total_items }}</h2>
                 <p class="card-text text-muted stat-description">Items grabbed for monitored queries so far</p>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100 border-0 shadow-sm dashboard-stat-card">
+        <a href="/queries?status=active" class="card h-100 border-0 shadow-sm dashboard-stat-card dashboard-stat-link text-decoration-none text-body"
+           aria-label="Manage {{ stats.active_queries }} active queries">
             <div class="card-body text-center d-flex flex-column justify-content-center">
                 <div class="d-flex align-items-center justify-content-center stat-icon">
                     <i class="bi bi-search text-success"></i>
                 </div>
                 <h5 class="card-title stat-label">Active Queries</h5>
-                <h2 class="fw-bold text-success stat-value">{{ stats.total_queries }}</h2>
-                <p class="card-text text-muted stat-description">Queries being monitored</p>
+                <h2 class="fw-bold text-success stat-value">{{ stats.active_queries }}</h2>
+                <p class="card-text text-muted stat-description">
+                    Queries being monitored{% if stats.paused_queries %}; {{ stats.paused_queries }} paused{% endif %}
+                </p>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100 border-0 shadow-sm dashboard-stat-card">
+        <a href="/items?sort=date_desc" class="card h-100 border-0 shadow-sm dashboard-stat-card dashboard-stat-link text-decoration-none text-body"
+           aria-label="Browse newest items">
             <div class="card-body text-center d-flex flex-column justify-content-center">
                 <div class="d-flex align-items-center justify-content-center stat-icon">
                     <i class="bi bi-bar-chart-fill text-warning"></i>
@@ -43,7 +48,7 @@
                 <h2 class="fw-bold text-warning stat-value">{{ stats.items_per_day }}</h2>
                 <p class="card-text text-muted stat-description">Average items found daily</p>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
         <div class="card h-100 border-0 shadow-sm dashboard-stat-card">
@@ -55,7 +60,7 @@
                 {% if stats.last_item %}
                 <div class="d-flex align-items-center justify-content-center dashboard-last-item">
                     {% if stats.last_item.photo_url %}
-                    <img src="{{ stats.last_item.photo_url }}" alt="{{ stats.last_item.title }}"
+                    <img src="{{ stats.last_item.photo_url }}" alt="{{ stats.last_item.title }}" data-image-fallback
                          class="img-thumbnail me-2" style="width: 50px; height: 50px; object-fit: cover;">
                     {% else %}
                     <div class="bg-light d-flex align-items-center justify-content-center me-2"
@@ -241,7 +246,7 @@
                     <div class="col-6 col-md-6 col-xl-4 mb-3">
                         <div class="card h-100">
                             {% if item.photo_url %}
-                            <img src="{{ item.photo_url }}" class="card-img-top" alt="{{ item.title }}"
+                            <img src="{{ item.photo_url }}" class="card-img-top" alt="{{ item.title }}" data-image-fallback
                                  style="height: 150px; object-fit: cover;">
                             {% else %}
                             <div class="card-img-top bg-light d-flex align-items-center justify-content-center"
@@ -292,7 +297,7 @@
                         <tr>
                             <td style="width: 60px;">
                                 {% if item.photo_url %}
-                                <img src="{{ item.photo_url }}" alt="{{ item.title }}" class="img-thumbnail"
+                                <img src="{{ item.photo_url }}" alt="{{ item.title }}" class="img-thumbnail" data-image-fallback
                                      style="width: 50px; height: 50px; object-fit: cover;">
                                 {% else %}
                                 <div class="bg-light d-flex align-items-center justify-content-center"
@@ -425,7 +430,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
     document.addEventListener('DOMContentLoaded', function () {
         // Process control buttons
         const processButtons = document.querySelectorAll('.process-control');
@@ -453,10 +458,13 @@
                         const alertDiv = document.createElement('div');
                         alertDiv.className = `alert alert-${alertClass} alert-dismissible fade show flash-message`;
                         alertDiv.setAttribute('role', 'alert');
-                        alertDiv.innerHTML = `
-                        ${data.message}
-                        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-                    `;
+                        alertDiv.appendChild(document.createTextNode(String(data.message)));
+                        const closeButton = document.createElement('button');
+                        closeButton.type = 'button';
+                        closeButton.className = 'btn-close';
+                        closeButton.setAttribute('data-bs-dismiss', 'alert');
+                        closeButton.setAttribute('aria-label', 'Close');
+                        alertDiv.appendChild(closeButton);
 
                         document.querySelector('.flash-messages').appendChild(alertDiv);
 

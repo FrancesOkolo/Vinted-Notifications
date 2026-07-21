@@ -17,17 +17,50 @@
             <div class="card-body">
                 <form action="/add_country" method="post">
                     <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                    <div class="row">
+                    <div class="row g-3 align-items-end">
                         <div class="col-md-10">
                             <div class="form-group">
-                                <label for="country">Country Code (2 letters)</label>
+                                <label for="country" class="form-label">Country</label>
                                 <input type="text" class="form-control" id="country" name="country" placeholder="FR"
-                                       maxlength="2" required>
-                                <small class="form-text text-muted">Enter a 2-letter country code (e.g., FR for France,
-                                    DE for Germany)</small>
+                                       minlength="2" pattern="[A-Za-z]{2}" list="countryOptions"
+                                       autocomplete="off" autocapitalize="characters" required>
+                                <datalist id="countryOptions">
+                                    <option value="GB">United Kingdom</option>
+                                    <option value="FR">France</option>
+                                    <option value="DE">Germany</option>
+                                    <option value="ES">Spain</option>
+                                    <option value="IT">Italy</option>
+                                    <option value="PT">Portugal</option>
+                                    <option value="NL">Netherlands</option>
+                                    <option value="BE">Belgium</option>
+                                    <option value="IE">Ireland</option>
+                                    <option value="AT">Austria</option>
+                                    <option value="LU">Luxembourg</option>
+                                    <option value="PL">Poland</option>
+                                    <option value="CZ">Czechia</option>
+                                    <option value="SK">Slovakia</option>
+                                    <option value="HU">Hungary</option>
+                                    <option value="RO">Romania</option>
+                                    <option value="LT">Lithuania</option>
+                                    <option value="SE">Sweden</option>
+                                    <option value="DK">Denmark</option>
+                                    <option value="FI">Finland</option>
+                                    <option value="GR">Greece</option>
+                                    <option value="HR">Croatia</option>
+                                    <option value="SI">Slovenia</option>
+                                    <option value="EE">Estonia</option>
+                                    <option value="LV">Latvia</option>
+                                    <option value="BG">Bulgaria</option>
+                                    <option value="CY">Cyprus</option>
+                                    <option value="MT">Malta</option>
+                                    <option value="US">United States</option>
+                                    <option value="CA">Canada</option>
+                                </datalist>
+                                <small class="form-text text-muted">Start typing a country name or enter its
+                                    two-letter ISO code. Other valid ISO codes are also accepted.</small>
                             </div>
                         </div>
-                        <div class="col-md-2 d-flex align-items-center">
+                        <div class="col-md-2">
                             <button type="submit" class="btn btn-primary w-100">Add Country</button>
                         </div>
                     </div>
@@ -138,4 +171,22 @@
         </div>
     </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script nonce="{{ csp_nonce }}">
+    document.addEventListener('DOMContentLoaded', function () {
+        const countryInput = document.getElementById('country');
+        if (countryInput) {
+            countryInput.addEventListener('input', function () {
+                // Uppercase a typed two-letter code. Longer text is left alone
+                // temporarily so native datalist search can match country names;
+                // choosing a suggestion replaces it with the valid code.
+                if (/^[a-z]{0,2}$/i.test(this.value)) {
+                    this.value = this.value.toUpperCase();
+                }
+            });
+        }
+    });
+</script>
 {% endblock %}
