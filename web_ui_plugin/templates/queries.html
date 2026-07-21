@@ -14,7 +14,23 @@
     }
 
     .query-bulk-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        justify-content: flex-end;
         margin-left: auto;
+    }
+
+    @media (max-width: 767.98px) {
+        .query-bulk-actions {
+            justify-content: stretch;
+            margin-left: 0;
+            width: 100%;
+        }
+
+        .query-bulk-actions .btn {
+            flex: 1 1 auto;
+        }
     }
 </style>
 {% endblock %}
@@ -115,6 +131,11 @@
                     </div>
                     <small class="text-muted query-results-count" id="queryResultsCount" aria-live="polite"></small>
                     <div class="query-bulk-actions">
+                        <button type="submit" class="btn btn-sm btn-outline-warning" id="bulkPauseButton"
+                                form="bulkRemoveForm" formaction="/pause_query/bulk" formmethod="post" disabled>
+                            <i class="bi bi-pause-fill"></i> Pause selected
+                            (<span id="bulkPauseSelectedCount">0</span>)
+                        </button>
                         <button type="button" class="btn btn-sm btn-danger" id="bulkRemoveButton"
                                 data-bs-toggle="modal" data-bs-target="#bulkDeleteModal" disabled>
                             <i class="bi bi-trash"></i> Remove selected (<span id="bulkSelectedCount">0</span>)
@@ -495,6 +516,8 @@
             const nextPageButton = document.getElementById('queryNextPage');
             const pageStatus = document.getElementById('queryPageStatus');
             const selectAll = document.getElementById('querySelectAll');
+            const bulkPauseButton = document.getElementById('bulkPauseButton');
+            const bulkPauseSelectedCount = document.getElementById('bulkPauseSelectedCount');
             const bulkButton = document.getElementById('bulkRemoveButton');
             const bulkSelectedCount = document.getElementById('bulkSelectedCount');
             const bulkDeleteCount = document.getElementById('bulkDeleteCount');
@@ -518,6 +541,9 @@
                 if (bulkSelectedCount) {
                     bulkSelectedCount.textContent = count;
                 }
+                if (bulkPauseSelectedCount) {
+                    bulkPauseSelectedCount.textContent = count;
+                }
                 if (bulkDeleteCount) {
                     bulkDeleteCount.textContent = count;
                 }
@@ -526,6 +552,9 @@
                 }
                 if (bulkButton) {
                     bulkButton.disabled = count === 0;
+                }
+                if (bulkPauseButton) {
+                    bulkPauseButton.disabled = count === 0;
                 }
                 if (selectAll) {
                     const matching = matchingRowsForTerm();

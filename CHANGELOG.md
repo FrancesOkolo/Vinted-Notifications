@@ -18,6 +18,8 @@ have not been pushed or deployed.
 
 ### Items and interface
 
+- Add a bulk action to pause selected queries across filtered and paginated
+  query results.
 - Add server-side item search, price filters, sorting, and pagination.
 - Add relative timestamps, recent-item badges, lazy-loaded images, and image
   fallbacks.

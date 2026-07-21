@@ -495,6 +495,34 @@ def remove_query_bulk():
     return redirect(url_for("queries"))
 
 
+@app.route("/pause_query/bulk", methods=["POST"])
+def pause_query_bulk():
+    ids = request.form.getlist("query_ids")
+    selected_ids = []
+    for raw_id in ids:
+        if str(raw_id).isdigit():
+            query_id = int(raw_id)
+            if query_id > 0 and query_id not in selected_ids:
+                selected_ids.append(query_id)
+
+    if not selected_ids:
+        flash("Select at least one query to pause.", "warning")
+        return redirect(url_for("queries"))
+
+    paused = db.set_queries_enabled(selected_ids, False)
+    if paused is None:
+        flash("Could not pause the selected queries.", "error")
+    elif paused:
+        flash(
+            f"Paused {paused} quer{'y' if paused == 1 else 'ies'}.",
+            "success",
+        )
+    else:
+        flash("The selected queries were already paused.", "info")
+
+    return redirect(url_for("queries"))
+
+
 @app.route("/toggle_query/<int:query_id>", methods=["POST"])
 def toggle_query(query_id):
     enabled_map = db.get_query_enabled_map()

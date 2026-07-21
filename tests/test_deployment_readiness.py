@@ -1059,6 +1059,8 @@ def test_queries_page_has_search_sort_pagination_and_shared_modals(database, mon
     # Tier 2: multi-select bulk remove, items column, pause/resume, relative time.
     assert 'id="querySelectAll"' in html
     assert 'class="form-check-input query-select"' in html
+    assert 'id="bulkPauseButton"' in html
+    assert 'formaction="/pause_query/bulk"' in html
     assert 'id="bulkRemoveButton"' in html
     assert 'action="/remove_query/bulk"' in html
     assert 'data-sort-key="items"' in html
@@ -1130,6 +1132,24 @@ def test_query_pause_enable_counts_and_bulk_remove(database, monkeypatch):
     # Toggling again resumes it.
     response = client.post(f"/toggle_query/{qid_b}", headers={"X-CSRF-Token": token})
     assert response.get_json()["enabled"] is True
+
+    # Bulk-pause A and C in one request; B remains active.
+    response = client.post(
+        "/pause_query/bulk",
+        data={"_csrf_token": token, "query_ids": [str(qid_a), str(qid_c)]},
+    )
+    assert response.status_code == 302
+    enabled = db.get_query_enabled_map()
+    assert enabled == {qid_a: False, qid_b: True, qid_c: False}
+    assert {row[0] for row in db.get_queries(enabled_only=True)} == {qid_b}
+
+    # Repeating the action is harmless and keeps both queries paused.
+    response = client.post(
+        "/pause_query/bulk",
+        data={"_csrf_token": token, "query_ids": [str(qid_a), str(qid_c)]},
+    )
+    assert response.status_code == 302
+    assert db.get_query_enabled_map() == enabled
 
     # Bulk-remove A and C, leaving only B.
     response = client.post(

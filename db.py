@@ -1742,6 +1742,47 @@ def set_query_enabled(query_id, enabled):
             conn.close()
 
 
+def set_queries_enabled(query_ids, enabled):
+    """Pause or resume several queries in one atomic database update.
+
+    Returns the number of queries whose state changed, or ``None`` if the
+    database update failed. Invalid and duplicate IDs are ignored.
+    """
+    normalised_ids = []
+    for query_id in query_ids:
+        try:
+            value = int(query_id)
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value not in normalised_ids:
+            normalised_ids.append(value)
+
+    if not normalised_ids:
+        return 0
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        enabled_value = 1 if enabled else 0
+        placeholders = ",".join("?" for _ in normalised_ids)
+        cursor = conn.execute(
+            f"""
+            UPDATE queries
+            SET enabled=?
+            WHERE id IN ({placeholders}) AND enabled<>?
+            """,
+            [enabled_value, *normalised_ids, enabled_value],
+        )
+        conn.commit()
+        return cursor.rowcount
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
 def get_query_enabled_map():
     """Return {query_id: bool} of whether each query is enabled."""
     conn = None
