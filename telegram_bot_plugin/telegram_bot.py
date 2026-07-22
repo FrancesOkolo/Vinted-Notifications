@@ -17,6 +17,21 @@ SEND_MAX_ATTEMPTS = 4
 SEND_BACKOFFS = (2, 5, 10)  # seconds to wait before attempts 2, 3, 4
 
 
+def _eligible_outbox_chat_ids(query_id, queued_chat_ids):
+    """Filter a queued item alert against current query and subscription state."""
+    if query_id is None:
+        return queued_chat_ids
+    if not db.is_query_enabled(query_id):
+        return []
+
+    current_subscribers = {str(value) for value in db.get_query_subscribers(query_id)}
+    return [
+        chat_id
+        for chat_id in (queued_chat_ids or [])
+        if str(chat_id) in current_subscribers
+    ]
+
+
 def is_retryable_telegram_error(error):
     """True for transient errors worth retrying.
 
@@ -918,6 +933,18 @@ class LeRobot:
                     chat_ids = json.loads(chat_ids_json) if chat_ids_json else None
                 except (TypeError, ValueError):
                     chat_ids = None
+
+                if query_id is not None:
+                    chat_ids = _eligible_outbox_chat_ids(query_id, chat_ids)
+                    if not chat_ids:
+                        logger.info(
+                            "Dropping queued notification %s because query %s "
+                            "is paused or has no remaining queued subscribers.",
+                            notif_id,
+                            query_id,
+                        )
+                        db.delete_notification(notif_id)
+                        continue
 
                 try:
                     delivered = await self.send_new_post(

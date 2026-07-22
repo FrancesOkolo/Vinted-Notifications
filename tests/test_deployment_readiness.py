@@ -202,6 +202,7 @@ def test_rss_dispatches_when_no_telegram_subscribers(database, monkeypatch):
     monkeypatch.setattr(core.db, "get_last_timestamp", lambda query_id: None)
     monkeypatch.setattr(core.db, "is_item_in_db_by_id", lambda item_id: False)
     monkeypatch.setattr(core.db, "get_allowlist", lambda: 0)
+    monkeypatch.setattr(core.db, "is_query_enabled", lambda query_id: True)
     monkeypatch.setattr(core.db, "get_query_subscribers", lambda query_id: [])
     monkeypatch.setattr(core.db, "add_item_to_db", lambda **kwargs: None)
 
@@ -400,11 +401,15 @@ def test_remove_description_migration_repairs_stored_template(database):
     assert db.get_parameter("message_template") == migrated
 
 
-@pytest.mark.parametrize("status_code", [403, 429])
-def test_requester_does_not_multiply_block_responses(
+@pytest.mark.parametrize(
+    ("status_code", "expected_calls"),
+    [(403, 2), (429, 1)],
+)
+def test_requester_uses_one_bounded_retry_for_block_responses(
     database,
     monkeypatch,
     status_code,
+    expected_calls,
 ):
     import importlib
 
@@ -435,23 +440,87 @@ def test_requester_does_not_multiply_block_responses(
     )
     client = requester_module.Requester()
     client.session = Session()
+    monkeypatch.setattr(client, "_rebuild_session", lambda: None)
+    waits = []
+    monkeypatch.setattr(requester_module.time, "sleep", waits.append)
 
     response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
 
     assert response.status_code == status_code
-    assert client.session.calls == 1
+    assert client.session.calls == expected_calls
+    assert waits == (
+        [requester_module.FORBIDDEN_RETRY_DELAY_SECONDS]
+        if status_code == 403
+        else []
+    )
 
 
-def test_query_spacing_spreads_133_queries_over_at_least_nine_minutes(
+def test_requester_recovers_from_transient_403_with_fresh_session(
+    database,
+    monkeypatch,
+):
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class Session:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            return Response(self.status_code)
+
+    monkeypatch.setattr(
+        requester_module.proxies,
+        "configure_proxy",
+        lambda session: False,
+    )
+    client = requester_module.Requester()
+    rejected_session = Session(403)
+    fresh_session = Session(200)
+    client.session = rejected_session
+    monkeypatch.setattr(
+        client,
+        "_rebuild_session",
+        lambda: setattr(client, "session", fresh_session),
+    )
+    monkeypatch.setattr(requester_module.time, "sleep", lambda seconds: None)
+
+    response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
+
+    assert response.status_code == 200
+    assert rejected_session.calls == 1
+    assert fresh_session.calls == 1
+
+
+def test_query_spacing_leaves_idle_time_between_scrape_cycles(
     database,
 ):
     core = _core()
     db.set_parameter("query_refresh_delay", "300")
 
     spacing = core._get_query_spacing_seconds(133)
+    active_window = spacing * 132
 
-    assert spacing >= 4
-    assert 9 * 60 <= spacing * 132 <= 12 * 60
+    assert 1 <= spacing <= 5
+    assert 2 * 60 <= active_window <= 3 * 60
+    assert active_window < 300
+
+    db.set_parameter("query_refresh_delay", "600")
+    smaller_query_set_window = core._get_query_spacing_seconds(41) * 40
+    assert smaller_query_set_window <= 600 * 0.5
 
 
 def test_403_circuit_breaker_stops_cycle_and_escalates_cooldown(
@@ -505,31 +574,31 @@ def test_403_circuit_breaker_stops_cycle_and_escalates_cooldown(
     monkeypatch.setattr(core.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(core.random, "uniform", lambda low, high: 1.0)
 
-    # Two rejected catalogue requests stop the first cycle. The remaining
+    # Three confirmed rejected catalogue requests stop the first cycle. The remaining
     # queries are never contacted.
     core.process_items(queue.Queue())
-    assert len(search_calls) == 2
+    assert len(search_calls) == 3
     cooldown = core.get_scraper_cooldown(now=clock[0])
     assert cooldown["active"]
-    assert cooldown["remaining"] == 15 * 60
+    assert cooldown["remaining"] == 5 * 60
     assert cooldown["level"] == 1
     assert cooldown["status_code"] == 403
 
     # Scheduled runs during the cooldown make no Vinted requests.
     core.process_items(queue.Queue())
-    assert len(search_calls) == 2
+    assert len(search_calls) == 3
 
-    # A repeated block after each timer expires escalates to 30 then 60 min.
-    clock[0] += 15 * 60 + 1
-    core.process_items(queue.Queue())
-    assert len(search_calls) == 4
-    assert core.get_scraper_cooldown(now=clock[0])["remaining"] == 30 * 60
-
-    clock[0] += 30 * 60 + 1
+    # A repeated block after each timer expires escalates to 10 then 15 min.
+    clock[0] += 5 * 60 + 1
     core.process_items(queue.Queue())
     assert len(search_calls) == 6
+    assert core.get_scraper_cooldown(now=clock[0])["remaining"] == 10 * 60
+
+    clock[0] += 10 * 60 + 1
+    core.process_items(queue.Queue())
+    assert len(search_calls) == 9
     cooldown = core.get_scraper_cooldown(now=clock[0])
-    assert cooldown["remaining"] == 60 * 60
+    assert cooldown["remaining"] == 15 * 60
     assert cooldown["level"] == 3
 
 
@@ -692,7 +761,10 @@ def test_startup_resets_stale_watchdog_without_false_alert(database, monkeypatch
 
     assert db.get_parameter("scraper_heartbeat") == str(now)
     assert db.get_parameter("scraper_failed_cycles") == "0"
-    assert db.get_parameter("scraper_watchdog_alerted") == "False"
+    # Preserve an existing alert across restart; stable-recovery logic clears
+    # it later without sending a false duplicate warning.
+    assert db.get_parameter("scraper_watchdog_alerted") == "True"
+    assert db.get_parameter("scraper_watchdog_recovery_started") == "0"
     assert db.get_parameter("scraper_last_ok") == str(now - 60)
 
     health = core.get_scraper_health(now=now)
@@ -706,6 +778,65 @@ def test_startup_resets_stale_watchdog_without_false_alert(database, monkeypatch
     )
     app.check_scraper_watchdog()
     assert enqueued == []
+
+
+def test_watchdog_requires_stable_recovery_before_rearming(database, monkeypatch):
+    import vinted_notifications as app
+
+    core = _core()
+    db.set_parameters(
+        {
+            "query_refresh_delay": "300",
+            "telegram_enabled": "True",
+            "telegram_chat_id": "111",
+            "scraper_watchdog_alerted": "False",
+            "scraper_watchdog_recovery_started": "0",
+        }
+    )
+    clock = [1_000]
+    monkeypatch.setattr(app.time, "time", lambda: clock[0])
+    enqueued = []
+    monkeypatch.setattr(
+        app.db,
+        "enqueue_notification",
+        lambda *args, **kwargs: enqueued.append((args, kwargs)),
+    )
+
+    blocked = {
+        "stalled": False,
+        "blocked": True,
+        "cooldown_active": True,
+        "cooldown_remaining": 300,
+        "cooldown_level": 1,
+        "last_block_status": 403,
+        "failed_cycles": 1,
+    }
+    healthy = {"stalled": False, "blocked": False}
+    state = [blocked]
+    monkeypatch.setattr(core, "get_scraper_health", lambda: state[0])
+
+    app.check_scraper_watchdog()
+    assert len(enqueued) == 1
+    assert db.get_parameter("scraper_watchdog_alerted") == "True"
+
+    # A brief recovery followed by another block does not emit a recovery or
+    # a second warning.
+    state[0] = healthy
+    clock[0] += 60
+    app.check_scraper_watchdog()
+    state[0] = blocked
+    clock[0] += 60
+    app.check_scraper_watchdog()
+    assert len(enqueued) == 1
+
+    # Only a sustained healthy period clears/rearms the alert.
+    state[0] = healthy
+    clock[0] += 60
+    app.check_scraper_watchdog()
+    clock[0] += app._watchdog_recovery_window_seconds()
+    app.check_scraper_watchdog()
+    assert len(enqueued) == 2
+    assert db.get_parameter("scraper_watchdog_alerted") == "False"
 
 
 def test_telegram_polling_can_be_disabled_for_local_testing(monkeypatch):
@@ -999,6 +1130,7 @@ def test_subscribed_item_is_persisted_to_outbox(database, monkeypatch):
     monkeypatch.setattr(core.db, "get_last_timestamp", lambda query_id: None)
     monkeypatch.setattr(core.db, "is_item_in_db_by_id", lambda item_id: False)
     monkeypatch.setattr(core.db, "get_allowlist", lambda: 0)
+    monkeypatch.setattr(core.db, "is_query_enabled", lambda query_id: True)
     monkeypatch.setattr(core.db, "get_query_subscribers", lambda query_id: ["123"])
     monkeypatch.setattr(core.db, "add_item_to_db", lambda **kwargs: None)
 
@@ -1026,6 +1158,59 @@ def test_subscribed_item_is_persisted_to_outbox(database, monkeypatch):
     # RSS still receives the item on the in-memory queue.
     rss_item = destination.get_nowait()
     assert len(rss_item) == 6
+
+
+def test_paused_query_discards_results_already_waiting_in_item_queue(database):
+    core = _core()
+    conn = db.get_db_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO queries (query, query_name, enabled) VALUES (?, ?, 0)",
+            ("https://www.vinted.co.uk/catalog?search_text=paused", "Paused"),
+        )
+        query_id = cursor.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    source = queue.Queue()
+    destination = queue.Queue()
+    source.put(([object()], query_id))
+
+    core.clear_item_queue(source, destination)
+
+    assert destination.empty()
+    conn = db.get_db_connection()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM items WHERE query_id=?",
+            (query_id,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_outbox_rechecks_pause_and_current_subscribers(database):
+    from telegram_bot_plugin.telegram_bot import _eligible_outbox_chat_ids
+
+    db.set_parameter("telegram_chat_id", "111")
+    assert db.migrate_multi_user_schema()
+    assert db.approve_telegram_user("222", "Sister")
+    query_url = normalise_vinted_url(
+        "https://www.vinted.co.uk/catalog?search_text=queue-state"
+    )
+    query_id, _, _ = db.add_query_to_db(query_url, chat_id="111")
+    db.add_query_to_db(query_url, chat_id="222")
+
+    assert _eligible_outbox_chat_ids(query_id, ["111", "222"]) == ["111", "222"]
+
+    # Unsubscribing after the item was queued removes only that recipient.
+    assert db.remove_query_subscription(query_id, "222")
+    assert _eligible_outbox_chat_ids(query_id, ["111", "222"]) == ["111"]
+
+    # Pausing the shared query suppresses the queued alert for everyone.
+    assert db.set_query_enabled(query_id, False)
+    assert _eligible_outbox_chat_ids(query_id, ["111"]) == []
 
 
 def test_retryable_telegram_error_classification():
@@ -1215,6 +1400,49 @@ def test_query_pause_enable_counts_and_bulk_remove(database, monkeypatch):
     )
     assert response.status_code == 302
     assert {row[0] for row in db.get_queries()} == {qid_b}
+
+
+def test_scrape_cycle_honours_query_paused_after_cycle_started(database, monkeypatch):
+    core = _core()
+    db.set_parameter("quiet_hours_enabled", "False")
+    db.set_parameter("query_refresh_delay", "300")
+
+    conn = db.get_db_connection()
+    try:
+        first = conn.execute(
+            "INSERT INTO queries (query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=first", "First"),
+        ).lastrowid
+        second = conn.execute(
+            "INSERT INTO queries (query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=second", "Second"),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    search_calls = []
+
+    class Items:
+        def search(self, url, nbr_items):
+            search_calls.append(url)
+            db.set_query_enabled(second, False)
+            return []
+
+    class FakeVinted:
+        def __init__(self):
+            self.items = Items()
+
+    monkeypatch.setattr(core, "Vinted", FakeVinted)
+    monkeypatch.setattr(core.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(core.random, "uniform", lambda low, high: 1.0)
+
+    core.process_items(queue.Queue())
+
+    assert len(search_calls) == 1
+    assert "search_text=first" in search_calls[0]
+    assert db.is_query_enabled(first)
+    assert not db.is_query_enabled(second)
 
 
 def test_network_web_bind_requires_auth_and_persistent_secret(monkeypatch):
@@ -1564,6 +1792,17 @@ def test_frontend_assets_are_self_hosted_and_image_fallback_is_wired():
     assert all(
         path.is_file() and path.stat().st_size > 1000 for path in required_assets
     )
+
+
+def test_base_template_declares_local_favicon():
+    template = (ROOT / "web_ui_plugin" / "templates" / "base.html").read_text(
+        encoding="utf-8"
+    )
+    favicon = ROOT / "web_ui_plugin" / "static" / "favicon.svg"
+
+    assert "filename='favicon.svg'" in template
+    assert favicon.is_file()
+    assert "#11a8b5" in favicon.read_text(encoding="utf-8").lower()
 
 
 def test_responsive_layout_hooks_are_present():

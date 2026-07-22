@@ -1661,6 +1661,24 @@ def set_query_enabled(query_id, enabled):
             conn.close()
 
 
+def is_query_enabled(query_id):
+    """Return whether a query exists and is currently enabled."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT enabled FROM queries WHERE id=?",
+            (query_id,),
+        ).fetchone()
+        return bool(row and row[0])
+    except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
 def set_queries_enabled(query_ids, enabled):
     """Pause or resume several queries in one atomic database update.
 

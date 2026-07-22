@@ -58,6 +58,15 @@ scrape_process = None
 current_query_refresh_delay = None
 
 
+def _watchdog_recovery_window_seconds():
+    """Require a sustained recovery before allowing another watchdog alert."""
+    try:
+        refresh_delay = int(db.get_parameter("query_refresh_delay") or 300)
+    except (TypeError, ValueError):
+        refresh_delay = 300
+    return max(30 * 60, min(refresh_delay * 2, 2 * 60 * 60))
+
+
 def telegram_polling_enabled():
     """Whether this instance should receive Telegram bot commands.
 
@@ -272,14 +281,22 @@ def check_scraper_watchdog():
         problem = bool(health["stalled"] or health["blocked"])
         already_alerted = db.get_parameter("scraper_watchdog_alerted") == "True"
 
-        # Only act on a transition (healthy <-> problem).
-        if problem == already_alerted:
-            return
+        now = int(time.time())
+        try:
+            recovery_started = int(
+                db.get_parameter("scraper_watchdog_recovery_started") or 0
+            )
+        except (TypeError, ValueError):
+            recovery_started = 0
 
         admin_chat_id = db.get_parameter("telegram_chat_id")
         telegram_enabled = db.get_parameter("telegram_enabled") == "True"
 
         if problem:
+            if recovery_started:
+                db.set_parameter("scraper_watchdog_recovery_started", "0")
+            if already_alerted:
+                return
             if health["stalled"]:
                 reason = "has stalled with no recent scrape activity"
             elif health["cooldown_active"]:
@@ -309,12 +326,36 @@ def check_scraper_watchdog():
             )
             db.set_parameter("scraper_watchdog_alerted", "True")
         else:
+            if not already_alerted:
+                if recovery_started:
+                    db.set_parameter("scraper_watchdog_recovery_started", "0")
+                return
+
+            # A single successful request between two blocks used to emit a
+            # recovery followed by another warning. Keep the existing alert
+            # latched until the scraper has stayed healthy for a meaningful
+            # period, which suppresses that noisy alert flapping.
+            if not recovery_started:
+                db.set_parameter(
+                    "scraper_watchdog_recovery_started",
+                    str(now),
+                )
+                logger.info(
+                    "Scraper watchdog: recovery detected; waiting for stable "
+                    "operation before clearing the alert."
+                )
+                return
+
+            if now - recovery_started < _watchdog_recovery_window_seconds():
+                return
+
             logger.info("Scraper watchdog: the scraper has recovered.")
             content = (
                 "✅ Vinted Notifications: the scraper has recovered "
                 "and is running normally again."
             )
             db.set_parameter("scraper_watchdog_alerted", "False")
+            db.set_parameter("scraper_watchdog_recovery_started", "0")
 
         if telegram_enabled and admin_chat_id:
             db.enqueue_notification(content, None, None, [admin_chat_id])
@@ -393,7 +434,7 @@ def reset_scraper_watchdog_baseline(now=None):
         {
             "scraper_heartbeat": str(baseline),
             "scraper_failed_cycles": "0",
-            "scraper_watchdog_alerted": "False",
+            "scraper_watchdog_recovery_started": "0",
         }
     ):
         raise RuntimeError("Failed to reset the scraper watchdog baseline.")

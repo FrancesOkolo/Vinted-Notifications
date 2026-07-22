@@ -22,11 +22,11 @@ _VERSION_CACHE_TIME = 0.0
 _VERSION_CACHE_TTL_SECONDS = 6 * 60 * 60
 _VERSION_CACHE_LOCK = threading.Lock()
 _ITEM_PAGE_REQUEST_TIMEOUT = (5, 10)
-_SCRAPER_FORBIDDEN_LIMIT = 2
-_SCRAPER_COOLDOWN_SECONDS = (15 * 60, 30 * 60, 60 * 60)
-_SCRAPER_MIN_CYCLE_WINDOW_SECONDS = 9 * 60
-_SCRAPER_MIN_QUERY_SPACING_SECONDS = 4.0
-_SCRAPER_MAX_QUERY_SPACING_SECONDS = 15.0
+_SCRAPER_FORBIDDEN_LIMIT = 3
+_SCRAPER_COOLDOWN_SECONDS = (5 * 60, 10 * 60, 15 * 60)
+_SCRAPER_MIN_QUERY_SPACING_SECONDS = 1.0
+_SCRAPER_MAX_QUERY_SPACING_SECONDS = 5.0
+_SCRAPER_TARGET_ACTIVE_FRACTION = 0.50
 _ITEM_PAGE_NAVIGATION_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -354,13 +354,11 @@ def _get_query_spacing_seconds(query_count):
     except (TypeError, ValueError):
         refresh_delay = 600
 
-    # Even when the configured scheduler interval is short, distribute a large
-    # query set across at least nine minutes. For 133 queries this produces
-    # roughly four seconds between catalogue requests instead of two.
-    usable_window = max(
-        _SCRAPER_MIN_CYCLE_WINDOW_SECONDS,
-        refresh_delay * 0.80,
-    )
+    # Pace requests during roughly the first half of the configured interval,
+    # then leave a real idle period before the next cycle. The previous
+    # nine-minute minimum made a ten-minute schedule almost continuous, which
+    # is both unlike the original app and an unnecessarily regular pattern.
+    usable_window = max(30, refresh_delay * _SCRAPER_TARGET_ACTIVE_FRACTION)
     calculated_spacing = usable_window / max(1, query_count - 1)
     return max(
         _SCRAPER_MIN_QUERY_SPACING_SECONDS,
@@ -392,7 +390,7 @@ def get_scraper_cooldown(now=None):
 
 
 def _activate_scraper_cooldown(status_code, now=None):
-    """Open or escalate the persistent 15/30/60-minute circuit breaker."""
+    """Open or escalate the persistent 5/10/15-minute circuit breaker."""
     now = int(now if now is not None else time.time())
     current_level = min(
         get_scraper_cooldown(now=now)["level"],
@@ -599,6 +597,12 @@ def process_items(queue):
         query_url = query[1]
         all_items = None
 
+        # The enabled-query list is a snapshot taken at the beginning of the
+        # cycle. Honour a pause made while that cycle is already running.
+        if not db.is_query_enabled(query_id):
+            logger.info("Skipping query %s because it was paused mid-cycle.", query_id)
+            continue
+
         for attempt in range(2):
             if _quiet_hours_active():
                 logger.info(
@@ -701,8 +705,16 @@ def process_items(queue):
 
         if all_items is not None:
             successful_fetches += 1
-            data = [item for item in all_items if item.is_new_item()]
-            queue.put((data, query_id))
+            if db.is_query_enabled(query_id):
+                data = [item for item in all_items if item.is_new_item()]
+                queue.put((data, query_id))
+            else:
+                data = []
+                logger.info(
+                    "Discarding results for query %s because it was paused "
+                    "while the request was in progress.",
+                    query_id,
+                )
             logger.info(
                 "Scraped %s items for query %s/%s: %s",
                 len(data),
@@ -867,8 +879,21 @@ def clear_item_queue(items_queue, new_items_queue):
     """
     if not items_queue.empty():
         data, query_id = items_queue.get()
+        if not db.is_query_enabled(query_id):
+            logger.info(
+                "Discarding queued results for paused query %s.",
+                query_id,
+            )
+            return
         banwords_str = db.get_parameter("banwords")
         for item in reversed(data):
+
+            if not db.is_query_enabled(query_id):
+                logger.info(
+                    "Stopping queued item processing because query %s was paused.",
+                    query_id,
+                )
+                break
 
             # If already in db, pass
             last_query_timestamp = db.get_last_timestamp(query_id)

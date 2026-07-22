@@ -5,7 +5,7 @@ import os
 import db
 import random
 import requests
-from requests.exceptions import HTTPError
+import time
 
 # Add the parent directory to sys.path to import logger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +15,7 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 REQUEST_TIMEOUT = (10, 30)
+FORBIDDEN_RETRY_DELAY_SECONDS = 3
 
 
 class Requester:
@@ -100,10 +101,10 @@ class Requester:
         """
         Make a GET request with retry logic.
 
-        Authentication failures may refresh cookies and retry. Blocking and
-        rate-limit responses are returned immediately so the scraper-level
-        circuit breaker can stop the whole cycle instead of multiplying a
-        Vinted rejection across hidden retries.
+        Authentication failures may refresh cookies and retry. The first 403
+        gets one controlled retry with a completely fresh session; only a 403
+        from that fresh session is returned to the scraper-level circuit
+        breaker. Rate-limit responses are still returned immediately.
 
         Args:
             url (str): The URL to request
@@ -121,7 +122,10 @@ class Requester:
         if self.debug and proxy_configured:
             logger.debug("Using configured proxy")
 
-        for attempt in range(1, self.MAX_RETRIES + 1):
+        forbidden_retry_used = False
+        authentication_attempt = 1
+
+        while True:
             with self.session.get(
                 url,
                 params=params,
@@ -130,35 +134,61 @@ class Requester:
                 if response.status_code == 200:
                     return response
 
-                # A 403 is normally an anti-bot/IP rejection and a 429 is an
-                # explicit rate limit. Retrying either response here used to
-                # create up to six catalogue requests before core.py even knew
-                # that one query had failed.
+                # A 403 can also mean that this session's cookies were rejected.
+                # Retry it exactly once with a fresh session, rather than either
+                # treating the first response as a site-wide block or repeating
+                # the old six-request retry burst.
+                if response.status_code == 403 and not forbidden_retry_used:
+                    forbidden_retry_used = True
+                    logger.warning(
+                        "Vinted returned HTTP 403; refreshing the session and "
+                        "retrying this query once."
+                    )
+                    self._rebuild_session()
+                    time.sleep(FORBIDDEN_RETRY_DELAY_SECONDS)
+                    continue
+
                 if response.status_code in (403, 429):
                     logger.warning(
-                        "Vinted returned HTTP %s; deferring retry policy to "
-                        "the scraper circuit breaker.",
+                        "Vinted returned confirmed HTTP %s; deferring further "
+                        "retry policy to the scraper circuit breaker.",
                         response.status_code,
                     )
                     return response
 
-                if response.status_code in (401, 404) and attempt < self.MAX_RETRIES:
-                    print("Cookies invalid, retrying " f"{attempt}/{self.MAX_RETRIES}")
+                if (
+                    response.status_code in (401, 404)
+                    and authentication_attempt < self.MAX_RETRIES
+                ):
+                    print(
+                        "Cookies invalid, retrying "
+                        f"{authentication_attempt}/{self.MAX_RETRIES}"
+                    )
                     if self.debug:
                         logger.debug(
                             "Cookies invalid retrying %s/%s",
-                            attempt,
+                            authentication_attempt,
                             self.MAX_RETRIES,
                         )
+                    authentication_attempt += 1
                     self.set_cookies()
                     continue
 
                 return response
 
-        # This should only happen if the loop exits without returning
-        raise HTTPError(
-            f"Failed to get a valid response after {self.MAX_RETRIES} attempts"
-        )
+    def _rebuild_session(self):
+        """Replace the HTTP session and obtain new cookies for one 403 retry."""
+        old_session = self.session
+        try:
+            old_session.close()
+        except Exception:
+            if self.debug:
+                logger.debug("Could not close the rejected Vinted session.")
+
+        self.session = requests.Session()
+        self.session.headers.update(self.HEADER)
+        proxies.configure_proxy(self.session)
+        self.set_cookies()
 
     def post(self, url, params=None):
         """
