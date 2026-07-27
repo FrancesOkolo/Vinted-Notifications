@@ -63,6 +63,85 @@ def test_quiet_hours_support_a_window_across_midnight(database, monkeypatch):
     assert not core.get_quiet_hours_status(time(6, 0))[0]
 
 
+def test_quiet_hours_day_parsing():
+    core = _core()
+    # None (never configured) keeps the original every-day behaviour.
+    assert core._parse_quiet_days(None) == {0, 1, 2, 3, 4, 5, 6}
+    # An explicitly empty selection means no quiet days.
+    assert core._parse_quiet_days("") == set()
+    assert core._parse_quiet_days("0,4,6") == {0, 4, 6}
+    assert core._parse_quiet_days("0, 1, 9, x") == {0, 1}  # ignores out-of-range/junk
+
+
+def test_quiet_hours_respects_days_of_week(database, monkeypatch):
+    core = _core()
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    values = {
+        "quiet_hours_enabled": "True",
+        "quiet_hours_start": "01:00",
+        "quiet_hours_end": "06:00",
+        "quiet_hours_timezone": "Europe/London",
+        "quiet_hours_days": "0,1,2,3,4",  # Mon-Fri only
+    }
+    monkeypatch.setattr(core.db, "get_parameter", values.get)
+
+    tz = ZoneInfo("Europe/London")
+    wednesday = datetime(2026, 7, 1, 2, 0, tzinfo=tz)
+    while wednesday.weekday() != 2:  # Wednesday
+        wednesday += timedelta(days=1)
+    saturday = wednesday + timedelta(days=3)
+    assert wednesday.weekday() == 2 and saturday.weekday() == 5
+
+    # 02:00 is inside the window: quiet on Wednesday (a selected day)...
+    assert core.get_quiet_hours_status(wednesday)[0] is True
+    # ...but NOT on Saturday (weekend excluded).
+    assert core.get_quiet_hours_status(saturday)[0] is False
+    # Outside the window on a selected day is never quiet.
+    assert core.get_quiet_hours_status(wednesday.replace(hour=12))[0] is False
+
+
+def test_config_save_stores_quiet_hours_days(database, monkeypatch):
+    import web_ui_plugin.web_ui as web
+
+    monkeypatch.setattr(
+        web.core, "check_version", lambda: (True, "t", "t", "https://x/y")
+    )
+    client = web.app.test_client()
+    token = re.search(
+        rb'name="_csrf_token" value="([^"]+)"', client.get("/config").data
+    ).group(1).decode()
+
+    base = {
+        "_csrf_token": token,
+        "quiet_hours_enabled": "on",
+        "quiet_hours_start": "01:00",
+        "quiet_hours_end": "06:00",
+        "quiet_hours_timezone": "Europe/London",
+        "items_per_query": "20",
+        "query_refresh_delay": "300",
+        "rss_port": "8080",
+        "rss_max_items": "100",
+        "message_template": "{title}",
+        "user_agents": "[]",
+        "default_headers": "{}",
+    }
+
+    # Selected weekdays are stored sorted; weekends are off here.
+    response = client.post(
+        "/update_config",
+        data={**base, "quiet_hours_days": ["4", "0", "1", "2", "3"]},
+    )
+    assert response.status_code == 302
+    assert db.get_parameter("quiet_hours_days") == "0,1,2,3,4"
+
+    # No days checked -> stored as an explicit empty string, not a fallback.
+    response = client.post("/update_config", data=base)
+    assert response.status_code == 302
+    assert db.get_parameter("quiet_hours_days") == ""
+
+
 def test_admin_rotation_leaves_exactly_one_administrator(database):
     assert db.set_parameter("telegram_chat_id", "111") is None
     assert db.migrate_multi_user_schema()

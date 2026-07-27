@@ -397,16 +397,38 @@
                                         </div>
                                         <div class="col-md-4">
                                             <label for="quiet_hours_timezone" class="form-label">Timezone</label>
-                                            <input type="text" class="form-control" id="quiet_hours_timezone"
-                                                   name="quiet_hours_timezone"
-                                                   value="{{ params.get('quiet_hours_timezone', 'Europe/London') }}"
-                                                   required>
+                                            {% set current_tz = params.get('quiet_hours_timezone', 'Europe/London') %}
+                                            <select class="form-select" id="quiet_hours_timezone"
+                                                    name="quiet_hours_timezone" required>
+                                                {% if current_tz not in timezones %}
+                                                <option value="{{ current_tz }}" selected>{{ current_tz }}</option>
+                                                {% endif %}
+                                                {% for tz in timezones %}
+                                                <option value="{{ tz }}" {% if tz == current_tz %}selected{% endif %}>{{ tz }}</option>
+                                                {% endfor %}
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div class="mt-3">
+                                        <label class="form-label d-block mb-2">Days quiet hours apply</label>
+                                        {% set quiet_days = params.get('quiet_hours_days', '0,1,2,3,4,5,6').split(',') %}
+                                        <div class="d-flex flex-wrap gap-3">
+                                            {% for num, dname in [('0', 'Mon'), ('1', 'Tue'), ('2', 'Wed'), ('3', 'Thu'), ('4', 'Fri'), ('5', 'Sat'), ('6', 'Sun')] %}
+                                            <div class="form-check">
+                                                <input class="form-check-input" type="checkbox" name="quiet_hours_days"
+                                                       value="{{ num }}" id="quiet_day_{{ num }}"
+                                                       {% if num in quiet_days %}checked{% endif %}>
+                                                <label class="form-check-label" for="quiet_day_{{ num }}">{{ dname }}</label>
+                                            </div>
+                                            {% endfor %}
                                         </div>
                                     </div>
                                     <div class="form-text mt-2">
                                         Use an IANA timezone such as Europe/London. This remains correct when the app
                                         runs on a UTC server and follows BST/GMT automatically. The global quiet period
-                                        applies to every Telegram account. Windows that cross midnight are supported.
+                                        applies to every Telegram account. Uncheck days (e.g. Sat &amp; Sun) to keep
+                                        notifications flowing normally on those days. Windows that cross midnight are
+                                        supported.
                                     </div>
                                 </div>
                             </div>

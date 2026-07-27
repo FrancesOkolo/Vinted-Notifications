@@ -27,7 +27,7 @@ import time
 from collections import deque
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from logger import get_logger
 from url_normalizer import normalise_vinted_url
 
@@ -890,6 +890,12 @@ def items():
     next_url = (
         url_for("items", page=page + 1, **filter_args) if page < total_pages else None
     )
+    first_url = url_for("items", page=1, **filter_args) if page > 1 else None
+    last_url = (
+        url_for("items", page=total_pages, **filter_args)
+        if page < total_pages
+        else None
+    )
 
     return render_template(
         "items.html",
@@ -906,6 +912,8 @@ def items():
         total_items=total,
         prev_url=prev_url,
         next_url=next_url,
+        first_url=first_url,
+        last_url=last_url,
     )
 
 
@@ -980,6 +988,7 @@ def config():
         params=params,
         telegram_token_configured=telegram_token_configured,
         query_health=query_health,
+        timezones=sorted(available_timezones()),
     )
 
 
@@ -1098,6 +1107,19 @@ def update_config():
         )
         return redirect(url_for("config"))
 
+    # Days quiet hours apply on (Mon=0 .. Sun=6). Always written, so an empty
+    # selection is stored as "" (no quiet days) rather than falling back to all.
+    quiet_days = ",".join(
+        sorted(
+            {
+                day
+                for day in request.form.getlist("quiet_hours_days")
+                if day.isdigit() and 0 <= int(day) <= 6
+            },
+            key=int,
+        )
+    )
+
     try:
         items_per_query = _validated_int("items_per_query", 20, 1, 100)
         query_refresh_delay = _validated_int(
@@ -1168,6 +1190,7 @@ def update_config():
         "quiet_hours_start": quiet_start,
         "quiet_hours_end": quiet_end,
         "quiet_hours_timezone": quiet_timezone,
+        "quiet_hours_days": quiet_days,
         "check_proxies": str("check_proxies" in request.form),
         "proxy_list": request.form.get("proxy_list", ""),
         "proxy_list_link": request.form.get("proxy_list_link", ""),

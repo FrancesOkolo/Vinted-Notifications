@@ -254,6 +254,23 @@ def _parse_quiet_time(value, fallback):
         return datetime.strptime(fallback, "%H:%M").time()
 
 
+def _parse_quiet_days(value):
+    """Parse the quiet-hours weekday set (Mon=0 .. Sun=6).
+
+    None means the setting was never configured, which keeps the original
+    behaviour of applying quiet hours every day. An explicitly saved empty
+    value means no quiet days (quiet hours effectively off).
+    """
+    if value is None:
+        return {0, 1, 2, 3, 4, 5, 6}
+    days = set()
+    for part in str(value).split(","):
+        part = part.strip()
+        if part.isdigit() and 0 <= int(part) <= 6:
+            days.add(int(part))
+    return days
+
+
 def get_quiet_hours_status(now=None):
     """
     Return (active, start_text, end_text, timezone_name).
@@ -299,21 +316,33 @@ def get_quiet_hours_status(now=None):
     if start == end:
         return False, start_text, end_text, timezone_name
 
+    weekday = None
     if now is None:
-        current = datetime.now(quiet_timezone).time().replace(tzinfo=None)
+        now_local = datetime.now(quiet_timezone)
+        current = now_local.time().replace(tzinfo=None)
+        weekday = now_local.weekday()
     elif isinstance(now, datetime):
         if now.tzinfo is None:
             now = now.replace(tzinfo=quiet_timezone)
-        current = now.astimezone(quiet_timezone).time().replace(tzinfo=None)
+        now_local = now.astimezone(quiet_timezone)
+        current = now_local.time().replace(tzinfo=None)
+        weekday = now_local.weekday()
     else:
         # A time object is useful for unit tests and is interpreted directly
-        # in the configured quiet-hours timezone.
+        # in the configured quiet-hours timezone. Without a date the weekday
+        # restriction is skipped.
         current = now.replace(tzinfo=None)
 
     if start < end:
         active = start <= current < end
     else:
         active = current >= start or current < end
+
+    # Restrict quiet hours to the configured days of the week when the date is
+    # known (e.g. leave Sat/Sun unchecked to keep weekends noisy).
+    if active and weekday is not None:
+        if weekday not in _parse_quiet_days(db.get_parameter("quiet_hours_days")):
+            active = False
 
     return active, start_text, end_text, timezone_name
 

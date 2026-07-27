@@ -166,8 +166,11 @@ class LeRobot:
             job_queue.run_once(self.set_commands, when=1)
             # Every day we check for a new version
             job_queue.run_repeating(self.check_version, interval=86400, first=1)
-            # Continuously deliver persisted notifications from the outbox.
-            job_queue.run_once(self.drain_outbox, when=1)
+            # Deliver persisted notifications from the outbox. A *repeating*
+            # job (rather than one long-lived loop) means a network stall or a
+            # cancelled tick can only delay a single pass — the next tick always
+            # fires, so delivery can never silently stop for the process's life.
+            job_queue.run_repeating(self.drain_outbox, interval=10, first=1)
 
             # drop_pending_updates avoids replaying a backlog of old commands
             # that piled up while the bot was stopped.
@@ -176,10 +179,17 @@ class LeRobot:
             logger.error(f"Error initializing bot: {str(e)}", exc_info=True)
 
     async def run_send_only(self):
-        """Deliver the outbox without receiving commands via getUpdates."""
+        """Deliver the outbox without receiving commands via getUpdates.
+
+        drain_outbox is a finite single pass (see its docstring), so loop it
+        here to keep delivering; each pass clears the current backlog and then
+        sleeps briefly before checking again.
+        """
         await self.bot.initialize()
         try:
-            await self.drain_outbox(None)
+            while True:
+                await self.drain_outbox(None)
+                await asyncio.sleep(10)
         finally:
             await self.bot.shutdown()
 
@@ -898,14 +908,21 @@ class LeRobot:
                 exc_info=True,
             )
 
-    async def drain_outbox(self, context: ContextTypes.DEFAULT_TYPE):
-        """Continuously deliver persisted notifications from the outbox.
+    # A single delivery must never block the queue forever. If the network
+    # wedges mid-send, abandon that attempt and let the retry/backoff path
+    # requeue it rather than freezing every other pending alert behind it.
+    _OUTBOX_SEND_TIMEOUT = 120
 
-        Rows are removed on success. A failed row is retried later with
-        backoff and dropped after too many attempts, so a permanently
-        undeliverable message can't wedge delivery. Because the outbox lives in
-        the database, undelivered notifications survive a restart — closing the
-        window where a crash could silently lose an alert.
+    async def drain_outbox(self, context: ContextTypes.DEFAULT_TYPE):
+        """Deliver all currently-due outbox notifications, then return.
+
+        Scheduled to run repeatedly (see ``run``), so this is a single finite
+        pass rather than an immortal loop. A network stall or a cancelled tick
+        can therefore only delay delivery until the next scheduled run — it can
+        never silently kill delivery for the life of the process. Rows are
+        removed on success; a failed row is retried later with backoff and
+        dropped after too many attempts, and because the outbox lives in the
+        database, undelivered notifications survive a restart.
         """
         max_attempts = 10
         while True:
@@ -913,12 +930,10 @@ class LeRobot:
                 due = db.get_due_notifications(limit=10)
             except Exception:
                 logger.error("Could not read the notification outbox.", exc_info=True)
-                await asyncio.sleep(5)
-                continue
+                return
 
             if not due:
-                await asyncio.sleep(1)
-                continue
+                return
 
             for (
                 notif_id,
@@ -947,15 +962,26 @@ class LeRobot:
                         continue
 
                 try:
-                    delivered = await self.send_new_post(
-                        content,
-                        url,
-                        button_text,
-                        chat_ids=chat_ids,
-                        query_id=query_id,
+                    delivered = await asyncio.wait_for(
+                        self.send_new_post(
+                            content,
+                            url,
+                            button_text,
+                            chat_ids=chat_ids,
+                            query_id=query_id,
+                        ),
+                        timeout=self._OUTBOX_SEND_TIMEOUT,
                     )
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Delivery of notification %s timed out after %ss; "
+                        "will retry.",
+                        notif_id,
+                        self._OUTBOX_SEND_TIMEOUT,
+                    )
+                    delivered = False
                 except Exception as error:
                     logger.error(
                         "Unexpected error delivering notification %s: %s",

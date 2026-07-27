@@ -297,13 +297,25 @@
                 </form>
                 <div class="query-pagination d-flex align-items-center justify-content-between p-3 border-top"
                      id="queryPagination" aria-label="Query table pagination">
-                    <button type="button" class="btn btn-sm btn-outline-secondary" id="queryPreviousPage">
-                        <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous
-                    </button>
+                    <div class="btn-group" role="group">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="queryFirstPage"
+                                title="First page" aria-label="First page">
+                            <i class="bi bi-chevron-double-left" aria-hidden="true"></i>
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="queryPreviousPage">
+                            <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous
+                        </button>
+                    </div>
                     <span class="small text-muted" id="queryPageStatus" aria-live="polite"></span>
-                    <button type="button" class="btn btn-sm btn-outline-secondary" id="queryNextPage">
-                        Next <i class="bi bi-chevron-right" aria-hidden="true"></i>
-                    </button>
+                    <div class="btn-group" role="group">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="queryNextPage">
+                            Next <i class="bi bi-chevron-right" aria-hidden="true"></i>
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="queryLastPage"
+                                title="Last page" aria-label="Last page">
+                            <i class="bi bi-chevron-double-right" aria-hidden="true"></i>
+                        </button>
+                    </div>
                 </div>
                 <span class="visually-hidden" id="querySortStatus" aria-live="polite"></span>
             </div>
@@ -585,6 +597,8 @@
             const resultsCount = document.getElementById('queryResultsCount');
             const previousPageButton = document.getElementById('queryPreviousPage');
             const nextPageButton = document.getElementById('queryNextPage');
+            const firstPageButton = document.getElementById('queryFirstPage');
+            const lastPageButton = document.getElementById('queryLastPage');
             const pageStatus = document.getElementById('queryPageStatus');
             const statusFilter = document.getElementById('queryStatusFilter');
             const mobileSort = document.getElementById('queryMobileSort');
@@ -604,6 +618,7 @@
             let activeSortKey = 'lastFound';
             let activeSortDirection = 'descending';
             let currentPage = 1;
+            let pageCount = 1;
 
             const requestedStatus = new URLSearchParams(window.location.search).get('status');
             if (['active', 'paused'].includes(requestedStatus)) {
@@ -727,7 +742,7 @@
                         || (statusFilter.value === 'paused' && !enabled);
                     return row.dataset.query.toLocaleLowerCase().includes(searchTerm) && matchesStatus;
                 });
-                const pageCount = Math.max(1, Math.ceil(matchingRows.length / pageSize));
+                pageCount = Math.max(1, Math.ceil(matchingRows.length / pageSize));
                 currentPage = Math.min(currentPage, pageCount);
                 const firstResultIndex = (currentPage - 1) * pageSize;
                 const pageRows = matchingRows.slice(firstResultIndex, firstResultIndex + pageSize);
@@ -749,6 +764,12 @@
                 clearSearchButton.hidden = searchInput.value.length === 0;
                 previousPageButton.disabled = currentPage <= 1 || matchingRows.length === 0;
                 nextPageButton.disabled = currentPage >= pageCount || matchingRows.length === 0;
+                if (firstPageButton) {
+                    firstPageButton.disabled = currentPage <= 1 || matchingRows.length === 0;
+                }
+                if (lastPageButton) {
+                    lastPageButton.disabled = currentPage >= pageCount || matchingRows.length === 0;
+                }
                 pageStatus.textContent = `Page ${currentPage} of ${pageCount}`;
 
                 const statusLabel = statusFilter.value === 'all' ? '' : statusFilter.value + ' ';
@@ -837,6 +858,22 @@
                 queryTable.scrollIntoView({block: 'nearest'});
             });
 
+            if (firstPageButton) {
+                firstPageButton.addEventListener('click', function () {
+                    currentPage = 1;
+                    renderQueryTable();
+                    queryTable.scrollIntoView({block: 'nearest'});
+                });
+            }
+
+            if (lastPageButton) {
+                lastPageButton.addEventListener('click', function () {
+                    currentPage = pageCount;
+                    renderQueryTable();
+                    queryTable.scrollIntoView({block: 'nearest'});
+                });
+            }
+
             // Bulk selection: the header checkbox selects every matching row
             // (across pages), and selections persist while paging/searching.
             selectAllControls.forEach(selectAll => {
@@ -856,7 +893,9 @@
             });
 
             queryTable.addEventListener('query-state-changed', function () {
-                currentPage = 1;
+                // Re-render in place after a pause/resume so the user stays on
+                // the page they were on (renderQueryTable clamps the page if the
+                // active/paused filter shrinks the list).
                 renderQueryTable();
             });
 
