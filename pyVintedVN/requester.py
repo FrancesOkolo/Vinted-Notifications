@@ -16,6 +16,10 @@ logger = get_logger(__name__)
 
 REQUEST_TIMEOUT = (10, 30)
 FORBIDDEN_RETRY_DELAY_SECONDS = 3
+# A reset/aborted TCP connection (typically a stale keep-alive socket reused on
+# the first request of a scrape cycle) is transient; retry a couple of times on
+# a fresh connection before surfacing it as a network error.
+CONNECTION_RESET_MAX_RETRIES = 2
 
 
 class Requester:
@@ -124,13 +128,33 @@ class Requester:
 
         forbidden_retry_used = False
         authentication_attempt = 1
+        connection_retry = 0
 
         while True:
-            with self.session.get(
-                url,
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-            ) as response:
+            try:
+                response = self.session.get(
+                    url,
+                    params=params,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except requests.exceptions.ConnectionError as error:
+                # Almost always a stale keep-alive socket being reused on the
+                # first request of a cycle (Vinted drops idle sockets between
+                # scrapes). A retry dials a fresh connection and succeeds;
+                # only surface the error to the scraper after a few tries.
+                if connection_retry >= CONNECTION_RESET_MAX_RETRIES:
+                    raise
+                connection_retry += 1
+                logger.warning(
+                    "Connection to Vinted was reset (%s); retrying %s/%s.",
+                    error.__class__.__name__,
+                    connection_retry,
+                    CONNECTION_RESET_MAX_RETRIES,
+                )
+                time.sleep(1)
+                continue
+
+            with response:
                 if response.status_code == 200:
                     return response
 

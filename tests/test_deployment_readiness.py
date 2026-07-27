@@ -584,6 +584,90 @@ def test_requester_recovers_from_transient_403_with_fresh_session(
     assert fresh_session.calls == 1
 
 
+def test_requester_retries_connection_reset_then_succeeds(
+    database,
+    monkeypatch,
+):
+    """A reset keep-alive socket (common on the first request of a cycle) is
+    retried on a fresh connection instead of surfacing as a network error."""
+    import importlib
+    import requests
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise requests.exceptions.ConnectionError(
+                    "('Connection aborted.', ConnectionResetError(10054))"
+                )
+            return Response(200)
+
+    monkeypatch.setattr(
+        requester_module.proxies,
+        "configure_proxy",
+        lambda session: False,
+    )
+    client = requester_module.Requester()
+    client.session = Session()
+    monkeypatch.setattr(requester_module.time, "sleep", lambda seconds: None)
+
+    response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
+
+    assert response.status_code == 200
+    assert client.session.calls == 2  # first request reset, retry succeeded
+
+
+def test_requester_gives_up_after_persistent_connection_resets(
+    database,
+    monkeypatch,
+):
+    """Persistent resets are surfaced to the scraper after bounded retries."""
+    import importlib
+    import requests
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            raise requests.exceptions.ConnectionError("reset")
+
+    monkeypatch.setattr(
+        requester_module.proxies,
+        "configure_proxy",
+        lambda session: False,
+    )
+    client = requester_module.Requester()
+    client.session = Session()
+    monkeypatch.setattr(requester_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        client.get("https://www.vinted.co.uk/api/v2/catalog/items")
+
+    assert (
+        client.session.calls
+        == requester_module.CONNECTION_RESET_MAX_RETRIES + 1
+    )
+
+
 def test_query_spacing_leaves_idle_time_between_scrape_cycles(
     database,
 ):
