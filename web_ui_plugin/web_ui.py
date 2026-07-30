@@ -1055,6 +1055,12 @@ def config_health():
         status = "ok"
 
     enabled_map = db.get_query_enabled_map()
+
+    quiet_active, quiet_start, quiet_end, quiet_timezone = core.get_quiet_hours_status()
+    quiet_enabled = (
+        str(db.get_parameter("quiet_hours_enabled") or "False").strip().lower() == "true"
+    )
+
     return jsonify(
         {
             "pending_notifications": db.count_pending_notifications(),
@@ -1072,6 +1078,13 @@ def config_health():
                 "total": len(enabled_map),
                 "active": sum(1 for on in enabled_map.values() if on),
                 "paused": sum(1 for on in enabled_map.values() if not on),
+            },
+            "quiet_hours": {
+                "active": quiet_active,
+                "enabled": quiet_enabled,
+                "start": quiet_start,
+                "end": quiet_end,
+                "timezone": quiet_timezone,
             },
         }
     )

@@ -132,6 +132,10 @@
                         <span class="dashboard-health-label">Scraper protection</span>
                         <strong id="dashboardHealthProtection">Checking…</strong>
                     </div>
+                    <div class="dashboard-health-metric">
+                        <span class="dashboard-health-label">Quiet mode</span>
+                        <strong id="dashboardHealthQuiet">Checking…</strong>
+                    </div>
                 </div>
                 <a href="/config#system-health" class="btn btn-sm btn-outline-primary dashboard-health-details">
                     Details <i class="bi bi-chevron-right ms-1" aria-hidden="true"></i>
@@ -522,6 +526,7 @@
         const dashboardHealthLastOk = document.getElementById('dashboardHealthLastOk');
         const dashboardHealthPending = document.getElementById('dashboardHealthPending');
         const dashboardHealthProtection = document.getElementById('dashboardHealthProtection');
+        const dashboardHealthQuiet = document.getElementById('dashboardHealthQuiet');
 
         function formatDashboardHealthAge(seconds) {
             if (seconds === null || seconds === undefined) return 'Never';
@@ -585,6 +590,25 @@
                         iconClass = 'bi bi-shield-exclamation';
                     }
 
+                    const quiet = data.quiet_hours || {};
+                    if (quiet.active) {
+                        dashboardHealthQuiet.textContent = 'On · until ' + (quiet.end || '');
+                        dashboardHealthQuiet.className = 'text-info';
+                        // Quiet hours pause scraping on purpose, so explain the
+                        // expected lack of recent scrapes instead of looking broken.
+                        if (state === 'ok') {
+                            summary = 'Quiet hours are active — scraping is paused until ' +
+                                (quiet.end || '') + '. Alert delivery still runs.';
+                            iconClass = 'bi bi-moon-stars-fill';
+                        }
+                    } else if (quiet.enabled) {
+                        dashboardHealthQuiet.textContent = 'Off';
+                        dashboardHealthQuiet.className = 'text-success';
+                    } else {
+                        dashboardHealthQuiet.textContent = 'Disabled';
+                        dashboardHealthQuiet.className = 'text-muted';
+                    }
+
                     setDashboardHealthState(state);
                     dashboardHealthIcon.className = iconClass;
                     dashboardHealthSummary.textContent = summary;
@@ -618,6 +642,7 @@
                     dashboardHealthPending.textContent = '—';
                     dashboardHealthPending.className = '';
                     dashboardHealthProtection.textContent = 'Unknown';
+                    if (dashboardHealthQuiet) dashboardHealthQuiet.textContent = '—';
                 });
         }
 
