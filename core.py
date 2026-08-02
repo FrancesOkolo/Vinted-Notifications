@@ -1,3 +1,4 @@
+import ai_deal_evaluator
 import db
 import deal_evaluator
 import html
@@ -939,6 +940,17 @@ def _notification_value(value, fallback="Not provided", max_length=None):
     return html.escape(text, quote=False)
 
 
+def _ai_deal_query_ids():
+    """Query IDs configured to use AI deal evaluation (CSV parameter)."""
+    raw = db.get_parameter("deal_ai_query_ids") or ""
+    ids = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
 def clear_item_queue(items_queue, new_items_queue):
     """
     Process items from the items_queue.
@@ -1026,15 +1038,20 @@ def clear_item_queue(items_queue, new_items_queue):
                         exc_info=True,
                     )
                     content = db.DEFAULT_MESSAGE_TEMPLATE.format(**format_values)
-                # Prepend a listing-price deal rating (Excellent / Good / Don't
-                # buy) for queries with the evaluator enabled. Disabled queries
-                # get their content back unchanged.
-                content, _deal_rating = deal_evaluator.prepend_deal_rating(
-                    content,
-                    item.price,
-                    item.currency,
-                    db.get_query_preferences(query_id),
-                )
+                # Deal rating: an AI verdict for AI-enabled queries, otherwise
+                # the free listing-price ceiling evaluator. Both are best-effort
+                # and never block the alert.
+                if query_id in _ai_deal_query_ids():
+                    ai_rating = ai_deal_evaluator.evaluate(item)
+                    if ai_rating:
+                        content = f"{ai_rating}\n\n{content}"
+                else:
+                    content, _deal_rating = deal_evaluator.prepend_deal_rating(
+                        content,
+                        item.price,
+                        item.currency,
+                        db.get_query_preferences(query_id),
+                    )
                 # Subscriber lookup, durable Telegram outbox insertion, item
                 # insertion, and last-item advancement are one SQLite
                 # transaction. If any step fails, none of them is committed and

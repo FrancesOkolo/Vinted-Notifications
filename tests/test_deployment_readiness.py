@@ -826,6 +826,24 @@ def test_requester_gives_up_after_persistent_connection_resets(
     assert client.session.calls == requester_module.CONNECTION_RESET_MAX_RETRIES + 1
 
 
+def test_ai_deal_evaluator_formats_verdicts():
+    import ai_deal_evaluator as ai
+
+    assert "AI: EXCELLENT DEAL" in ai.format_verdict(
+        '{"verdict":"excellent","reason":"well under value"}'
+    )
+    assert "AI: GOOD DEAL" in ai.format_verdict('{"verdict":"good","reason":"fair"}')
+    assert "DON'T BUY" in ai.format_verdict(
+        '{"verdict":"dont_buy","reason":"overpriced"}'
+    )
+    # HTML in the reason is escaped so it can't break the Telegram message.
+    assert "&lt;b&gt;" in ai.format_verdict('{"verdict":"good","reason":"<b>x"}')
+    # Unknown verdict or malformed input yields no rating (best-effort).
+    assert ai.format_verdict('{"verdict":"maybe"}') is None
+    assert ai.format_verdict("not json") is None
+    assert ai.format_verdict("[1,2]") is None
+
+
 def test_contains_banwords_supports_and_syntax(database):
     core = _core()
     banwords = "empty+box|||empty+bottle|||box only"
