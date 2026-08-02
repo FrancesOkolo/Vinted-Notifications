@@ -1,4 +1,5 @@
 import db
+import deal_evaluator
 import html
 import json
 import random
@@ -571,15 +572,25 @@ def get_scraper_health(now=None):
     }
 
 
-def process_items(queue):
+def process_items(
+    queue,
+    query_ids=None,
+    monitor_during_quiet_hours=False,
+):
     """
-    Scrape every unique query once, pacing requests across the configured
+    Scrape enabled queries once, pacing multi-query calls across the configured
     interval. Shared subscriptions do not create duplicate Vinted requests.
+
+    ``query_ids`` is used by the per-query scheduler to run exactly one due
+    search while preserving the original all-query entry point for callers and
+    tests. ``monitor_during_quiet_hours`` is deliberately explicit: ordinary
+    searches remain silent overnight, while an opted-in priority search can
+    still be scraped and delivered immediately.
     """
     record_scraper_heartbeat()
 
     quiet_active, quiet_start, quiet_end, quiet_timezone = get_quiet_hours_status()
-    if quiet_active:
+    if quiet_active and not monitor_during_quiet_hours:
         logger.info(
             "Quiet hours active (%s-%s, %s); skipping this scrape cycle.",
             quiet_start,
@@ -602,8 +613,20 @@ def process_items(queue):
     # no requests.
     all_queries = db.get_queries(enabled_only=True)
 
+    if query_ids is not None:
+        if isinstance(query_ids, (str, int)):
+            query_ids = [query_ids]
+        selected_ids = set()
+        for query_id in query_ids:
+            try:
+                selected_ids.add(int(query_id))
+            except (TypeError, ValueError):
+                continue
+        all_queries = [query for query in all_queries if query[0] in selected_ids]
+
     if not all_queries:
-        logger.info("No active Vinted queries configured.")
+        if query_ids is None:
+            logger.info("No active Vinted queries configured.")
         return
 
     vinted = Vinted()
@@ -629,7 +652,7 @@ def process_items(queue):
     cycle_block_status = None
 
     for position, query in enumerate(all_queries, start=1):
-        if _quiet_hours_active():
+        if _quiet_hours_active() and not monitor_during_quiet_hours:
             logger.info(
                 "Quiet hours began during the scrape. Stopping after %s/%s queries.",
                 position - 1,
@@ -648,7 +671,7 @@ def process_items(queue):
             continue
 
         for attempt in range(2):
-            if _quiet_hours_active():
+            if _quiet_hours_active() and not monitor_during_quiet_hours:
                 logger.info(
                     "Quiet hours began before a retry; ending this scrape cycle."
                 )
@@ -1003,6 +1026,15 @@ def clear_item_queue(items_queue, new_items_queue):
                         exc_info=True,
                     )
                     content = db.DEFAULT_MESSAGE_TEMPLATE.format(**format_values)
+                # Prepend a listing-price deal rating (Excellent / Good / Don't
+                # buy) for queries with the evaluator enabled. Disabled queries
+                # get their content back unchanged.
+                content, _deal_rating = deal_evaluator.prepend_deal_rating(
+                    content,
+                    item.price,
+                    item.currency,
+                    db.get_query_preferences(query_id),
+                )
                 # Subscriber lookup, durable Telegram outbox insertion, item
                 # insertion, and last-item advancement are one SQLite
                 # transaction. If any step fails, none of them is committed and

@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import time
+from decimal import Decimal, InvalidOperation
 from traceback import print_exc
 
 DB_PATH = "./data/vinted_notifications.db"
@@ -11,6 +12,16 @@ DEFAULT_MESSAGE_TEMPLATE = """🆕 Title : {title}
 🛍️ Brand : {brand}
 Condition : {condition}
 <a href="{image}">&#8205;</a>"""
+
+QUERY_PREFERENCE_DEFAULTS = {
+    "poll_mode": "normal",
+    "monitor_during_quiet_hours": False,
+    "deal_evaluator_enabled": False,
+    "deal_excellent_max": None,
+    "deal_good_max": None,
+    "deal_currency": "GBP",
+}
+_QUERY_POLL_MODES = {"normal", "fast"}
 
 
 def get_db_connection():
@@ -1880,6 +1891,338 @@ def count_pending_notifications():
     except Exception:
         print_exc()
         return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+# --- Per-query monitoring and deal preferences -----------------------------
+
+
+def migrate_query_preferences_schema():
+    """Create and backfill the one-to-one query-preferences table.
+
+    This runtime migration is deliberately idempotent.  Existing query rows
+    receive the same conservative defaults as a fresh installation, while the
+    insert trigger keeps future rows in sync without changing the legacy
+    ``get_queries`` tuple layout.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS query_preferences
+            (
+                query_id                    INTEGER PRIMARY KEY,
+                poll_mode                   TEXT NOT NULL DEFAULT 'normal'
+                                            CHECK (poll_mode IN ('normal', 'fast')),
+                monitor_during_quiet_hours  INTEGER NOT NULL DEFAULT 0
+                                            CHECK (monitor_during_quiet_hours IN (0, 1)),
+                deal_evaluator_enabled      INTEGER NOT NULL DEFAULT 0
+                                            CHECK (deal_evaluator_enabled IN (0, 1)),
+                deal_excellent_max          TEXT,
+                deal_good_max               TEXT,
+                deal_currency               TEXT NOT NULL DEFAULT 'GBP',
+                FOREIGN KEY (query_id) REFERENCES queries (id) ON DELETE CASCADE
+            )
+            """)
+
+        columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(query_preferences)")
+        }
+        if "query_id" not in columns:
+            raise sqlite3.OperationalError(
+                "query_preferences exists without its query_id primary key"
+            )
+
+        # These ALTERs make the helper safe for an interrupted or experimental
+        # early installation that created only part of the preference schema.
+        missing_columns = {
+            "poll_mode": (
+                "TEXT NOT NULL DEFAULT 'normal' "
+                "CHECK (poll_mode IN ('normal', 'fast'))"
+            ),
+            "monitor_during_quiet_hours": (
+                "INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (monitor_during_quiet_hours IN (0, 1))"
+            ),
+            "deal_evaluator_enabled": (
+                "INTEGER NOT NULL DEFAULT 0 " "CHECK (deal_evaluator_enabled IN (0, 1))"
+            ),
+            "deal_excellent_max": "TEXT",
+            "deal_good_max": "TEXT",
+            "deal_currency": "TEXT NOT NULL DEFAULT 'GBP'",
+        }
+        for column, definition in missing_columns.items():
+            if column not in columns:
+                cursor.execute(
+                    f"ALTER TABLE query_preferences ADD COLUMN {column} {definition}"
+                )
+
+        cursor.execute("""
+            INSERT OR IGNORE INTO query_preferences (query_id)
+            SELECT id FROM queries
+            """)
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS queries_create_default_preferences
+            AFTER INSERT ON queries
+            BEGIN
+                INSERT OR IGNORE INTO query_preferences (query_id)
+                VALUES (NEW.id);
+            END
+            """)
+        cursor.execute(
+            "INSERT OR IGNORE INTO parameters (key, value) VALUES (?, ?)",
+            ("fast_query_refresh_delay", "90"),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def _normalise_preference_bool(value, field_name):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{field_name} must be true or false.")
+
+
+def _canonical_decimal_text(value, field_name):
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a non-negative number.")
+
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{field_name} must be a non-negative number.") from None
+
+    if not number.is_finite() or number < 0:
+        raise ValueError(f"{field_name} must be a non-negative number.")
+
+    canonical = format(number, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    return "0" if canonical in {"-0", ""} else canonical
+
+
+def normalise_query_preferences(
+    *,
+    poll_mode="normal",
+    monitor_during_quiet_hours=False,
+    deal_evaluator_enabled=False,
+    deal_excellent_max=None,
+    deal_good_max=None,
+    deal_currency="GBP",
+):
+    """Validate and canonicalise query-preference input.
+
+    The public helper lets Web/API callers surface a useful ``ValueError``
+    before attempting a database write. Deal thresholds remain optional while
+    the evaluator is disabled so a user can temporarily switch it off without
+    losing their saved values.
+    """
+    poll_mode = str(poll_mode).strip().lower()
+    if poll_mode not in _QUERY_POLL_MODES:
+        raise ValueError("Poll mode must be 'normal' or 'fast'.")
+
+    monitor_during_quiet_hours = _normalise_preference_bool(
+        monitor_during_quiet_hours,
+        "Monitor during quiet hours",
+    )
+    deal_evaluator_enabled = _normalise_preference_bool(
+        deal_evaluator_enabled,
+        "Deal evaluator enabled",
+    )
+    excellent = _canonical_decimal_text(
+        deal_excellent_max,
+        "Excellent-deal maximum",
+    )
+    good = _canonical_decimal_text(deal_good_max, "Good-deal maximum")
+
+    currency = str(deal_currency or "GBP").strip().upper()
+    if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
+        raise ValueError("Deal currency must be a three-letter code such as GBP.")
+
+    if deal_evaluator_enabled:
+        if excellent is None or good is None:
+            raise ValueError(
+                "Excellent and good price limits are required when the deal "
+                "evaluator is enabled."
+            )
+        if Decimal(excellent) > Decimal(good):
+            raise ValueError(
+                "The excellent-deal maximum cannot exceed the good-deal maximum."
+            )
+
+    return {
+        "poll_mode": poll_mode,
+        "monitor_during_quiet_hours": monitor_during_quiet_hours,
+        "deal_evaluator_enabled": deal_evaluator_enabled,
+        "deal_excellent_max": excellent,
+        "deal_good_max": good,
+        "deal_currency": currency,
+    }
+
+
+def get_query_preferences_map(query_ids=None):
+    """Return query preferences keyed by query ID.
+
+    A LEFT JOIN supplies defaults even if an installation has not yet backfilled
+    a particular row. ``query_ids`` may be omitted for all queries or supplied
+    as one ID/any iterable of IDs.
+    """
+    parameters = []
+    where = ""
+    if query_ids is not None:
+        if isinstance(query_ids, (str, int)):
+            query_ids = [query_ids]
+        normalised_ids = []
+        for query_id in query_ids:
+            try:
+                query_id = int(query_id)
+            except (TypeError, ValueError):
+                continue
+            if query_id > 0 and query_id not in normalised_ids:
+                normalised_ids.append(query_id)
+        if not normalised_ids:
+            return {}
+        placeholders = ",".join("?" for _ in normalised_ids)
+        where = f"WHERE q.id IN ({placeholders})"
+        parameters = normalised_ids
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        rows = conn.execute(
+            f"""
+            SELECT
+                q.id,
+                COALESCE(p.poll_mode, 'normal'),
+                COALESCE(p.monitor_during_quiet_hours, 0),
+                COALESCE(p.deal_evaluator_enabled, 0),
+                p.deal_excellent_max,
+                p.deal_good_max,
+                COALESCE(NULLIF(p.deal_currency, ''), 'GBP')
+            FROM queries q
+            LEFT JOIN query_preferences p ON p.query_id=q.id
+            {where}
+            ORDER BY q.id
+            """,
+            parameters,
+        ).fetchall()
+        return {
+            row[0]: {
+                "poll_mode": row[1],
+                "monitor_during_quiet_hours": bool(row[2]),
+                "deal_evaluator_enabled": bool(row[3]),
+                "deal_excellent_max": row[4],
+                "deal_good_max": row[5],
+                "deal_currency": str(row[6]).upper(),
+            }
+            for row in rows
+        }
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_query_preferences(query_id):
+    """Return one query's preference dictionary, or ``None`` if absent."""
+    try:
+        query_id = int(query_id)
+    except (TypeError, ValueError):
+        return None
+    preferences = get_query_preferences_map([query_id])
+    return preferences.get(query_id) if preferences is not None else None
+
+
+def set_query_preferences(
+    query_id,
+    *,
+    poll_mode="normal",
+    monitor_during_quiet_hours=False,
+    deal_evaluator_enabled=False,
+    deal_excellent_max=None,
+    deal_good_max=None,
+    deal_currency="GBP",
+):
+    """Atomically create or update one existing query's preferences."""
+    try:
+        query_id = int(query_id)
+        if query_id <= 0:
+            return False
+        values = normalise_query_preferences(
+            poll_mode=poll_mode,
+            monitor_during_quiet_hours=monitor_during_quiet_hours,
+            deal_evaluator_enabled=deal_evaluator_enabled,
+            deal_excellent_max=deal_excellent_max,
+            deal_good_max=deal_good_max,
+            deal_currency=deal_currency,
+        )
+    except (TypeError, ValueError):
+        return False
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM queries WHERE id=?", (query_id,))
+        if cursor.fetchone() is None:
+            return False
+        cursor.execute(
+            """
+            INSERT INTO query_preferences
+                (
+                    query_id, poll_mode, monitor_during_quiet_hours,
+                    deal_evaluator_enabled, deal_excellent_max,
+                    deal_good_max, deal_currency
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(query_id) DO UPDATE SET
+                poll_mode=excluded.poll_mode,
+                monitor_during_quiet_hours=excluded.monitor_during_quiet_hours,
+                deal_evaluator_enabled=excluded.deal_evaluator_enabled,
+                deal_excellent_max=excluded.deal_excellent_max,
+                deal_good_max=excluded.deal_good_max,
+                deal_currency=excluded.deal_currency
+            """,
+            (
+                query_id,
+                values["poll_mode"],
+                int(values["monitor_during_quiet_hours"]),
+                int(values["deal_evaluator_enabled"]),
+                values["deal_excellent_max"],
+                values["deal_good_max"],
+                values["deal_currency"],
+            ),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
     finally:
         if conn:
             conn.close()

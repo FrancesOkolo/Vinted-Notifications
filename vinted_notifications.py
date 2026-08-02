@@ -2,6 +2,7 @@ import multiprocessing
 import time
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -34,6 +35,7 @@ def _load_env_file():
 _env_loaded, _env_detail = _load_env_file()
 
 import db  # noqa: E402
+from apscheduler.executors.pool import ThreadPoolExecutor  # noqa: E402
 from apscheduler.schedulers.background import BackgroundScheduler  # noqa: E402
 from logger import get_logger  # noqa: E402
 
@@ -56,6 +58,10 @@ telegram_process = None
 rss_process = None
 scrape_process = None
 current_query_refresh_delay = None
+
+_SCRAPER_RECONCILE_SECONDS = 10
+_SCRAPER_JOB_PREFIX = "scrape_query_"
+_SCRAPER_RECONCILE_JOB_ID = "scraper_reconcile"
 
 
 def _watchdog_recovery_window_seconds():
@@ -129,6 +135,7 @@ def initialise_database():
         (db.migrate_multi_user_schema, "multi-user Telegram support"),
         (db.migrate_query_uniqueness, "query uniqueness"),
         (db.migrate_quiet_hours_schema, "quiet-hours configuration"),
+        (db.migrate_query_preferences_schema, "per-query monitoring preferences"),
         (db.migrate_fork_identity, "fork identity"),
     ]
     for migration, label in migrations:
@@ -136,22 +143,221 @@ def initialise_database():
             raise RuntimeError(f"Failed to initialise {label}.")
 
 
-def scraper_process(items_queue):
+def _scrape_delay(key, default, minimum=30):
+    """Return a bounded positive scheduler interval from application settings."""
+    try:
+        value = int(db.get_parameter(key) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+def _scrape_intervals():
+    """Return (normal, fast), ensuring Fast can never be the slower mode."""
+    normal = _scrape_delay("query_refresh_delay", 300)
+    configured_fast = _scrape_delay("fast_query_refresh_delay", 90, minimum=60)
+    return normal, min(normal, configured_fast)
+
+
+def _query_preference(preferences, query_id):
+    if not isinstance(preferences, dict):
+        return {}
+    preference = preferences.get(query_id)
+    if preference is None:
+        preference = preferences.get(str(query_id), {})
+    return preference if isinstance(preference, dict) else {}
+
+
+def _query_poll_mode(preference):
+    mode = str(preference.get("poll_mode", "normal")).strip().lower()
+    return "fast" if mode == "fast" else "normal"
+
+
+def _query_job_id(query_id):
+    return f"{_SCRAPER_JOB_PREFIX}{int(query_id)}"
+
+
+def _deterministic_next_run(query_id, interval_seconds, now=None):
+    """Place a query in a stable slot instead of bursting every query at boot."""
+    interval_seconds = max(1, int(interval_seconds))
+    if now is None:
+        now_timestamp = time.time()
+    elif isinstance(now, datetime):
+        now_timestamp = now.timestamp()
+    else:
+        now_timestamp = float(now)
+
+    # 97 is coprime with the normal 180s and fast 90s defaults. Sequential
+    # SQLite IDs are therefore distributed over those intervals rather than
+    # clustering at process start. The same query keeps the same phase after a
+    # restart, which also avoids cadence churn.
+    phase = (int(query_id) * 97) % interval_seconds
+    cycle_start = int(now_timestamp // interval_seconds) * interval_seconds
+    next_timestamp = cycle_start + phase
+    if next_timestamp <= now_timestamp:
+        next_timestamp += interval_seconds
+    return datetime.fromtimestamp(next_timestamp, timezone.utc)
+
+
+def _get_query_preferences(query_ids):
+    getter = getattr(db, "get_query_preferences_map", None)
+    if getter is None:
+        return {}
+    try:
+        preferences = getter(query_ids=query_ids)
+    except Exception:
+        logger.error("Could not load per-query monitoring preferences.", exc_info=True)
+        return None
+    return preferences if isinstance(preferences, dict) else None
+
+
+def _run_scheduled_query(items_queue, query_id):
+    """Run one query on the scheduler's sole worker thread."""
     import core
 
+    preference = _query_preference(_get_query_preferences([query_id]), query_id)
+    core.process_items(
+        items_queue,
+        query_ids=[query_id],
+        monitor_during_quiet_hours=bool(
+            preference.get("monitor_during_quiet_hours", False)
+        ),
+    )
+
+
+def _job_interval_seconds(job):
+    interval = getattr(getattr(job, "trigger", None), "interval", None)
+    if interval is None:
+        return None
+    return int(interval.total_seconds())
+
+
+def _reconcile_scraper_jobs(scheduler, items_queue, now=None):
+    """Synchronise serialized per-query jobs with the latest database state."""
+    import core
+
+    # The reconciliation heartbeat proves the process is healthy even when no
+    # queries are enabled or every ordinary query is intentionally quiet.
+    core.record_scraper_heartbeat()
+
+    active_queries = db.get_queries(enabled_only=True)
+    query_ids = [int(query[0]) for query in active_queries]
+    preferences = _get_query_preferences(query_ids)
+    if preferences is None:
+        # A transient preferences read must not silently downgrade Fast jobs or
+        # churn every trigger. Existing jobs retain their last known schedule;
+        # the next reconciliation retries the read.
+        logger.warning(
+            "Could not reconcile per-query schedules; keeping existing jobs."
+        )
+        return {
+            "active": len(query_ids),
+            "normal_interval": None,
+            "fast_interval": None,
+            "changed": 0,
+        }
+    normal_interval, fast_interval = _scrape_intervals()
+    desired_job_ids = {_query_job_id(query_id) for query_id in query_ids}
+    changes = 0
+
+    for job in scheduler.get_jobs():
+        if job.id.startswith(_SCRAPER_JOB_PREFIX) and job.id not in desired_job_ids:
+            scheduler.remove_job(job.id)
+            changes += 1
+
+    for query_id in query_ids:
+        preference = _query_preference(preferences, query_id)
+        mode = _query_poll_mode(preference)
+        interval = fast_interval if mode == "fast" else normal_interval
+        job_id = _query_job_id(query_id)
+        existing = scheduler.get_job(job_id)
+        next_run = _deterministic_next_run(query_id, interval, now=now)
+
+        if existing is None:
+            scheduler.add_job(
+                _run_scheduled_query,
+                "interval",
+                seconds=interval,
+                args=[items_queue, query_id],
+                id=job_id,
+                name=f"Vinted query {query_id} ({mode})",
+                next_run_time=next_run,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=max(30, interval),
+            )
+            changes += 1
+        elif _job_interval_seconds(existing) != interval:
+            scheduler.reschedule_job(
+                job_id,
+                trigger="interval",
+                seconds=interval,
+                next_run_time=next_run,
+            )
+            scheduler.modify_job(
+                job_id,
+                name=f"Vinted query {query_id} ({mode})",
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=max(30, interval),
+            )
+            changes += 1
+
+    if changes:
+        fast_count = sum(
+            1
+            for query_id in query_ids
+            if _query_poll_mode(_query_preference(preferences, query_id)) == "fast"
+        )
+        logger.info(
+            "Reconciled %s active query schedules (%s fast at %ss, %s normal "
+            "at %ss); %s job(s) changed.",
+            len(query_ids),
+            fast_count,
+            fast_interval,
+            len(query_ids) - fast_count,
+            normal_interval,
+            changes,
+        )
+
+    return {
+        "active": len(query_ids),
+        "normal_interval": normal_interval,
+        "fast_interval": fast_interval,
+        "changed": changes,
+    }
+
+
+def scraper_process(items_queue):
     logger.info("Scrape process started")
 
-    # Get the query refresh delay from the database
-    current_query_refresh_delay = int(db.get_parameter("query_refresh_delay"))
-    logger.info(f"Using query refresh delay of {current_query_refresh_delay} seconds")
+    normal_interval, fast_interval = _scrape_intervals()
+    logger.info(
+        "Using serialized per-query scheduling: normal=%ss, fast=%ss.",
+        normal_interval,
+        fast_interval,
+    )
 
-    scraper_scheduler = BackgroundScheduler()
+    # pyVintedVN owns one module-global Requester/session. A single executor
+    # thread is therefore intentional: Fast searches gain cadence through
+    # staggered due times, never through concurrent Vinted requests.
+    scraper_scheduler = BackgroundScheduler(
+        executors={"default": ThreadPoolExecutor(max_workers=1)},
+        timezone=timezone.utc,
+        job_defaults={"coalesce": True, "max_instances": 1},
+    )
+    _reconcile_scraper_jobs(scraper_scheduler, items_queue)
     scraper_scheduler.add_job(
-        core.process_items,
+        _reconcile_scraper_jobs,
         "interval",
-        seconds=current_query_refresh_delay,
-        args=[items_queue],
-        name="scraper",
+        seconds=_SCRAPER_RECONCILE_SECONDS,
+        args=[scraper_scheduler, items_queue],
+        id=_SCRAPER_RECONCILE_JOB_ID,
+        name="scraper schedule reconciliation",
+        next_run_time=datetime.now(timezone.utc)
+        + timedelta(seconds=_SCRAPER_RECONCILE_SECONDS),
+        coalesce=True,
+        max_instances=1,
     )
     scraper_scheduler.start()
     try:
@@ -225,8 +431,8 @@ def web_ui_process_entry():
 
 
 def check_refresh_delay(items_queue):
-    """Check if the query refresh delay has changed and update the scheduler if needed"""
-    global scrape_process, current_query_refresh_delay
+    """Observe delay changes; the scraper reconciles jobs without a restart."""
+    global current_query_refresh_delay
 
     # Check if the scheduler is running
 
@@ -237,26 +443,17 @@ def check_refresh_delay(items_queue):
     try:
         new_delay = int(db.get_parameter("query_refresh_delay"))
 
-        # If the delay has changed, update the scheduler
+        # The scraper child rereads both Normal and Fast intervals during its
+        # ten-second reconciliation. Do not terminate it here: doing so used to
+        # create a restart burst and could interrupt an in-flight query.
         if new_delay != current_query_refresh_delay:
             logger.info(
-                f"Query refresh delay changed from {current_query_refresh_delay} to {new_delay} seconds"
+                "Query refresh delay changed from %s to %s seconds; the "
+                "per-query scheduler will reconcile it without restarting.",
+                current_query_refresh_delay,
+                new_delay,
             )
-
-            # Update the global variable
             current_query_refresh_delay = new_delay
-
-            # Remove the existing job and add a new one with the updated interval
-            scrape_process.terminate()
-            scrape_process.join()
-            scrape_process = multiprocessing.Process(
-                target=scraper_process, args=(items_queue,)
-            )
-            scrape_process.start()
-
-            logger.info(
-                f"Scheduler updated with new refresh delay of {new_delay} seconds"
-            )
     except Exception as e:
         logger.error(f"Error updating refresh delay: {e}", exc_info=True)
 

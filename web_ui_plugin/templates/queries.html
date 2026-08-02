@@ -1,5 +1,67 @@
 {% extends "base.html" %}
 
+{% macro query_preference_fields(prefix) %}
+<div class="border rounded p-3 query-preference-fields">
+    <div class="row g-3">
+        <div class="col-md-4">
+            <label for="{{ prefix }}PollMode" class="form-label fw-semibold">Polling speed</label>
+            <select class="form-select" id="{{ prefix }}PollMode" name="poll_mode">
+                <option value="normal">Normal (180s)</option>
+                <option value="fast">Fast (~90s)</option>
+            </select>
+            <div class="form-text">Fast is limited to {{ max_active_fast_queries }} active queries.</div>
+        </div>
+        <div class="col-md-8 d-flex align-items-center">
+            <div class="form-check">
+                <input class="form-check-input" type="checkbox"
+                       id="{{ prefix }}QuietOverride" name="monitor_during_quiet_hours">
+                <label class="form-check-label fw-semibold" for="{{ prefix }}QuietOverride">
+                    Monitor and notify during quiet hours
+                </label>
+                <div class="form-text">
+                    Use this only for priority searches that should wake you overnight.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <hr>
+    <div class="form-check mb-2">
+        <input class="form-check-input" type="checkbox" id="{{ prefix }}DealEnabled"
+               name="deal_evaluator_enabled" data-deal-toggle>
+        <label class="form-check-label fw-semibold" for="{{ prefix }}DealEnabled">
+            Add a deal rating to notifications
+        </label>
+    </div>
+    <div class="row g-3" data-deal-fields hidden>
+        <div class="col-sm-4">
+            <label for="{{ prefix }}ExcellentMax" class="form-label">Excellent up to</label>
+            <input type="number" class="form-control" id="{{ prefix }}ExcellentMax"
+                   name="deal_excellent_max" min="0" step="0.01" inputmode="decimal"
+                   placeholder="25.00" data-deal-threshold>
+        </div>
+        <div class="col-sm-4">
+            <label for="{{ prefix }}GoodMax" class="form-label">Good up to</label>
+            <input type="number" class="form-control" id="{{ prefix }}GoodMax"
+                   name="deal_good_max" min="0" step="0.01" inputmode="decimal"
+                   placeholder="50.00" data-deal-threshold>
+        </div>
+        <div class="col-sm-4">
+            <label for="{{ prefix }}DealCurrency" class="form-label">Currency</label>
+            <input type="text" class="form-control text-uppercase" id="{{ prefix }}DealCurrency"
+                   name="deal_currency" value="GBP" minlength="3" maxlength="3"
+                   pattern="[A-Za-z]{3}" autocomplete="off" required>
+        </div>
+        <div class="col-12">
+            <div class="form-text">
+                Ratings use the listing price only. They exclude postage, buyer-protection fees,
+                and authenticity. Items above the Good limit are labelled “Don’t buy” but are still notified.
+            </div>
+        </div>
+    </div>
+</div>
+{% endmacro %}
+
 {% block title %}Queries - Vinted Notifications{% endblock %}
 
 {% block head %}
@@ -94,6 +156,16 @@
 
                         <div class="col-md-2 d-flex align-items-center">
                             <button type="submit" class="btn btn-primary w-100">Add Query</button>
+                        </div>
+                    </div>
+                    <div class="mt-3">
+                        <button class="btn btn-sm btn-link p-0 text-decoration-none" type="button"
+                                data-bs-toggle="collapse" data-bs-target="#addQueryPreferences"
+                                aria-expanded="false" aria-controls="addQueryPreferences">
+                            <i class="bi bi-sliders me-1"></i> Priority and deal options
+                        </button>
+                        <div class="collapse mt-2" id="addQueryPreferences">
+                            {{ query_preference_fields('add') }}
                         </div>
                     </div>
                 </form>
@@ -240,6 +312,20 @@
                                             class="bi bi-box-arrow-up-right ms-1 small"></i></a>
                                     <span class="badge bg-secondary ms-2 query-paused-badge"
                                           {% if query.enabled %}hidden{% endif %}>Paused</span>
+                                    {% if query.poll_mode == 'fast' %}
+                                    <span class="badge bg-warning text-dark ms-1"
+                                          title="Priority query; polled approximately every 90 seconds">Fast</span>
+                                    {% endif %}
+                                    {% if query.monitor_during_quiet_hours %}
+                                    <span class="badge bg-info text-dark ms-1"
+                                          title="Monitoring and notifications continue during quiet hours">Overnight</span>
+                                    {% endif %}
+                                    {% if query.deal_evaluator_enabled %}
+                                    <span class="badge bg-success ms-1"
+                                          title="Listing-price evaluator; postage, buyer fees and authenticity are excluded">
+                                        Deals: ≤ {{ query.deal_currency_prefix }}{{ query.deal_excellent_max }} / ≤ {{ query.deal_currency_prefix }}{{ query.deal_good_max }}
+                                    </span>
+                                    {% endif %}
                                     {% if query.filters %}
                                     <div class="query-filter-chips mt-1">
                                         {% for chip in query.filters %}
@@ -273,9 +359,15 @@
                                         </button>
                                         <button type="button" class="btn btn-sm btn-outline-secondary"
                                                 data-bs-toggle="modal" data-bs-target="#editQueryModal"
-                                                data-query-id="{{ query.query_id }}"
-                                                data-query-url="{{ query.query|e }}"
-                                                data-query-name="{{ (query.display if query.display != query.query else '')|e }}">
+                                                 data-query-id="{{ query.query_id }}"
+                                                 data-query-url="{{ query.query|e }}"
+                                                 data-query-name="{{ (query.display if query.display != query.query else '')|e }}"
+                                                 data-query-poll-mode="{{ query.poll_mode }}"
+                                                 data-query-quiet-override="{{ 'true' if query.monitor_during_quiet_hours else 'false' }}"
+                                                 data-query-deal-enabled="{{ 'true' if query.deal_evaluator_enabled else 'false' }}"
+                                                 data-query-deal-excellent="{{ query.deal_excellent_max if query.deal_excellent_max is not none else '' }}"
+                                                 data-query-deal-good="{{ query.deal_good_max if query.deal_good_max is not none else '' }}"
+                                                 data-query-deal-currency="{{ query.deal_currency }}">
                                             <i class="bi bi-pencil"></i> Edit
                                         </button>
                                         <button type="button" class="btn btn-sm btn-outline-danger"
@@ -406,6 +498,10 @@
                                required
                                placeholder="My search">
                     </div>
+                    <div class="mb-3">
+                        <h6>Priority and deal options</h6>
+                        {{ query_preference_fields('edit') }}
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -471,12 +567,36 @@
             });
         }
 
+        // Deal thresholds are required only when the evaluator is enabled.
+        function setupDealEvaluatorFields(container) {
+            const toggle = container.querySelector('[data-deal-toggle]');
+            const fields = container.querySelector('[data-deal-fields]');
+            if (!toggle || !fields) return;
+
+            const sync = function () {
+                fields.hidden = !toggle.checked;
+                fields.querySelectorAll('[data-deal-threshold]').forEach(input => {
+                    input.required = toggle.checked;
+                });
+            };
+            toggle.addEventListener('change', sync);
+            sync();
+        }
+
+        document.querySelectorAll('.query-preference-fields').forEach(setupDealEvaluatorFields);
+
         // Populate the single shared Edit modal from the clicked row's data.
         const editQueryModal = document.getElementById('editQueryModal');
         if (editQueryModal) {
             const editForm = document.getElementById('editQueryForm');
             const editUrl = document.getElementById('editQueryUrl');
             const editName = document.getElementById('editQueryName');
+            const editPollMode = document.getElementById('editPollMode');
+            const editQuietOverride = document.getElementById('editQuietOverride');
+            const editDealEnabled = document.getElementById('editDealEnabled');
+            const editExcellentMax = document.getElementById('editExcellentMax');
+            const editGoodMax = document.getElementById('editGoodMax');
+            const editDealCurrency = document.getElementById('editDealCurrency');
             editQueryModal.addEventListener('show.bs.modal', function (event) {
                 const button = event.relatedTarget;
                 if (!button) {
@@ -485,6 +605,13 @@
                 editForm.action = '/update_query/' + button.dataset.queryId;
                 editUrl.value = button.dataset.queryUrl || '';
                 editName.value = button.dataset.queryName || '';
+                editPollMode.value = button.dataset.queryPollMode || 'normal';
+                editQuietOverride.checked = button.dataset.queryQuietOverride === 'true';
+                editDealEnabled.checked = button.dataset.queryDealEnabled === 'true';
+                editExcellentMax.value = button.dataset.queryDealExcellent || '';
+                editGoodMax.value = button.dataset.queryDealGood || '';
+                editDealCurrency.value = button.dataset.queryDealCurrency || 'GBP';
+                editDealEnabled.dispatchEvent(new Event('change'));
             });
         }
 
@@ -574,6 +701,8 @@
                     .then(data => {
                         if (data.status === 'success') {
                             applyEnabledState(this, data.enabled);
+                        } else if (data.message) {
+                            window.alert(data.message);
                         }
                         this.disabled = false;
                     })

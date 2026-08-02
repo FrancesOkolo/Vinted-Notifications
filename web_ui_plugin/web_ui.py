@@ -25,6 +25,7 @@ import string
 import threading
 import time
 from collections import deque
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
@@ -39,6 +40,16 @@ mimetypes.add_type("application/javascript", ".mjs")
 
 # Get logger for this module
 logger = get_logger(__name__)
+
+_MAX_ACTIVE_FAST_QUERIES = 5
+_QUERY_PREFERENCE_DEFAULTS = {
+    "poll_mode": "normal",
+    "monitor_during_quiet_hours": False,
+    "deal_evaluator_enabled": False,
+    "deal_excellent_max": None,
+    "deal_good_max": None,
+    "deal_currency": "GBP",
+}
 
 # Create Flask app
 app = Flask(
@@ -526,6 +537,115 @@ def _summarise_query_filters(url):
     return chips
 
 
+def _canonical_nonnegative_decimal(raw_value, label):
+    """Validate a money form field and return a stable decimal string."""
+    raw_value = str(raw_value or "").strip()
+    if not raw_value:
+        return None
+
+    try:
+        value = Decimal(raw_value)
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{label} must be a valid number.") from None
+
+    if not value.is_finite() or value < 0:
+        raise ValueError(f"{label} must be a non-negative finite number.")
+
+    canonical = format(value, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    return canonical or "0"
+
+
+def _query_preferences_from_form():
+    """Parse and validate the shared per-query alert preferences."""
+    poll_mode = request.form.get("poll_mode", "normal").strip().lower()
+    if poll_mode not in {"normal", "fast"}:
+        raise ValueError("Polling speed must be Normal or Fast.")
+
+    currency = request.form.get("deal_currency", "GBP").strip().upper() or "GBP"
+    if re.fullmatch(r"[A-Z]{3}", currency) is None:
+        raise ValueError("Deal evaluator currency must be a three-letter code.")
+
+    excellent_max = _canonical_nonnegative_decimal(
+        request.form.get("deal_excellent_max"),
+        "Excellent price",
+    )
+    good_max = _canonical_nonnegative_decimal(
+        request.form.get("deal_good_max"),
+        "Good price",
+    )
+    evaluator_enabled = "deal_evaluator_enabled" in request.form
+
+    if evaluator_enabled and (excellent_max is None or good_max is None):
+        raise ValueError(
+            "Enter both Excellent and Good maximum prices to enable the deal evaluator."
+        )
+    if (excellent_max is None) != (good_max is None):
+        raise ValueError("Enter both deal-price thresholds, or leave both blank.")
+    if excellent_max is not None and Decimal(excellent_max) > Decimal(good_max):
+        raise ValueError("Excellent price must be less than or equal to Good price.")
+
+    return {
+        "poll_mode": poll_mode,
+        "monitor_during_quiet_hours": ("monitor_during_quiet_hours" in request.form),
+        "deal_evaluator_enabled": evaluator_enabled,
+        "deal_excellent_max": excellent_max,
+        "deal_good_max": good_max,
+        "deal_currency": currency,
+    }
+
+
+def _query_preferences_with_defaults(preferences):
+    merged = dict(_QUERY_PREFERENCE_DEFAULTS)
+    if preferences:
+        merged.update(preferences)
+    return merged
+
+
+def _active_fast_query_ids(preferences_map=None, enabled_map=None):
+    preferences_map = (
+        preferences_map
+        if preferences_map is not None
+        else db.get_query_preferences_map()
+    )
+    if preferences_map is None:
+        raise ValueError("Could not verify the active Fast-query limit.")
+    enabled_map = enabled_map if enabled_map is not None else db.get_query_enabled_map()
+    return {
+        query_id
+        for query_id, enabled in enabled_map.items()
+        if enabled
+        and _query_preferences_with_defaults(preferences_map.get(query_id)).get(
+            "poll_mode"
+        )
+        == "fast"
+    }
+
+
+def _fast_query_limit_exceeded(
+    query_id,
+    poll_mode,
+    will_be_enabled=True,
+    preferences_map=None,
+    enabled_map=None,
+):
+    """Return True if this change would create a sixth active Fast query."""
+    if poll_mode != "fast" or not will_be_enabled:
+        return False
+    active_fast = _active_fast_query_ids(
+        preferences_map=preferences_map,
+        enabled_map=enabled_map,
+    )
+    if query_id is not None:
+        active_fast.discard(query_id)
+    return len(active_fast) >= _MAX_ACTIVE_FAST_QUERIES
+
+
+def _save_query_preferences(query_id, preferences):
+    return db.set_query_preferences(query_id, **preferences)
+
+
 @app.route("/queries")
 def queries():
     # Get queries, newest Last Found Item first; Never entries last.
@@ -533,6 +653,10 @@ def queries():
     # Fetch pause-state and item counts once each to avoid per-row queries.
     enabled_map = db.get_query_enabled_map()
     item_counts = db.get_query_item_counts()
+    preferences_map = db.get_query_preferences_map([query[0] for query in all_queries])
+    if preferences_map is None:
+        logger.error("Could not load query preferences for the Queries page.")
+        preferences_map = {}
     formatted_queries = []
     for i, query in enumerate(all_queries):
         parsed_query = urlparse(query[1])
@@ -566,6 +690,10 @@ def queries():
                 last_found_item = "Never"
                 last_found_timestamp = None
 
+        preferences = _query_preferences_with_defaults(preferences_map.get(query[0]))
+        currency = str(preferences["deal_currency"] or "GBP").upper()
+        currency_prefix = "£" if currency == "GBP" else f"{currency} "
+
         formatted_queries.append(
             {
                 "id": i + 1,
@@ -577,10 +705,16 @@ def queries():
                 "enabled": enabled_map.get(query[0], True),
                 "item_count": item_counts.get(query[0], 0),
                 "filters": _summarise_query_filters(query[1]),
+                **preferences,
+                "deal_currency_prefix": currency_prefix,
             }
         )
 
-    return render_template("queries.html", queries=formatted_queries)
+    return render_template(
+        "queries.html",
+        queries=formatted_queries,
+        max_active_fast_queries=_MAX_ACTIVE_FAST_QUERIES,
+    )
 
 
 @app.route("/add_query", methods=["POST"])
@@ -590,12 +724,25 @@ def add_query():
 
     if query:
         try:
+            preferences = _query_preferences_from_form()
+            if _fast_query_limit_exceeded(None, preferences["poll_mode"]):
+                raise ValueError(
+                    f"At most {_MAX_ACTIVE_FAST_QUERIES} active queries can use Fast polling."
+                )
             query = normalise_vinted_url(query)
             message, is_new_query = core.process_query(
                 query, name=query_name if query_name != "" else None
             )
             if is_new_query:
-                flash(f"Query added: {query}", "success")
+                saved_query = db.get_query_by_url(query)
+                if saved_query and _save_query_preferences(saved_query[0], preferences):
+                    flash(f"Query added: {query}", "success")
+                else:
+                    flash(
+                        "Query added, but its alert preferences could not be saved. "
+                        "Open Edit and try again.",
+                        "error",
+                    )
             else:
                 flash(message, "warning")
         except (ValueError, TypeError) as error:
@@ -722,6 +869,36 @@ def resume_query_bulk():
         flash("Select at least one query to resume.", "warning")
         return redirect(url_for("queries"))
 
+    enabled_map = db.get_query_enabled_map()
+    preferences_map = db.get_query_preferences_map(selected_ids)
+    if preferences_map is None:
+        flash("Could not read query preferences. No queries were resumed.", "error")
+        return redirect(url_for("queries"))
+    all_preferences = db.get_query_preferences_map()
+    if all_preferences is None:
+        flash("Could not verify the active Fast-query limit.", "error")
+        return redirect(url_for("queries"))
+    active_fast = _active_fast_query_ids(
+        preferences_map=all_preferences,
+        enabled_map=enabled_map,
+    )
+    fast_to_resume = {
+        query_id
+        for query_id in selected_ids
+        if not enabled_map.get(query_id, False)
+        and _query_preferences_with_defaults(preferences_map.get(query_id)).get(
+            "poll_mode"
+        )
+        == "fast"
+    }
+    if len(active_fast | fast_to_resume) > _MAX_ACTIVE_FAST_QUERIES:
+        flash(
+            f"Cannot resume these queries: at most {_MAX_ACTIVE_FAST_QUERIES} "
+            "active queries can use Fast polling.",
+            "error",
+        )
+        return redirect(url_for("queries"))
+
     resumed = db.set_queries_enabled(selected_ids, True)
     if resumed is None:
         flash("Could not resume the selected queries.", "error")
@@ -743,6 +920,39 @@ def toggle_query(query_id):
         return jsonify({"status": "error", "message": "Query not found."}), 404
 
     new_state = not enabled_map[query_id]
+    stored_preferences = db.get_query_preferences(query_id)
+    if stored_preferences is None:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Could not read this query's preferences.",
+                }
+            ),
+            500,
+        )
+    preferences = _query_preferences_with_defaults(stored_preferences)
+    try:
+        fast_limit_exceeded = new_state and _fast_query_limit_exceeded(
+            query_id,
+            preferences["poll_mode"],
+            enabled_map=enabled_map,
+        )
+    except ValueError as error:
+        return jsonify({"status": "error", "message": str(error)}), 500
+    if fast_limit_exceeded:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": (
+                        f"At most {_MAX_ACTIVE_FAST_QUERIES} active queries "
+                        "can use Fast polling."
+                    ),
+                }
+            ),
+            409,
+        )
     if db.set_query_enabled(query_id, new_state):
         return jsonify({"status": "success", "enabled": new_state})
 
@@ -759,12 +969,27 @@ def update_query(query_id):
 
     if query:
         try:
+            preferences = _query_preferences_from_form()
+            enabled = db.get_query_enabled_map().get(query_id, False)
+            if _fast_query_limit_exceeded(
+                query_id,
+                preferences["poll_mode"],
+                will_be_enabled=enabled,
+            ):
+                raise ValueError(
+                    f"At most {_MAX_ACTIVE_FAST_QUERIES} active queries can use Fast polling."
+                )
             query = normalise_vinted_url(query)
             message, success = core.process_update_query(
                 query_id, query, name=query_name if query_name != "" else None
             )
-            if success:
+            if success and _save_query_preferences(query_id, preferences):
                 flash("Query updated", "success")
+            elif success:
+                flash(
+                    "The query was updated, but its alert preferences could not be saved.",
+                    "error",
+                )
             else:
                 flash(message, "error")
         except (ValueError, TypeError) as error:

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Priority monitoring and deal guidance
+
+- Add per-query Normal and Fast monitoring modes. Fast searches use a safe,
+  serialized 90-second schedule while ordinary searches retain the configured
+  refresh interval.
+- Allow selected priority queries to keep scraping and notify immediately
+  during quiet hours, while all ordinary queries remain paused.
+- Stagger per-query schedules and keep one scraper worker so priority searches
+  do not create a second concurrent request stream or a cold-start burst.
+- Add optional per-query Excellent and Good listing-price ceilings. Telegram
+  alerts are labelled Excellent, Good, or Don't Buy (above the chosen limit),
+  with an explicit reminder that postage, buyer fees, condition, and
+  authenticity are not included in the rating.
+- Treat missing prices, invalid thresholds, and currency mismatches as Not
+  Rated without dropping the notification.
+
 ### Reliability, subscriptions, and configuration
 
 - Acknowledge durable Telegram alerts per recipient so a failure for one user
