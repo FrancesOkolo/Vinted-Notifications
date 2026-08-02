@@ -646,6 +646,26 @@ def _save_query_preferences(query_id, preferences):
     return db.set_query_preferences(query_id, **preferences)
 
 
+def _ai_deal_query_ids():
+    """Query IDs configured to use AI deal evaluation (CSV parameter)."""
+    ids = set()
+    for part in str(db.get_parameter("deal_ai_query_ids") or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
+def _set_query_ai_deal(query_id, enabled):
+    """Add or remove one query from the AI-deal-evaluation ID list."""
+    ids = _ai_deal_query_ids()
+    if enabled:
+        ids.add(int(query_id))
+    else:
+        ids.discard(int(query_id))
+    db.set_parameter("deal_ai_query_ids", ",".join(str(i) for i in sorted(ids)))
+
+
 @app.route("/queries")
 def queries():
     # Get queries, newest Last Found Item first; Never entries last.
@@ -658,6 +678,7 @@ def queries():
         logger.error("Could not load query preferences for the Queries page.")
         preferences_map = {}
     formatted_queries = []
+    ai_ids = _ai_deal_query_ids()
     for i, query in enumerate(all_queries):
         parsed_query = urlparse(query[1])
         query_params = parse_qs(parsed_query.query)
@@ -706,6 +727,7 @@ def queries():
                 "item_count": item_counts.get(query[0], 0),
                 "filters": _summarise_query_filters(query[1]),
                 **preferences,
+                "deal_ai_enabled": query[0] in ai_ids,
                 "deal_currency_prefix": currency_prefix,
             }
         )
@@ -984,6 +1006,7 @@ def update_query(query_id):
                 query_id, query, name=query_name if query_name != "" else None
             )
             if success and _save_query_preferences(query_id, preferences):
+                _set_query_ai_deal(query_id, "deal_ai_enabled" in request.form)
                 flash("Query updated", "success")
             elif success:
                 flash(

@@ -33,6 +33,20 @@
             Add a deal rating to notifications
         </label>
     </div>
+    {% if prefix == 'edit' %}
+    <div class="form-check mb-2">
+        <input class="form-check-input" type="checkbox" id="{{ prefix }}DealAi"
+               name="deal_ai_enabled">
+        <label class="form-check-label fw-semibold" for="{{ prefix }}DealAi">
+            Use AI deal check (OpenAI)
+        </label>
+        <div class="form-text">
+            Asks OpenAI for an Excellent / Good / Don't-buy verdict on each new
+            item (needs VN_OPENAI_API_KEY set). Overrides the price-ceiling
+            rating when on.
+        </div>
+    </div>
+    {% endif %}
     <div class="row g-3" data-deal-fields hidden>
         <div class="col-sm-4">
             <label for="{{ prefix }}ExcellentMax" class="form-label">Excellent up to</label>
@@ -326,6 +340,10 @@
                                         Deals: ≤ {{ query.deal_currency_prefix }}{{ query.deal_excellent_max }} / ≤ {{ query.deal_currency_prefix }}{{ query.deal_good_max }}
                                     </span>
                                     {% endif %}
+                                    {% if query.deal_ai_enabled %}
+                                    <span class="badge bg-primary ms-1"
+                                          title="AI deal check via OpenAI">AI</span>
+                                    {% endif %}
                                     {% if query.filters %}
                                     <div class="query-filter-chips mt-1">
                                         {% for chip in query.filters %}
@@ -367,7 +385,7 @@
                                                  data-query-deal-enabled="{{ 'true' if query.deal_evaluator_enabled else 'false' }}"
                                                  data-query-deal-excellent="{{ query.deal_excellent_max if query.deal_excellent_max is not none else '' }}"
                                                  data-query-deal-good="{{ query.deal_good_max if query.deal_good_max is not none else '' }}"
-                                                 data-query-deal-currency="{{ query.deal_currency }}">
+                                                 data-query-deal-currency="{{ query.deal_currency }}" data-query-deal-ai="{{ 'true' if query.deal_ai_enabled else 'false' }}">
                                             <i class="bi bi-pencil"></i> Edit
                                         </button>
                                         <button type="button" class="btn btn-sm btn-outline-danger"
@@ -597,6 +615,7 @@
             const editExcellentMax = document.getElementById('editExcellentMax');
             const editGoodMax = document.getElementById('editGoodMax');
             const editDealCurrency = document.getElementById('editDealCurrency');
+            const editDealAi = document.getElementById('editDealAi');
             editQueryModal.addEventListener('show.bs.modal', function (event) {
                 const button = event.relatedTarget;
                 if (!button) {
@@ -611,6 +630,9 @@
                 editExcellentMax.value = button.dataset.queryDealExcellent || '';
                 editGoodMax.value = button.dataset.queryDealGood || '';
                 editDealCurrency.value = button.dataset.queryDealCurrency || 'GBP';
+                if (editDealAi) {
+                    editDealAi.checked = button.dataset.queryDealAi === 'true';
+                }
                 editDealEnabled.dispatchEvent(new Event('change'));
             });
         }
