@@ -100,6 +100,7 @@ VALUES ('telegram_enabled', 'False'),
        ('quiet_hours_start', '01:00'),
        ('quiet_hours_end', '06:00'),
        ('quiet_hours_timezone', 'Europe/London'),
+       ('quiet_hours_days', '0,1,2,3,4,5,6'),
 
        ('proxy_list', ''),
        ('proxy_list_link', ''),

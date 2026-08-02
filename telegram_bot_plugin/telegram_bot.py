@@ -15,21 +15,66 @@ logger = get_logger(__name__)
 # transient blip, so failed sends are retried with backoff before giving up.
 SEND_MAX_ATTEMPTS = 4
 SEND_BACKOFFS = (2, 5, 10)  # seconds to wait before attempts 2, 3, 4
+OUTBOX_MAX_ATTEMPTS = 10
 
 
 def _eligible_outbox_chat_ids(query_id, queued_chat_ids):
-    """Filter a queued item alert against current query and subscription state."""
+    """Filter an alert against current query/subscription state.
+
+    ``None`` means the database state could not be read. Callers must retain
+    the durable row in that case rather than mistaking an operational failure
+    for an intentional pause or unsubscribe.
+    """
     if query_id is None:
         return queued_chat_ids
-    if not db.is_query_enabled(query_id):
+    state = db.get_query_delivery_state(query_id)
+    if state is None:
+        return None
+    enabled, subscribers = state
+    if not enabled:
         return []
 
-    current_subscribers = {str(value) for value in db.get_query_subscribers(query_id)}
+    current_subscribers = {str(value) for value in subscribers}
     return [
         chat_id
         for chat_id in (queued_chat_ids or [])
         if str(chat_id) in current_subscribers
     ]
+
+
+def _defer_outbox_notification(notification_id, attempts):
+    """Back off one failed outbox row without creating a tight retry loop."""
+    attempts = int(attempts or 0) + 1
+    if attempts >= OUTBOX_MAX_ATTEMPTS:
+        if not db.delete_notification(notification_id):
+            logger.error(
+                "Could not remove exhausted notification %s; stopping this "
+                "outbox pass to avoid duplicate delivery.",
+                notification_id,
+            )
+            return False
+        logger.error(
+            "Giving up on notification %s after %s attempts.",
+            notification_id,
+            attempts,
+        )
+        return True
+
+    backoff = min(60 * attempts, 600)
+    if not db.reschedule_notification(notification_id, attempts, time.time() + backoff):
+        logger.error(
+            "Could not reschedule notification %s; stopping this outbox pass "
+            "to avoid an immediate retry loop.",
+            notification_id,
+        )
+        return False
+    logger.warning(
+        "Notification %s not delivered (attempt %s); retrying in %ss.",
+        notification_id,
+        attempts,
+        backoff,
+    )
+    return True
 
 
 def is_retryable_telegram_error(error):
@@ -170,7 +215,12 @@ class LeRobot:
             # job (rather than one long-lived loop) means a network stall or a
             # cancelled tick can only delay a single pass — the next tick always
             # fires, so delivery can never silently stop for the process's life.
-            job_queue.run_repeating(self.drain_outbox, interval=10, first=1)
+            job_queue.run_repeating(
+                self.drain_outbox,
+                interval=10,
+                first=1,
+                job_kwargs={"max_instances": 1, "coalesce": True},
+            )
 
             # drop_pending_updates avoids replaying a backlog of old commands
             # that piled up while the bot was stopped.
@@ -658,13 +708,28 @@ class LeRobot:
             )
         markup = InlineKeyboardMarkup(buttons) if buttons else None
 
+        normalised_chat_ids = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in chat_ids
+                if value is not None and str(value).strip()
+            )
+        )
+        approval_states = {}
+        for chat_id in normalised_chat_ids:
+            approval = db.get_telegram_user_approval_state(chat_id)
+            if approval is None:
+                logger.error(
+                    "Could not verify Telegram approval for chat %s; retaining "
+                    "the notification for a later attempt.",
+                    chat_id,
+                )
+                return None
+            approval_states[chat_id] = approval
+
         all_delivered = True
-        for chat_id in {
-            str(value).strip()
-            for value in chat_ids
-            if value is not None and str(value).strip()
-        }:
-            if not db.is_telegram_user_approved(chat_id):
+        for chat_id in normalised_chat_ids:
+            if not approval_states[chat_id]:
                 logger.info(
                     "Skipping alert for unapproved Telegram chat %s.",
                     chat_id,
@@ -674,8 +739,10 @@ class LeRobot:
             delivered = await self._send_message_with_retries(chat_id, content, markup)
             all_delivered = all_delivered and delivered
 
-        # True when every approved recipient received it (or there were none to
-        # deliver to). The outbox uses this to decide whether to retry.
+        # True when every approved recipient received it (or every supplied
+        # recipient was definitively ineligible), False on a Telegram delivery
+        # failure, and None when approval could not be read. The outbox retains
+        # the recipient unchanged for the latter case.
         return all_delivered
 
     async def unsubscribe_query(
@@ -706,6 +773,12 @@ class LeRobot:
             return
 
         removed = db.remove_query_subscription(query_id, chat_id)
+        if removed is None:
+            await callback.answer(
+                "Could not update this subscription right now. Please try again.",
+                show_alert=True,
+            )
+            return
         await callback.answer(
             (
                 "Unsubscribed from this search."
@@ -750,7 +823,8 @@ class LeRobot:
         added = db.add_query_subscription(query_id, chat_id)
         if added is None:
             await callback.answer(
-                "This search is no longer available.",
+                "Could not resubscribe right now. The search may no longer be "
+                "available; please try again.",
                 show_alert=True,
             )
             return
@@ -919,12 +993,13 @@ class LeRobot:
         Scheduled to run repeatedly (see ``run``), so this is a single finite
         pass rather than an immortal loop. A network stall or a cancelled tick
         can therefore only delay delivery until the next scheduled run — it can
-        never silently kill delivery for the life of the process. Rows are
-        removed on success; a failed row is retried later with backoff and
-        dropped after too many attempts, and because the outbox lives in the
-        database, undelivered notifications survive a restart.
+        never silently kill delivery for the life of the process. Each
+        recipient is acknowledged in SQLite immediately after a successful
+        send. If another recipient fails, only that failed recipient remains for
+        the retry, preventing duplicate alerts to people who already received
+        the message. Because the outbox lives in the database, undelivered
+        notifications survive a restart.
         """
-        max_attempts = 10
         while True:
             try:
                 due = db.get_due_notifications(limit=10)
@@ -944,13 +1019,65 @@ class LeRobot:
                 query_id,
                 attempts,
             ) in due:
-                try:
-                    chat_ids = json.loads(chat_ids_json) if chat_ids_json else None
-                except (TypeError, ValueError):
-                    chat_ids = None
+                if chat_ids_json is None:
+                    configured_chat_id = db.get_parameter("telegram_chat_id")
+                    if not configured_chat_id:
+                        logger.error(
+                            "Notification %s has no stored recipients and no "
+                            "configured fallback recipient.",
+                            notif_id,
+                        )
+                        if not _defer_outbox_notification(notif_id, attempts):
+                            return
+                        continue
+                    chat_ids = [configured_chat_id]
+                else:
+                    try:
+                        chat_ids = json.loads(chat_ids_json)
+                    except (TypeError, ValueError):
+                        logger.error(
+                            "Notification %s has invalid recipient data; retaining "
+                            "it without guessing a replacement recipient.",
+                            notif_id,
+                        )
+                        if not _defer_outbox_notification(notif_id, attempts):
+                            return
+                        continue
+
+                if not isinstance(chat_ids, (list, str, int)) or isinstance(
+                    chat_ids, bool
+                ):
+                    logger.error(
+                        "Notification %s has an unsupported recipient format; "
+                        "retaining it without attempting delivery.",
+                        notif_id,
+                    )
+                    if not _defer_outbox_notification(notif_id, attempts):
+                        return
+                    continue
+
+                if isinstance(chat_ids, (str, int)):
+                    chat_ids = [chat_ids]
+
+                # Normalise legacy rows and discard duplicate/empty recipients.
+                chat_ids = list(
+                    dict.fromkeys(
+                        str(value).strip()
+                        for value in chat_ids
+                        if value is not None and str(value).strip()
+                    )
+                )
 
                 if query_id is not None:
-                    chat_ids = _eligible_outbox_chat_ids(query_id, chat_ids)
+                    eligible_chat_ids = _eligible_outbox_chat_ids(query_id, chat_ids)
+                    if eligible_chat_ids is None:
+                        logger.error(
+                            "Could not verify recipients for notification %s; "
+                            "retaining it for the next outbox pass.",
+                            notif_id,
+                        )
+                        return
+                    chat_ids = eligible_chat_ids
                     if not chat_ids:
                         logger.info(
                             "Dropping queued notification %s because query %s "
@@ -958,63 +1085,103 @@ class LeRobot:
                             notif_id,
                             query_id,
                         )
-                        db.delete_notification(notif_id)
-                        continue
-
-                try:
-                    delivered = await asyncio.wait_for(
-                        self.send_new_post(
-                            content,
-                            url,
-                            button_text,
-                            chat_ids=chat_ids,
-                            query_id=query_id,
-                        ),
-                        timeout=self._OUTBOX_SEND_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Delivery of notification %s timed out after %ss; "
-                        "will retry.",
-                        notif_id,
-                        self._OUTBOX_SEND_TIMEOUT,
-                    )
-                    delivered = False
-                except Exception as error:
+                recipients_saved = db.set_notification_recipients(notif_id, chat_ids)
+                if recipients_saved is None:
                     logger.error(
-                        "Unexpected error delivering notification %s: %s",
+                        "Could not persist eligible recipients for notification %s; "
+                        "stopping this outbox pass.",
                         notif_id,
-                        error,
-                        exc_info=True,
                     )
-                    delivered = False
-
-                if delivered:
-                    db.delete_notification(notif_id)
+                    return
+                if not recipients_saved or not chat_ids:
                     continue
 
-                attempts += 1
-                if attempts >= max_attempts:
-                    logger.error(
-                        "Giving up on notification %s after %s attempts.",
-                        notif_id,
-                        attempts,
+                remaining_count = len(chat_ids)
+                for chat_id in chat_ids:
+                    # Subscription state can change while a multi-recipient row
+                    # is being delivered. Drop a recipient that became ineligible
+                    # before their individual send.
+                    current_eligibility = (
+                        _eligible_outbox_chat_ids(query_id, [chat_id])
+                        if query_id is not None
+                        else [chat_id]
                     )
-                    db.delete_notification(notif_id)
-                else:
-                    backoff = min(60 * attempts, 600)
-                    db.reschedule_notification(
-                        notif_id, attempts, time.time() + backoff
-                    )
-                    logger.warning(
-                        "Notification %s not delivered (attempt %s); "
-                        "retrying in %ss.",
-                        notif_id,
-                        attempts,
-                        backoff,
-                    )
+                    if current_eligibility is None:
+                        logger.error(
+                            "Could not recheck recipient %s for notification %s; "
+                            "retaining it for the next outbox pass.",
+                            chat_id,
+                            notif_id,
+                        )
+                        return
+                    if not current_eligibility:
+                        remaining_count = db.ack_notification_recipient(
+                            notif_id, chat_id
+                        )
+                        if remaining_count is None:
+                            logger.error(
+                                "Could not acknowledge removed recipient for "
+                                "notification %s; stopping this outbox pass.",
+                                notif_id,
+                            )
+                            return
+                        continue
+
+                    try:
+                        delivered = await asyncio.wait_for(
+                            self.send_new_post(
+                                content,
+                                url,
+                                button_text,
+                                chat_ids=[chat_id],
+                                query_id=query_id,
+                            ),
+                            timeout=self._OUTBOX_SEND_TIMEOUT,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Delivery of notification %s timed out after %ss; "
+                            "will retry this recipient.",
+                            notif_id,
+                            self._OUTBOX_SEND_TIMEOUT,
+                        )
+                        delivered = False
+                    except Exception as error:
+                        logger.error(
+                            "Unexpected error delivering notification %s: %s",
+                            notif_id,
+                            error,
+                            exc_info=True,
+                        )
+                        delivered = False
+
+                    if delivered is None:
+                        logger.error(
+                            "Could not verify recipient approval for notification "
+                            "%s; retaining it unchanged for the next outbox pass.",
+                            notif_id,
+                        )
+                        return
+                    if delivered:
+                        remaining_count = db.ack_notification_recipient(
+                            notif_id, chat_id
+                        )
+                        if remaining_count is None:
+                            logger.error(
+                                "Telegram accepted notification %s but its "
+                                "recipient acknowledgement could not be saved; "
+                                "stopping this outbox pass.",
+                                notif_id,
+                            )
+                            return
+
+                if remaining_count <= 0:
+                    continue
+
+                if not _defer_outbox_notification(notif_id, attempts):
+                    return
 
     async def set_commands(self, context: ContextTypes.DEFAULT_TYPE):
         try:

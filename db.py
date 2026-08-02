@@ -57,6 +57,18 @@ def create_or_update_sqlite_db(db_path):
             conn.close()
 
 
+def next_database_migration(current_version, migration_files):
+    """Select the one migration whose source version matches exactly."""
+    prefix = f"{current_version}_"
+    matches = sorted(name for name in migration_files if name.startswith(prefix))
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Ambiguous database migrations for version {current_version}: "
+            + ", ".join(matches)
+        )
+    return matches[0] if matches else None
+
+
 def is_item_in_db_by_id(id):
     conn = None
     try:
@@ -500,6 +512,7 @@ def migrate_quiet_hours_schema():
                 ("quiet_hours_start", "01:00"),
                 ("quiet_hours_end", "06:00"),
                 ("quiet_hours_timezone", "Europe/London"),
+                ("quiet_hours_days", "0,1,2,3,4,5,6"),
             ],
         )
         conn.commit()
@@ -521,9 +534,11 @@ def migrate_multi_user_schema():
     """
     Create the multi-user Telegram tables for an existing installation.
 
-    The configured telegram_chat_id is treated as the administrator and
-    is subscribed to every existing query that currently has no subscribers.
-    This migration is idempotent and may be run safely on every start.
+    The configured telegram_chat_id is treated as the administrator. On the
+    first successful legacy migration only, existing queries without an owner
+    are subscribed to that administrator. The one-time marker is important:
+    later Telegram unsubscribes intentionally leave a query globally available
+    for the Web UI/RSS and must not be silently reversed on restart.
     """
     conn = None
     try:
@@ -564,6 +579,13 @@ def migrate_multi_user_schema():
         cursor.execute("SELECT value FROM parameters WHERE key='telegram_chat_id'")
         row = cursor.fetchone()
         admin_chat_id = str(row[0]).strip() if row and row[0] is not None else ""
+        cursor.execute(
+            "SELECT value FROM parameters " "WHERE key='multi_user_orphans_migrated'"
+        )
+        migration_row = cursor.fetchone()
+        orphans_migrated = bool(
+            migration_row and str(migration_row[0]).strip().lower() == "true"
+        )
 
         if admin_chat_id:
             # Exactly one configured administrator is allowed. A previous
@@ -588,28 +610,34 @@ def migrate_multi_user_schema():
                 """,
                 (admin_chat_id,),
             )
+
+            if not orphans_migrated:
+                # Preserve searches that predate multi-user support by assigning
+                # only genuinely unowned rows to the configured primary account.
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO query_subscriptions (query_id, chat_id)
+                    SELECT q.id, ?
+                    FROM queries q
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM query_subscriptions s
+                        WHERE s.query_id = q.id
+                    )
+                    """,
+                    (admin_chat_id,),
+                )
+                cursor.execute("""
+                    INSERT INTO parameters (key, value)
+                    VALUES ('multi_user_orphans_migrated', 'True')
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """)
         else:
             cursor.execute("""
                 UPDATE telegram_users
                 SET is_admin=0, updated_at=CURRENT_TIMESTAMP
                 WHERE is_admin=1
                 """)
-
-            # Preserve all existing searches by assigning otherwise-unowned
-            # queries to the configured primary Telegram account.
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO query_subscriptions (query_id, chat_id)
-                SELECT q.id, ?
-                FROM queries q
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM query_subscriptions s
-                    WHERE s.query_id = q.id
-                )
-                """,
-                (admin_chat_id,),
-            )
 
         conn.commit()
         return True
@@ -861,6 +889,30 @@ def is_telegram_user_approved(chat_id):
     return bool(user and user[2] == "approved")
 
 
+def get_telegram_user_approval_state(chat_id):
+    """Return strict Telegram approval state for delivery decisions.
+
+    ``True`` means the account is approved, ``False`` means it is definitely
+    missing/pending/revoked, and ``None`` means SQLite could not be read.  The
+    durable outbox must retain a recipient when this returns ``None`` rather
+    than treating a temporary database problem as an intentional revocation.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT status FROM telegram_users WHERE chat_id=?",
+            (str(chat_id),),
+        ).fetchone()
+        return bool(row and row[0] == "approved")
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
 def is_telegram_user_admin(chat_id):
     user = get_telegram_user(chat_id)
     return bool(user and user[2] == "approved" and int(user[3]) == 1)
@@ -1056,6 +1108,43 @@ def get_query_subscribers(query_id):
             conn.close()
 
 
+def get_query_delivery_state(query_id):
+    """Return ``(enabled, approved_subscribers)`` for outbox filtering.
+
+    Unlike the older convenience getters, ``None`` means the database could
+    not be read. Delivery code must distinguish that operational failure from
+    an intentionally paused query or a query with no subscribers; otherwise a
+    transient SQLite error could delete a durable notification.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT enabled FROM queries WHERE id=?",
+            (query_id,),
+        ).fetchone()
+        if row is None:
+            return False, []
+
+        subscribers = conn.execute(
+            """
+            SELECT s.chat_id
+            FROM query_subscriptions s
+            JOIN telegram_users u ON u.chat_id=s.chat_id
+            WHERE s.query_id=? AND u.status='approved'
+            ORDER BY u.is_admin DESC, s.created_at
+            """,
+            (query_id,),
+        ).fetchall()
+        return bool(row[0]), [value[0] for value in subscribers]
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
 def add_query_subscription(query_id, chat_id):
     """Subscribe an approved Telegram user to an existing shared query.
 
@@ -1175,8 +1264,11 @@ def get_query_id_by_rowid(rowid, chat_id=None):
 
 def remove_query_subscription(query_id, chat_id):
     """
-    Unsubscribe one user. If no subscribers remain, delete the query and
-    its stored items to avoid continuing to scrape an unused search.
+    Unsubscribe one Telegram user without deleting the shared query.
+
+    Queries are also managed by the Web UI and may feed RSS, so a personal
+    unsubscribe must not destroy the global search or its item history. Global
+    deletion remains available through remove_query_from_db.
     """
     conn = None
     try:
@@ -1192,30 +1284,20 @@ def remove_query_subscription(query_id, chat_id):
         )
         removed = cursor.rowcount > 0
 
-        if removed:
-            cursor.execute(
-                """
-                SELECT COUNT(*)
-                FROM query_subscriptions
-                WHERE query_id=?
-                """,
-                (query_id,),
-            )
-            if cursor.fetchone()[0] == 0:
-                cursor.execute("DELETE FROM items WHERE query_id=?", (query_id,))
-                cursor.execute("DELETE FROM queries WHERE id=?", (query_id,))
-
         conn.commit()
         return removed
     except Exception:
+        if conn:
+            conn.rollback()
         print_exc()
-        return False
+        return None
     finally:
         if conn:
             conn.close()
 
 
 def remove_all_query_subscriptions(chat_id):
+    """Unsubscribe one Telegram user from every query, preserving queries."""
     conn = None
     try:
         conn = get_db_connection()
@@ -1223,32 +1305,9 @@ def remove_all_query_subscriptions(chat_id):
         chat_id = str(chat_id)
 
         cursor.execute(
-            """
-            SELECT query_id
-            FROM query_subscriptions
-            WHERE chat_id=?
-            """,
-            (chat_id,),
-        )
-        query_ids = [row[0] for row in cursor.fetchall()]
-
-        cursor.execute(
             "DELETE FROM query_subscriptions WHERE chat_id=?",
             (chat_id,),
         )
-
-        for query_id in query_ids:
-            cursor.execute(
-                """
-                SELECT COUNT(*)
-                FROM query_subscriptions
-                WHERE query_id=?
-                """,
-                (query_id,),
-            )
-            if cursor.fetchone()[0] == 0:
-                cursor.execute("DELETE FROM items WHERE query_id=?", (query_id,))
-                cursor.execute("DELETE FROM queries WHERE id=?", (query_id,))
 
         conn.commit()
         return True
@@ -1499,33 +1558,155 @@ def migrate_pending_notifications_table():
             conn.close()
 
 
+def _normalise_notification_chat_ids(chat_ids):
+    """Return unique, non-empty recipient IDs while preserving their order."""
+    if isinstance(chat_ids, (str, int)):
+        chat_ids = [chat_ids]
+    seen = set()
+    normalised = []
+    for value in chat_ids or []:
+        chat_id = str(value).strip()
+        if chat_id and chat_id not in seen:
+            seen.add(chat_id)
+            normalised.append(chat_id)
+    return normalised
+
+
+def _insert_notification(
+    cursor,
+    content,
+    url,
+    button_text,
+    chat_ids,
+    query_id=None,
+):
+    """Insert an outbox row using an existing transaction/cursor."""
+    recipients = _normalise_notification_chat_ids(chat_ids)
+    chat_ids_json = json.dumps(recipients) if recipients else None
+    cursor.execute(
+        """
+        INSERT INTO pending_notifications
+            (
+                content, url, button_text, chat_ids, query_id,
+                attempts, next_attempt_at
+            )
+        VALUES (?, ?, ?, ?, ?, 0, ?)
+        """,
+        (
+            content,
+            url,
+            button_text,
+            chat_ids_json,
+            query_id,
+            time.time(),
+        ),
+    )
+    return cursor.lastrowid
+
+
+def persist_item_and_notification(
+    *,
+    id,
+    title,
+    query_id,
+    price,
+    timestamp,
+    photo_url,
+    currency,
+    content,
+    notification_url,
+    button_text,
+):
+    """Atomically mark an item seen and queue its Telegram notification.
+
+    Returns ``(True, recipients)`` after a successful commit,
+    ``(False, [])`` if the query disappeared or was paused before commit, and
+    ``None`` on a database failure.  Combining subscriber lookup, outbox
+    insertion, item insertion, and ``last_item`` advancement prevents either a
+    lost alert or a duplicate outbox row across a crash boundary.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+
+        query = cursor.execute(
+            "SELECT enabled FROM queries WHERE id=?",
+            (query_id,),
+        ).fetchone()
+        if query is None or not bool(query[0]):
+            conn.rollback()
+            return False, []
+
+        recipients = [
+            row[0]
+            for row in cursor.execute(
+                """
+                SELECT s.chat_id
+                FROM query_subscriptions s
+                JOIN telegram_users u ON u.chat_id=s.chat_id
+                WHERE s.query_id=? AND u.status='approved'
+                ORDER BY u.is_admin DESC, s.created_at
+                """,
+                (query_id,),
+            ).fetchall()
+        ]
+
+        cursor.execute(
+            """
+            INSERT INTO items
+                (item, title, price, currency, timestamp, photo_url, query_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (id, title, price, currency, timestamp, photo_url, query_id),
+        )
+        if recipients:
+            _insert_notification(
+                cursor,
+                content,
+                notification_url,
+                button_text,
+                recipients,
+                query_id=query_id,
+            )
+
+        cursor.execute(
+            "UPDATE queries SET last_item=? WHERE id=?",
+            (timestamp, query_id),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.OperationalError("query disappeared while persisting item")
+
+        conn.commit()
+        return True, recipients
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
 def enqueue_notification(content, url, button_text, chat_ids, query_id=None):
     """Persist one Telegram notification for delivery. Returns the new row id."""
     conn = None
     try:
-        chat_ids_json = json.dumps([str(c) for c in chat_ids]) if chat_ids else None
+        recipients = _normalise_notification_chat_ids(chat_ids)
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO pending_notifications
-                (
-                    content, url, button_text, chat_ids, query_id,
-                    attempts, next_attempt_at
-                )
-            VALUES (?, ?, ?, ?, ?, 0, ?)
-            """,
-            (
-                content,
-                url,
-                button_text,
-                chat_ids_json,
-                query_id,
-                time.time(),
-            ),
+        notification_id = _insert_notification(
+            cursor,
+            content,
+            url,
+            button_text,
+            recipients,
+            query_id=query_id,
         )
         conn.commit()
-        return cursor.lastrowid
+        return notification_id
     except Exception:
         print_exc()
         return None
@@ -1598,6 +1779,91 @@ def reschedule_notification(notification_id, attempts, next_attempt_at):
     except Exception:
         print_exc()
         return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_notification_recipients(notification_id, chat_ids):
+    """Persist the recipients still eligible for one queued notification.
+
+    An empty recipient list removes the row. Returns True when the row was
+    updated/deleted, False when it no longer exists, and None on database error.
+    """
+    conn = None
+    try:
+        recipients = _normalise_notification_chat_ids(chat_ids)
+        conn = get_db_connection()
+        if recipients:
+            cursor = conn.execute(
+                "UPDATE pending_notifications SET chat_ids=? WHERE id=?",
+                (json.dumps(recipients), notification_id),
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM pending_notifications WHERE id=?",
+                (notification_id,),
+            )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def ack_notification_recipient(notification_id, chat_id):
+    """Atomically acknowledge one successful recipient delivery.
+
+    Returns the number of recipients still queued, zero when the row is gone,
+    and None on database error. Immediate acknowledgement prevents a failure
+    for one Telegram user from resending the alert to users who received it.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT chat_ids FROM pending_notifications WHERE id=?",
+            (notification_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return 0
+
+        try:
+            stored = json.loads(row[0]) if row[0] else []
+        except (TypeError, ValueError):
+            conn.rollback()
+            return None
+
+        target = str(chat_id).strip()
+        remaining = [
+            value
+            for value in _normalise_notification_chat_ids(stored)
+            if value != target
+        ]
+        if remaining:
+            conn.execute(
+                "UPDATE pending_notifications SET chat_ids=? WHERE id=?",
+                (json.dumps(remaining), notification_id),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM pending_notifications WHERE id=?",
+                (notification_id,),
+            )
+        conn.commit()
+        return len(remaining)
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return None
     finally:
         if conn:
             conn.close()

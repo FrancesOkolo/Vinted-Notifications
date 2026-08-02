@@ -134,6 +134,8 @@ def process_remove_query(number, chat_id=None):
         )
 
     success = db.remove_query_subscription(query_id, chat_id)
+    if success is None:
+        return "Could not update your subscription. Please try again.", False
     return (
         ("Query removed from your account.", True)
         if success
@@ -338,10 +340,17 @@ def get_quiet_hours_status(now=None):
     else:
         active = current >= start or current < end
 
-    # Restrict quiet hours to the configured days of the week when the date is
-    # known (e.g. leave Sat/Sun unchecked to keep weekends noisy).
+    # Restrict quiet hours to the configured *start* days when the date is
+    # known. For a window crossing midnight, the after-midnight portion belongs
+    # to the previous day's schedule (Friday 23:00-06:00 therefore remains
+    # quiet until Saturday 06:00).
     if active and weekday is not None:
-        if weekday not in _parse_quiet_days(db.get_parameter("quiet_hours_days")):
+        schedule_weekday = weekday
+        if start > end and current < end:
+            schedule_weekday = (weekday - 1) % 7
+        if schedule_weekday not in _parse_quiet_days(
+            db.get_parameter("quiet_hours_days")
+        ):
             active = False
 
     return active, start_text, end_text, timezone_name
@@ -374,14 +383,20 @@ def _get_retry_after_seconds(response, fallback_seconds):
         return fallback_seconds
 
 
-def _get_query_spacing_seconds(query_count):
+def _get_query_spacing_seconds(query_count, refresh_delay=None):
     if query_count <= 1:
         return 0.0
 
-    try:
-        refresh_delay = int(db.get_parameter("query_refresh_delay") or 600)
-    except (TypeError, ValueError):
-        refresh_delay = 600
+    if refresh_delay is None:
+        try:
+            refresh_delay = int(db.get_parameter("query_refresh_delay") or 600)
+        except (TypeError, ValueError):
+            refresh_delay = 600
+    else:
+        try:
+            refresh_delay = int(refresh_delay)
+        except (TypeError, ValueError):
+            refresh_delay = 600
 
     # Pace requests during roughly the first half of the configured interval,
     # then leave a real idle period before the next cycle. The previous
@@ -988,23 +1003,41 @@ def clear_item_queue(items_queue, new_items_queue):
                         exc_info=True,
                     )
                     content = db.DEFAULT_MESSAGE_TEMPLATE.format(**format_values)
-                # Route this alert only to approved subscribers of the
-                # matching query. One query may notify several accounts.
-                subscriber_chat_ids = db.get_query_subscribers(query_id)
-
-                # Persist the Telegram notification to the durable outbox BEFORE
-                # the item is marked "seen" below, so a crash or restart between
-                # finding and delivering it cannot lose the alert. The Telegram
-                # bot drains the outbox and retries until delivered.
-                if subscriber_chat_ids:
-                    db.enqueue_notification(
-                        content,
-                        item.url,
-                        "Open Vinted",
-                        subscriber_chat_ids,
-                        query_id=query_id,
+                # Subscriber lookup, durable Telegram outbox insertion, item
+                # insertion, and last-item advancement are one SQLite
+                # transaction. If any step fails, none of them is committed and
+                # the item remains eligible for discovery on the next cycle.
+                persistence = db.persist_item_and_notification(
+                    id=item.id,
+                    timestamp=item.raw_timestamp,
+                    price=item.price,
+                    title=item.title,
+                    photo_url=item.photo,
+                    query_id=query_id,
+                    currency=item.currency,
+                    content=content,
+                    notification_url=item.url,
+                    button_text="Open Vinted",
+                )
+                if persistence is None:
+                    logger.error(
+                        "Could not persist item %s and its notification; "
+                        "stopping this query batch so it can be retried.",
+                        item.id,
                     )
-                else:
+                    break
+
+                persisted, subscriber_chat_ids = persistence
+                if not persisted:
+                    logger.info(
+                        "Stopping queued item processing because query %s was "
+                        "paused or removed before item %s could be persisted.",
+                        query_id,
+                        item.id,
+                    )
+                    break
+
+                if not subscriber_chat_ids:
                     logger.warning(
                         "No approved Telegram subscribers for query %s; "
                         "the item will still be available to RSS.",
@@ -1022,16 +1055,6 @@ def clear_item_queue(items_queue, new_items_queue):
                         None,
                         subscriber_chat_ids,
                     )
-                )
-                # Mark the item as seen only after it has been persisted above.
-                db.add_item_to_db(
-                    id=item.id,
-                    timestamp=item.raw_timestamp,
-                    price=item.price,
-                    title=item.title,
-                    photo_url=item.photo,
-                    query_id=query_id,
-                    currency=item.currency,
                 )
 
 
@@ -1055,10 +1078,18 @@ def contains_banwords(title, banwords_str):
     if not banwords:
         return False
 
-    # Check if any banword is in the title (case-insensitive)
+    # Check if any banword matches the title (case-insensitive). A banword
+    # containing '+' (e.g. "empty+box") is an AND-rule: it matches only when
+    # every '+'-separated term appears somewhere in the title, in any order.
+    # That catches split phrases like "Empty ... Box" without banning "empty"
+    # alone (which would wrongly hit a vacuum's "self-empty station").
     title_lower = title.lower()
     for word in banwords:
-        if word in title_lower:
+        if "+" in word:
+            terms = [term.strip() for term in word.split("+") if term.strip()]
+            if terms and all(term in title_lower for term in terms):
+                return True
+        elif word in title_lower:
             return True
 
     return False

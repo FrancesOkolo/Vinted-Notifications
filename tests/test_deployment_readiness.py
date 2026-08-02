@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import queue
 import re
@@ -38,6 +39,22 @@ def _basic_header(username="admin", password="correct-horse"):
     return {"Authorization": f"Basic {value}"}
 
 
+def test_database_migration_selection_matches_the_exact_source_version():
+    files = [
+        "1.0.5.1_1.0.5.2.sql",
+        "1.0.5_1.0.5.1.sql",
+        "1.0.5.2_1.0.5.3.sql",
+    ]
+    assert db.next_database_migration("1.0.5", files) == "1.0.5_1.0.5.1.sql"
+    assert db.next_database_migration("1.0.5.1", files) == ("1.0.5.1_1.0.5.2.sql")
+
+    with pytest.raises(RuntimeError, match="Ambiguous database migrations"):
+        db.next_database_migration(
+            "1.0.5",
+            ["1.0.5_1.0.5.1.sql", "1.0.5_2.0.0.sql"],
+        )
+
+
 def test_url_normalisation_preserves_repeated_filters():
     result = normalise_vinted_url(
         "https://www.vinted.co.uk/catalog?size_ids[]=2&size_ids[]=3&page=9&utm_source=x"
@@ -73,6 +90,24 @@ def test_quiet_hours_day_parsing():
     assert core._parse_quiet_days("0, 1, 9, x") == {0, 1}  # ignores out-of-range/junk
 
 
+def test_quiet_hours_migration_adds_default_and_preserves_saved_days(database):
+    conn = db.get_db_connection()
+    try:
+        conn.execute("DELETE FROM parameters WHERE key='quiet_hours_days'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert db.migrate_quiet_hours_schema()
+    assert db.get_parameter("quiet_hours_days") == "0,1,2,3,4,5,6"
+
+    for saved_value in ("0,4", ""):
+        db.set_parameter("quiet_hours_days", saved_value)
+        assert db.migrate_quiet_hours_schema()
+        assert db.migrate_quiet_hours_schema()
+        assert db.get_parameter("quiet_hours_days") == saved_value
+
+
 def test_quiet_hours_respects_days_of_week(database, monkeypatch):
     core = _core()
     from datetime import datetime, timedelta
@@ -102,6 +137,50 @@ def test_quiet_hours_respects_days_of_week(database, monkeypatch):
     assert core.get_quiet_hours_status(wednesday.replace(hour=12))[0] is False
 
 
+def test_overnight_quiet_hours_belong_to_the_day_the_window_starts(
+    database, monkeypatch
+):
+    core = _core()
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    values = {
+        "quiet_hours_enabled": "True",
+        "quiet_hours_start": "23:00",
+        "quiet_hours_end": "06:00",
+        "quiet_hours_timezone": "Europe/London",
+        "quiet_hours_days": "0,1,2,3,4",  # nights starting Mon-Fri
+    }
+    monkeypatch.setattr(core.db, "get_parameter", values.get)
+
+    tz = ZoneInfo("Europe/London")
+    friday = datetime(2026, 7, 3, 23, 30, tzinfo=tz)
+    while friday.weekday() != 4:
+        friday += timedelta(days=1)
+
+    assert core.get_quiet_hours_status(friday)[0] is True
+    assert (
+        core.get_quiet_hours_status(
+            (friday + timedelta(days=1)).replace(hour=5, minute=59)
+        )[0]
+        is True
+    )
+    assert (
+        core.get_quiet_hours_status(
+            (friday + timedelta(days=1)).replace(hour=6, minute=0)
+        )[0]
+        is False
+    )
+    # Saturday night and the early hours of Monday belong to excluded weekend
+    # start days; Monday becomes quiet only once Monday night's window begins.
+    saturday_night = (friday + timedelta(days=1)).replace(hour=23, minute=30)
+    monday_early = (friday + timedelta(days=3)).replace(hour=2, minute=0)
+    monday_night = monday_early.replace(hour=23, minute=30)
+    assert core.get_quiet_hours_status(saturday_night)[0] is False
+    assert core.get_quiet_hours_status(monday_early)[0] is False
+    assert core.get_quiet_hours_status(monday_night)[0] is True
+
+
 def test_config_save_stores_quiet_hours_days(database, monkeypatch):
     import web_ui_plugin.web_ui as web
 
@@ -109,9 +188,11 @@ def test_config_save_stores_quiet_hours_days(database, monkeypatch):
         web.core, "check_version", lambda: (True, "t", "t", "https://x/y")
     )
     client = web.app.test_client()
-    token = re.search(
-        rb'name="_csrf_token" value="([^"]+)"', client.get("/config").data
-    ).group(1).decode()
+    token = (
+        re.search(rb'name="_csrf_token" value="([^"]+)"', client.get("/config").data)
+        .group(1)
+        .decode()
+    )
 
     base = {
         "_csrf_token": token,
@@ -155,6 +236,75 @@ def test_admin_rotation_leaves_exactly_one_administrator(database):
     assert admins == ["333"]
     assert db.is_telegram_user_approved("111")
     assert not db.is_telegram_user_admin("111")
+
+
+def test_legacy_orphan_queries_are_assigned_to_admin_only_once(database):
+    conn = db.get_db_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO queries (query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=legacy", "Legacy"),
+        )
+        query_id = cursor.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.set_parameter("telegram_chat_id", "111")
+    assert db.migrate_multi_user_schema()
+    assert db.get_query_subscribers(query_id) == ["111"]
+    assert db.get_parameter("multi_user_orphans_migrated") == "True"
+
+    # A later personal unsubscribe is intentional and must not be undone by
+    # the idempotent startup migration.
+    assert db.remove_query_subscription(query_id, "111")
+    assert db.get_query_subscribers(query_id) == []
+    assert db.migrate_multi_user_schema()
+    assert db.get_query_subscribers(query_id) == []
+
+
+def test_remove_all_subscriptions_preserves_shared_queries_and_items(database):
+    db.set_parameter("telegram_chat_id", "111")
+    assert db.migrate_multi_user_schema()
+    query_id, _, _ = db.add_query_to_db(
+        normalise_vinted_url(
+            "https://www.vinted.co.uk/catalog?search_text=shared-history"
+        ),
+        name="Shared history",
+        chat_id="111",
+    )
+    conn = db.get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO items
+                (item, title, price, currency, timestamp, photo_url, query_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (123, "Saved item", 10, "GBP", 1, "", query_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert db.remove_all_query_subscriptions("111")
+    assert db.get_query_subscribers(query_id) == []
+    conn = db.get_db_connection()
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM queries WHERE id=?", (query_id,)
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM items WHERE query_id=?", (query_id,)
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
 
 
 def test_shared_query_is_created_once_for_multiple_users(database):
@@ -257,7 +407,7 @@ def test_duplicate_migration_preserves_items_and_subscriptions(tmp_path, monkeyp
         conn.close()
 
 
-def test_rss_dispatches_when_no_telegram_subscribers(database, monkeypatch):
+def test_rss_dispatches_when_no_telegram_subscribers(database):
     core = _core()
 
     class Item:
@@ -273,26 +423,39 @@ def test_rss_dispatches_when_no_telegram_subscribers(database, monkeypatch):
         raw_timestamp = 100
         raw_data = {"user": {"id": 1}}
 
-    parameters = {
-        "banwords": "",
-        "message_template": db.DEFAULT_MESSAGE_TEMPLATE,
-    }
-    monkeypatch.setattr(core.db, "get_parameter", parameters.get)
-    monkeypatch.setattr(core.db, "get_last_timestamp", lambda query_id: None)
-    monkeypatch.setattr(core.db, "is_item_in_db_by_id", lambda item_id: False)
-    monkeypatch.setattr(core.db, "get_allowlist", lambda: 0)
-    monkeypatch.setattr(core.db, "is_query_enabled", lambda query_id: True)
-    monkeypatch.setattr(core.db, "get_query_subscribers", lambda query_id: [])
-    monkeypatch.setattr(core.db, "add_item_to_db", lambda **kwargs: None)
+    assert db.migrate_pending_notifications_table()
+    db.set_parameter("banwords", "")
+    db.set_parameter("message_template", db.DEFAULT_MESSAGE_TEMPLATE)
+    conn = db.get_db_connection()
+    try:
+        query_id = conn.execute(
+            "INSERT INTO queries (query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=rss-only", "RSS only"),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
 
     source = queue.Queue()
     destination = queue.Queue()
-    source.put(([Item()], 1))
+    source.put(([Item()], query_id))
     core.clear_item_queue(source, destination)
 
     dispatched = destination.get_nowait()
     assert len(dispatched) == 6
     assert dispatched[5] == []
+    assert db.count_pending_notifications() == 0
+    conn = db.get_db_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT last_item FROM queries WHERE id=?", (query_id,)
+            ).fetchone()[0]
+            == 100
+        )
+    finally:
+        conn.close()
 
 
 def test_item_description_uses_browser_navigation_headers(database, monkeypatch):
@@ -528,9 +691,7 @@ def test_requester_uses_one_bounded_retry_for_block_responses(
     assert response.status_code == status_code
     assert client.session.calls == expected_calls
     assert waits == (
-        [requester_module.FORBIDDEN_RETRY_DELAY_SECONDS]
-        if status_code == 403
-        else []
+        [requester_module.FORBIDDEN_RETRY_DELAY_SECONDS] if status_code == 403 else []
     )
 
 
@@ -662,10 +823,34 @@ def test_requester_gives_up_after_persistent_connection_resets(
     with pytest.raises(requests.exceptions.ConnectionError):
         client.get("https://www.vinted.co.uk/api/v2/catalog/items")
 
+    assert client.session.calls == requester_module.CONNECTION_RESET_MAX_RETRIES + 1
+
+
+def test_contains_banwords_supports_and_syntax(database):
+    core = _core()
+    banwords = "empty+box|||empty+bottle|||box only"
+
+    # AND-rule ("a+b"): every term must be present, in any order/position, so a
+    # split phrase like "Empty ... Box" is caught.
     assert (
-        client.session.calls
-        == requester_module.CONNECTION_RESET_MAX_RETRIES + 1
+        core.contains_banwords("Empty Penhaligons The Favourite Box", banwords) is True
     )
+    assert core.contains_banwords("Jo Malone empty box", banwords) is True
+    assert core.contains_banwords("Empty fragrance bottle", banwords) is True
+
+    # A plain (non-'+') banword still matches as a substring.
+    assert core.contains_banwords("iPhone box only, no phone", banwords) is True
+
+    # The AND-rule must NOT over-match: "empty" without "box"/"bottle" is kept,
+    # so legitimate robot-vacuum listings survive.
+    assert (
+        core.contains_banwords("Eufy Robot Vacuum with Self-Empty Station", banwords)
+        is False
+    )
+    assert core.contains_banwords("robot with auto empty bin", banwords) is False
+
+    # Unrelated titles are untouched.
+    assert core.contains_banwords("Karen Millen dress size 12", banwords) is False
 
 
 def test_query_spacing_leaves_idle_time_between_scrape_cycles(
@@ -1094,6 +1279,300 @@ def test_notification_outbox_persists_and_retries(database):
     assert {row[0] for row in db.get_due_notifications(limit=10)} == {second}
 
 
+def test_notification_outbox_acknowledges_each_recipient(database):
+    assert db.migrate_pending_notifications_table()
+    notification_id = db.enqueue_notification(
+        "hello",
+        "http://x",
+        "Open",
+        ["111", "222", "111"],
+    )
+
+    assert db.ack_notification_recipient(notification_id, "111") == 1
+    row = db.get_due_notifications(limit=10)[0]
+    assert json.loads(row[4]) == ["222"]
+    assert db.count_pending_notifications() == 1
+
+    assert db.ack_notification_recipient(notification_id, "222") == 0
+    assert db.count_pending_notifications() == 0
+
+
+def test_strict_telegram_approval_state_distinguishes_database_errors(
+    database, monkeypatch
+):
+    db.set_parameter("telegram_chat_id", "111")
+    assert db.migrate_multi_user_schema()
+    assert db.get_telegram_user_approval_state("111") is True
+
+    assert db.register_telegram_user("222", "Pending")
+    assert db.get_telegram_user_approval_state("222") is False
+    assert db.get_telegram_user_approval_state("missing") is False
+
+    def unavailable_database():
+        raise sqlite3.OperationalError("temporarily unavailable")
+
+    monkeypatch.setattr(db, "get_db_connection", unavailable_database)
+    assert db.get_telegram_user_approval_state("111") is None
+
+
+def test_send_new_post_fails_closed_when_approval_cannot_be_read(database, monkeypatch):
+    import asyncio
+    from telegram_bot_plugin.telegram_bot import LeRobot
+
+    robot = LeRobot.__new__(LeRobot)
+    robot.polling_enabled = False
+    sent = []
+
+    async def fake_send(chat_id, content, markup):
+        sent.append(chat_id)
+        return True
+
+    monkeypatch.setattr(robot, "_send_message_with_retries", fake_send)
+
+    async def send_once():
+        return await robot.send_new_post(
+            "hello", None, None, chat_ids=["111"], query_id=None
+        )
+
+    monkeypatch.setattr(db, "get_telegram_user_approval_state", lambda chat_id: None)
+    assert asyncio.run(send_once()) is None
+    assert sent == []
+
+    monkeypatch.setattr(db, "get_telegram_user_approval_state", lambda chat_id: False)
+    assert asyncio.run(send_once()) is True
+    assert sent == []
+
+    monkeypatch.setattr(db, "get_telegram_user_approval_state", lambda chat_id: True)
+    assert asyncio.run(send_once()) is True
+    assert sent == ["111"]
+
+
+def test_outbox_retains_recipient_when_approval_read_fails(database, monkeypatch):
+    import asyncio
+    from telegram_bot_plugin.telegram_bot import LeRobot
+
+    assert db.migrate_pending_notifications_table()
+    notification_id = db.enqueue_notification("hello", None, None, ["111"])
+    robot = LeRobot.__new__(LeRobot)
+    robot.polling_enabled = False
+    sent = []
+
+    async def fake_send(chat_id, content, markup):
+        sent.append(chat_id)
+        return True
+
+    monkeypatch.setattr(robot, "_send_message_with_retries", fake_send)
+    approval = [None]
+    monkeypatch.setattr(
+        db,
+        "get_telegram_user_approval_state",
+        lambda chat_id: approval[0],
+    )
+
+    asyncio.run(robot.drain_outbox(None))
+    row = db.get_due_notifications(limit=10)[0]
+    assert row[0] == notification_id
+    assert json.loads(row[4]) == ["111"]
+    assert row[6] == 0
+    assert sent == []
+
+    # A definitive revocation is intentionally acknowledged and removed.
+    approval[0] = False
+    asyncio.run(robot.drain_outbox(None))
+    assert db.count_pending_notifications() == 0
+    assert sent == []
+
+
+def test_outbox_retries_only_the_recipient_that_failed(database, monkeypatch):
+    import asyncio
+    from telegram_bot_plugin.telegram_bot import LeRobot
+
+    assert db.migrate_pending_notifications_table()
+    notification_id = db.enqueue_notification(
+        "hello",
+        "http://x",
+        "Open",
+        ["111", "222"],
+    )
+    robot = LeRobot.__new__(LeRobot)
+    calls = []
+    second_recipient_succeeds = False
+
+    async def fake_send(content, url, button_text, chat_ids=None, query_id=None):
+        chat_id = chat_ids[0]
+        calls.append(chat_id)
+        return chat_id == "111" or second_recipient_succeeds
+
+    monkeypatch.setattr(robot, "send_new_post", fake_send)
+    asyncio.run(robot.drain_outbox(None))
+
+    conn = db.get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT chat_ids, attempts FROM pending_notifications WHERE id=?",
+            (notification_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert json.loads(row[0]) == ["222"]
+    assert row[1] == 1
+    assert calls == ["111", "222"]
+
+    # Make the failed recipient due immediately and let the retry succeed.
+    db.reschedule_notification(notification_id, attempts=1, next_attempt_at=0)
+    second_recipient_succeeds = True
+    asyncio.run(robot.drain_outbox(None))
+    assert calls == ["111", "222", "222"]
+    assert db.count_pending_notifications() == 0
+
+
+def test_outbox_keeps_notification_when_eligibility_read_fails(database, monkeypatch):
+    import asyncio
+    import telegram_bot_plugin.telegram_bot as plugin
+
+    assert db.migrate_pending_notifications_table()
+    db.set_parameter("telegram_chat_id", "111")
+    assert db.migrate_multi_user_schema()
+    query_id, _, _ = db.add_query_to_db(
+        normalise_vinted_url(
+            "https://www.vinted.co.uk/catalog?search_text=eligibility-error"
+        ),
+        chat_id="111",
+    )
+    notification_id = db.enqueue_notification(
+        "hello", "http://x", "Open", ["111"], query_id=query_id
+    )
+    robot = plugin.LeRobot.__new__(plugin.LeRobot)
+    calls = []
+
+    async def fake_send(*args, **kwargs):
+        calls.append(kwargs.get("chat_ids"))
+        return True
+
+    monkeypatch.setattr(robot, "send_new_post", fake_send)
+    monkeypatch.setattr(db, "get_query_delivery_state", lambda query_id: None)
+    asyncio.run(robot.drain_outbox(None))
+
+    assert calls == []
+    assert db.count_pending_notifications() == 1
+    row = db.get_due_notifications(limit=10)[0]
+    assert row[0] == notification_id
+    assert row[6] == 0
+
+
+def test_outbox_never_guesses_a_recipient_for_corrupt_json(database, monkeypatch):
+    import asyncio
+    import telegram_bot_plugin.telegram_bot as plugin
+
+    assert db.migrate_pending_notifications_table()
+    db.set_parameter("telegram_chat_id", "admin-chat")
+    notification_id = db.enqueue_notification(
+        "hello", "http://x", "Open", ["intended-chat"]
+    )
+    conn = db.get_db_connection()
+    try:
+        conn.execute(
+            "UPDATE pending_notifications SET chat_ids=? WHERE id=?",
+            ("{not-json", notification_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    robot = plugin.LeRobot.__new__(plugin.LeRobot)
+    calls = []
+
+    async def fake_send(*args, **kwargs):
+        calls.append(kwargs.get("chat_ids"))
+        return True
+
+    monkeypatch.setattr(robot, "send_new_post", fake_send)
+    asyncio.run(robot.drain_outbox(None))
+
+    assert calls == []
+    conn = db.get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT chat_ids, attempts FROM pending_notifications WHERE id=?",
+            (notification_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("{not-json", 1)
+
+
+@pytest.mark.parametrize("failed_write", ["reschedule", "delete"])
+def test_outbox_stops_when_retry_state_cannot_be_saved(
+    database, monkeypatch, failed_write
+):
+    import asyncio
+    import telegram_bot_plugin.telegram_bot as plugin
+
+    assert db.migrate_pending_notifications_table()
+    notification_id = db.enqueue_notification("hello", "http://x", "Open", ["111"])
+    if failed_write == "delete":
+        db.reschedule_notification(notification_id, attempts=9, next_attempt_at=0)
+        monkeypatch.setattr(db, "delete_notification", lambda notification_id: False)
+    else:
+        monkeypatch.setattr(
+            db,
+            "reschedule_notification",
+            lambda notification_id, attempts, next_attempt_at: False,
+        )
+
+    robot = plugin.LeRobot.__new__(plugin.LeRobot)
+    calls = []
+
+    async def fake_send(*args, **kwargs):
+        calls.append(kwargs.get("chat_ids"))
+        return False
+
+    monkeypatch.setattr(robot, "send_new_post", fake_send)
+    asyncio.run(robot.drain_outbox(None))
+
+    # A failed state write returns from the pass instead of immediately
+    # re-fetching and re-sending the same due row forever.
+    assert calls == [["111"]]
+    assert db.count_pending_notifications() == 1
+
+
+def test_outbox_cancellation_keeps_only_unacknowledged_recipients(
+    database, monkeypatch
+):
+    import asyncio
+    import telegram_bot_plugin.telegram_bot as plugin
+
+    assert db.migrate_pending_notifications_table()
+    notification_id = db.enqueue_notification(
+        "hello", "http://x", "Open", ["111", "222"]
+    )
+    robot = plugin.LeRobot.__new__(plugin.LeRobot)
+    calls = []
+
+    async def fake_send(*args, **kwargs):
+        chat_id = kwargs["chat_ids"][0]
+        calls.append(chat_id)
+        if chat_id == "222":
+            raise asyncio.CancelledError
+        return True
+
+    monkeypatch.setattr(robot, "send_new_post", fake_send)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(robot.drain_outbox(None))
+
+    assert calls == ["111", "222"]
+    conn = db.get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT chat_ids, attempts FROM pending_notifications WHERE id=?",
+            (notification_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert json.loads(row[0]) == ["222"]
+    assert row[1] == 0
+
+
 def test_outbox_migration_adds_query_id_to_existing_table(tmp_path, monkeypatch):
     database_path = tmp_path / "legacy-outbox.db"
     monkeypatch.setattr(db, "DB_PATH", str(database_path))
@@ -1232,6 +1711,148 @@ def test_telegram_subscription_button_toggles_only_clicking_user(
     assert subscription_labels == ["Unsubscribe from this search"]
 
 
+def test_last_subscriber_can_unsubscribe_and_resubscribe(database, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from telegram_bot_plugin.telegram_bot import LeRobot
+
+    db.set_parameter("telegram_chat_id", "111")
+    assert db.migrate_multi_user_schema()
+    query_url = normalise_vinted_url(
+        "https://www.vinted.co.uk/catalog?search_text=last-subscriber"
+    )
+    query_id, _, subscribed = db.add_query_to_db(query_url, chat_id="111")
+    assert subscribed
+
+    conn = db.get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO items "
+            "(item, title, price, currency, timestamp, query_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (99, "Saved item", 10, "GBP", 100, query_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    robot = LeRobot.__new__(LeRobot)
+    robot.polling_enabled = True
+    markups = []
+
+    async def fake_send(chat_id, content, markup):
+        markups.append(markup)
+        return True
+
+    monkeypatch.setattr(robot, "_send_message_with_retries", fake_send)
+
+    class Callback:
+        def __init__(self, data, markup):
+            self.data = data
+            self.message = SimpleNamespace(reply_markup=markup)
+            self.answers = []
+            self.edited_markup = markup
+
+        async def answer(self, text, show_alert=False):
+            self.answers.append((text, show_alert))
+
+        async def edit_message_reply_markup(self, markup):
+            self.edited_markup = markup
+
+    async def exercise():
+        await robot.send_new_post(
+            "New item",
+            "https://www.vinted.co.uk/items/99",
+            "Open Vinted",
+            chat_ids=["111"],
+            query_id=query_id,
+        )
+        callback = Callback(f"unsubscribe:{query_id}", markups[0])
+        update = SimpleNamespace(
+            callback_query=callback,
+            effective_chat=SimpleNamespace(id=111),
+        )
+        await robot.unsubscribe_query(update, None)
+        assert callback.answers == [("Unsubscribed from this search.", True)]
+
+        callback.message.reply_markup = callback.edited_markup
+        callback.data = f"resubscribe:{query_id}"
+        callback.answers = []
+        await robot.resubscribe_query(update, None)
+        return callback
+
+    callback = asyncio.run(exercise())
+    assert callback.answers == [("Resubscribed to this search.", True)]
+    assert db.get_query_subscribers(query_id) == ["111"]
+    # Personal subscription changes preserve the shared query and item history.
+    conn = db.get_db_connection()
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM queries WHERE id=?", (query_id,)
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM items WHERE query_id=?", (query_id,)
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
+
+
+def test_subscription_button_does_not_change_when_database_update_fails(
+    database, monkeypatch
+):
+    import asyncio
+    from types import SimpleNamespace
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram_bot_plugin.telegram_bot import LeRobot
+
+    db.set_parameter("telegram_chat_id", "111")
+    assert db.migrate_multi_user_schema()
+    robot = LeRobot.__new__(LeRobot)
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Unsubscribe", callback_data="unsubscribe:7")]]
+    )
+
+    class Callback:
+        def __init__(self, data):
+            self.data = data
+            self.message = SimpleNamespace(reply_markup=markup)
+            self.answers = []
+            self.edits = []
+
+        async def answer(self, text, show_alert=False):
+            self.answers.append((text, show_alert))
+
+        async def edit_message_reply_markup(self, new_markup):
+            self.edits.append(new_markup)
+
+    async def exercise():
+        unsubscribe = Callback("unsubscribe:7")
+        update = SimpleNamespace(
+            callback_query=unsubscribe,
+            effective_chat=SimpleNamespace(id=111),
+        )
+        monkeypatch.setattr(db, "remove_query_subscription", lambda *args: None)
+        await robot.unsubscribe_query(update, None)
+
+        resubscribe = Callback("resubscribe:7")
+        update.callback_query = resubscribe
+        monkeypatch.setattr(db, "add_query_subscription", lambda *args: None)
+        await robot.resubscribe_query(update, None)
+        return unsubscribe, resubscribe
+
+    unsubscribe, resubscribe = asyncio.run(exercise())
+    assert "try again" in unsubscribe.answers[0][0].lower()
+    assert "try again" in resubscribe.answers[0][0].lower()
+    assert unsubscribe.edits == []
+    assert resubscribe.edits == []
+
+
 def test_send_only_notifications_do_not_offer_server_callbacks(
     database,
     monkeypatch,
@@ -1269,7 +1890,7 @@ def test_send_only_notifications_do_not_offer_server_callbacks(
     )
 
 
-def test_subscribed_item_is_persisted_to_outbox(database, monkeypatch):
+def test_subscribed_item_is_persisted_to_outbox_atomically(database):
     core = _core()
 
     class Item:
@@ -1285,42 +1906,260 @@ def test_subscribed_item_is_persisted_to_outbox(database, monkeypatch):
         raw_timestamp = 100
         raw_data = {"user": {"id": 1}}
 
-    parameters = {
-        "banwords": "",
-        "message_template": db.DEFAULT_MESSAGE_TEMPLATE,
-    }
-    monkeypatch.setattr(core.db, "get_parameter", parameters.get)
-    monkeypatch.setattr(core.db, "get_last_timestamp", lambda query_id: None)
-    monkeypatch.setattr(core.db, "is_item_in_db_by_id", lambda item_id: False)
-    monkeypatch.setattr(core.db, "get_allowlist", lambda: 0)
-    monkeypatch.setattr(core.db, "is_query_enabled", lambda query_id: True)
-    monkeypatch.setattr(core.db, "get_query_subscribers", lambda query_id: ["123"])
-    monkeypatch.setattr(core.db, "add_item_to_db", lambda **kwargs: None)
-
-    enqueued = []
-    monkeypatch.setattr(
-        core.db,
-        "enqueue_notification",
-        lambda content, url, button_text, chat_ids, query_id=None: enqueued.append(
-            (content, url, button_text, chat_ids, query_id)
+    assert db.migrate_pending_notifications_table()
+    db.set_parameter("banwords", "")
+    db.set_parameter("message_template", db.DEFAULT_MESSAGE_TEMPLATE)
+    db.set_parameter("telegram_chat_id", "123")
+    assert db.migrate_multi_user_schema()
+    query_id, _, subscribed = db.add_query_to_db(
+        normalise_vinted_url(
+            "https://www.vinted.co.uk/catalog?search_text=atomic-coat"
         ),
+        chat_id="123",
     )
+    assert subscribed
 
     source = queue.Queue()
     destination = queue.Queue()
-    source.put(([Item()], 1))
+    source.put(([Item()], query_id))
     core.clear_item_queue(source, destination)
 
-    # The Telegram notification was persisted for the subscriber.
-    assert len(enqueued) == 1
-    content, url, button_text, chat_ids, query_id = enqueued[0]
-    assert chat_ids == ["123"]
-    assert query_id == 1
+    due = db.get_due_notifications(limit=10)
+    assert len(due) == 1
+    _, content, url, button_text, chat_ids_json, queued_query_id, attempts = due[0]
+    assert json.loads(chat_ids_json) == ["123"]
+    assert queued_query_id == query_id
     assert url == "https://www.vinted.co.uk/items/77"
+    assert button_text == "Open Vinted"
+    assert attempts == 0
     assert "Wool Coat" in content
+    conn = db.get_db_connection()
+    try:
+        item = conn.execute("SELECT item, query_id FROM items WHERE item=77").fetchone()
+        last_item = conn.execute(
+            "SELECT last_item FROM queries WHERE id=?", (query_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert item == (77, query_id)
+    assert last_item == 100
     # RSS still receives the item on the in-memory queue.
     rss_item = destination.get_nowait()
     assert len(rss_item) == 6
+
+
+def test_outbox_insert_failure_rolls_back_item_and_timestamp(database):
+    core = _core()
+
+    class Item:
+        id = 78
+        title = "Rollback Coat"
+        price = 31
+        currency = "GBP"
+        brand_title = "Brand"
+        condition = "Very good"
+        description = None
+        photo = None
+        url = "https://www.vinted.co.uk/items/78"
+        raw_timestamp = 101
+        raw_data = {"user": {"id": 1}}
+
+    assert db.migrate_pending_notifications_table()
+    db.set_parameter("banwords", "")
+    db.set_parameter("message_template", db.DEFAULT_MESSAGE_TEMPLATE)
+    db.set_parameter("telegram_chat_id", "123")
+    assert db.migrate_multi_user_schema()
+    query_id, _, subscribed = db.add_query_to_db(
+        normalise_vinted_url(
+            "https://www.vinted.co.uk/catalog?search_text=rollback-coat"
+        ),
+        chat_id="123",
+    )
+    assert subscribed
+    conn = db.get_db_connection()
+    try:
+        conn.execute("""
+            CREATE TRIGGER fail_pending_notification
+            BEFORE INSERT ON pending_notifications
+            BEGIN
+                SELECT RAISE(ABORT, 'forced outbox failure');
+            END;
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    source = queue.Queue()
+    destination = queue.Queue()
+    source.put(([Item()], query_id))
+    core.clear_item_queue(source, destination)
+
+    assert destination.empty()
+    assert db.count_pending_notifications() == 0
+    conn = db.get_db_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT last_item FROM queries WHERE id=?", (query_id,)
+            ).fetchone()[0]
+            is None
+        )
+    finally:
+        conn.close()
+
+
+def test_persistence_failure_stops_the_remaining_item_batch(database, monkeypatch):
+    core = _core()
+
+    class Item:
+        title = "Retry me"
+        price = 10
+        currency = "GBP"
+        brand_title = "Brand"
+        condition = "Good"
+        description = None
+        photo = None
+        raw_data = {"user": {"id": 1}}
+
+        def __init__(self, item_id, timestamp):
+            self.id = item_id
+            self.raw_timestamp = timestamp
+            self.url = f"https://www.vinted.co.uk/items/{item_id}"
+
+    conn = db.get_db_connection()
+    try:
+        query_id = conn.execute(
+            "INSERT INTO queries (query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=retry", "Retry"),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    db.set_parameter("banwords", "")
+    db.set_parameter("message_template", db.DEFAULT_MESSAGE_TEMPLATE)
+    attempts = []
+
+    def fail_persistence(**kwargs):
+        attempts.append(kwargs["id"])
+        return None
+
+    monkeypatch.setattr(core.db, "persist_item_and_notification", fail_persistence)
+    source = queue.Queue()
+    destination = queue.Queue()
+    source.put(([Item(2, 200), Item(1, 100)], query_id))
+    core.clear_item_queue(source, destination)
+
+    assert attempts == [1]
+    assert destination.empty()
+
+
+def test_subscriber_read_failure_does_not_mark_item_seen(database):
+    core = _core()
+
+    class Item:
+        id = 79
+        title = "Database retry coat"
+        price = 15
+        currency = "GBP"
+        brand_title = "Brand"
+        condition = "Good"
+        description = None
+        photo = None
+        url = "https://www.vinted.co.uk/items/79"
+        raw_timestamp = 102
+        raw_data = {"user": {"id": 1}}
+
+    assert db.migrate_pending_notifications_table()
+    db.set_parameter("banwords", "")
+    db.set_parameter("message_template", db.DEFAULT_MESSAGE_TEMPLATE)
+    conn = db.get_db_connection()
+    try:
+        query_id = conn.execute(
+            "INSERT INTO queries (query, query_name) VALUES (?, ?)",
+            (
+                "https://www.vinted.co.uk/catalog?search_text=subscriber-read",
+                "Subscriber read",
+            ),
+        ).lastrowid
+        conn.execute("DROP TABLE query_subscriptions")
+        conn.commit()
+    finally:
+        conn.close()
+
+    source = queue.Queue()
+    destination = queue.Queue()
+    source.put(([Item()], query_id))
+    core.clear_item_queue(source, destination)
+
+    assert destination.empty()
+    assert db.count_pending_notifications() == 0
+    conn = db.get_db_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT last_item FROM queries WHERE id=?", (query_id,)
+            ).fetchone()[0]
+            is None
+        )
+    finally:
+        conn.close()
+
+
+def test_atomic_item_writer_rechecks_a_paused_query(database, monkeypatch):
+    core = _core()
+
+    class Item:
+        id = 80
+        title = "Paused race coat"
+        price = 20
+        currency = "GBP"
+        brand_title = "Brand"
+        condition = "Good"
+        description = None
+        photo = None
+        url = "https://www.vinted.co.uk/items/80"
+        raw_timestamp = 103
+        raw_data = {"user": {"id": 1}}
+
+    assert db.migrate_pending_notifications_table()
+    db.set_parameter("banwords", "")
+    db.set_parameter("message_template", db.DEFAULT_MESSAGE_TEMPLATE)
+    conn = db.get_db_connection()
+    try:
+        query_id = conn.execute(
+            "INSERT INTO queries (query, query_name, enabled) VALUES (?, ?, 0)",
+            (
+                "https://www.vinted.co.uk/catalog?search_text=paused-race",
+                "Paused race",
+            ),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Simulate the query being paused after the outer queue checks but before
+    # the transactional writer acquires its lock and rechecks the row.
+    monkeypatch.setattr(core.db, "is_query_enabled", lambda query_id: True)
+    source = queue.Queue()
+    destination = queue.Queue()
+    source.put(([Item()], query_id))
+    core.clear_item_queue(source, destination)
+
+    assert destination.empty()
+    assert db.count_pending_notifications() == 0
+    conn = db.get_db_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT last_item FROM queries WHERE id=?", (query_id,)
+            ).fetchone()[0]
+            is None
+        )
+    finally:
+        conn.close()
 
 
 def test_paused_query_discards_results_already_waiting_in_item_queue(database):
@@ -1345,10 +2184,13 @@ def test_paused_query_discards_results_already_waiting_in_item_queue(database):
     assert destination.empty()
     conn = db.get_db_connection()
     try:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM items WHERE query_id=?",
-            (query_id,),
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM items WHERE query_id=?",
+                (query_id,),
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         conn.close()
 
@@ -1821,7 +2663,7 @@ def test_config_health_endpoint(database):
     assert set(data["queries"]) == {"total", "active", "paused"}
 
 
-def test_test_telegram_route(database, monkeypatch):
+def test_test_telegram_route(database, monkeypatch, caplog):
     import web_ui_plugin.web_ui as web
 
     monkeypatch.setattr(
@@ -1863,6 +2705,52 @@ def test_test_telegram_route(database, monkeypatch):
     response = client.post("/test_telegram", headers={"X-CSRF-Token": token})
     assert response.status_code == 400
     assert "chat not found" in response.get_json()["message"]
+
+    # Neither transport exceptions nor Telegram's response body may echo the
+    # token-bearing API URL back into the browser.
+    import requests as requests_module
+
+    configured_token = "123456789:abcdefghijklmnopqrstuvwxyzABCDE"
+    db.set_parameter("telegram_token", configured_token)
+
+    def connection_failure(*args, **kwargs):
+        raise requests_module.ConnectionError(
+            f"failed https://api.telegram.org/bot{configured_token}/sendMessage"
+        )
+
+    monkeypatch.setattr(web.requests, "post", connection_failure)
+    response = client.post("/test_telegram", headers={"X-CSRF-Token": token})
+    assert response.status_code == 502
+    assert configured_token not in response.get_json()["message"]
+    assert "api.telegram.org" not in response.get_json()["message"]
+    assert configured_token not in caplog.text
+
+    class LeakyRejectResponse:
+        status_code = 400
+
+        def json(self):
+            return {
+                "ok": False,
+                "description": f"invalid token {configured_token}",
+            }
+
+    monkeypatch.setattr(web.requests, "post", lambda *a, **k: LeakyRejectResponse())
+    response = client.post("/test_telegram", headers={"X-CSRF-Token": token})
+    assert response.status_code == 400
+    assert configured_token not in response.get_json()["message"]
+    assert "[REDACTED]" in response.get_json()["message"]
+
+    class InvalidShapeResponse:
+        status_code = 200
+
+        def json(self):
+            return ["not", "a", "Telegram", "object"]
+
+    monkeypatch.setattr(web.requests, "post", lambda *a, **k: InvalidShapeResponse())
+    response = client.post("/test_telegram", headers={"X-CSRF-Token": token})
+    assert response.status_code == 502
+    assert response.get_json()["status"] == "error"
+    assert configured_token not in response.get_json()["message"]
 
 
 def test_items_filter_sort_and_pagination(database, monkeypatch):

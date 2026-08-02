@@ -28,7 +28,7 @@ from collections import deque
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
-from logger import get_logger
+from logger import get_logger, redact_secrets
 from url_normalizer import normalise_vinted_url
 
 # Windows can map .js files to text/plain through its system MIME registry.
@@ -966,11 +966,11 @@ def config():
         refresh_delay = int(params.get("query_refresh_delay") or 300)
     except (TypeError, ValueError):
         refresh_delay = 300
-    # Mirror core's paced-scrape spacing to estimate a full cycle's duration.
+    # Use the scraper's real pacing calculation so the Config estimate cannot
+    # drift when the production cadence changes.
     if active_count > 1:
-        usable_window = max(60, refresh_delay * 0.80)
-        spacing = max(2.0, min(15.0, usable_window / active_count))
-        cycle_seconds = int(spacing * active_count)
+        spacing = core._get_query_spacing_seconds(active_count, refresh_delay)
+        cycle_seconds = int(spacing * (active_count - 1))
     else:
         cycle_seconds = 0
     query_health = {
@@ -1021,11 +1021,25 @@ def test_telegram():
             timeout=(3.05, 10),
         )
         payload = response.json()
+        if not isinstance(payload, dict):
+            logger.warning("Telegram test message returned an invalid response shape.")
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "Telegram returned an invalid response. Try again.",
+                    }
+                ),
+                502,
+            )
         if response.status_code == 200 and payload.get("ok"):
             return jsonify(
                 {"status": "success", "message": "Test message sent — check Telegram."}
             )
-        description = payload.get("description", f"HTTP {response.status_code}")
+        description = str(payload.get("description", f"HTTP {response.status_code}"))
+        # Telegram usually returns harmless guidance, but never trust a remote
+        # error body with a credential that was present in the request URL.
+        description = redact_secrets(description.replace(token, "[REDACTED]"))[:500]
         return (
             jsonify(
                 {"status": "error", "message": f"Telegram rejected it: {description}"}
@@ -1038,7 +1052,12 @@ def test_telegram():
         logger.warning("Telegram test message failed (%s)", type(error).__name__)
         return (
             jsonify(
-                {"status": "error", "message": f"Could not reach Telegram: {error}"}
+                {
+                    "status": "error",
+                    "message": (
+                        "Could not reach Telegram. Check the connection and try again."
+                    ),
+                }
             ),
             502,
         )
@@ -1058,7 +1077,8 @@ def config_health():
 
     quiet_active, quiet_start, quiet_end, quiet_timezone = core.get_quiet_hours_status()
     quiet_enabled = (
-        str(db.get_parameter("quiet_hours_enabled") or "False").strip().lower() == "true"
+        str(db.get_parameter("quiet_hours_enabled") or "False").strip().lower()
+        == "true"
     )
 
     return jsonify(

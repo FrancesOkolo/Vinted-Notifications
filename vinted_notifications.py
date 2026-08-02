@@ -99,11 +99,14 @@ def initialise_database():
 
     current_version = db.get_parameter("version")
     migration_files = os.listdir("migrations")
+    visited_versions = set()
     while True:
-        migration_file = next(
-            (name for name in migration_files if name.startswith(current_version)),
-            None,
-        )
+        if current_version in visited_versions:
+            raise RuntimeError(
+                f"Database migration cycle detected at version {current_version}."
+            )
+        visited_versions.add(current_version)
+        migration_file = db.next_database_migration(current_version, migration_files)
         if not migration_file:
             break
         logger.info("Running migration: %s", migration_file)
@@ -111,7 +114,12 @@ def initialise_database():
             os.path.join("migrations", migration_file)
         ):
             raise RuntimeError(f"Failed to run migration {migration_file}.")
-        current_version = db.get_parameter("version")
+        next_version = db.get_parameter("version")
+        if not next_version or next_version == current_version:
+            raise RuntimeError(
+                f"Migration {migration_file} did not advance the database version."
+            )
+        current_version = next_version
 
     migrations = [
         (db.migrate_message_template, "notification message template"),
