@@ -575,7 +575,8 @@ def _query_preferences_from_form():
         request.form.get("deal_good_max"),
         "Good price",
     )
-    evaluator_enabled = "deal_evaluator_enabled" in request.form
+    deal_mode = request.form.get("deal_mode", "off").strip().lower()
+    evaluator_enabled = deal_mode == "ceiling"
 
     if evaluator_enabled and (excellent_max is None or good_max is None):
         raise ValueError(
@@ -1006,7 +1007,10 @@ def update_query(query_id):
                 query_id, query, name=query_name if query_name != "" else None
             )
             if success and _save_query_preferences(query_id, preferences):
-                _set_query_ai_deal(query_id, "deal_ai_enabled" in request.form)
+                _set_query_ai_deal(
+                    query_id,
+                    request.form.get("deal_mode", "off").strip().lower() == "ai",
+                )
                 flash("Query updated", "success")
             elif success:
                 flash(
