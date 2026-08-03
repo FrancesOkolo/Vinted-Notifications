@@ -951,6 +951,37 @@ def _ai_deal_query_ids():
     return ids
 
 
+def _dispatch_ai_followup(item, query_id, chat_ids):
+    """Run the AI deal verdict off the delivery path and enqueue it as a
+    follow-up notification.
+
+    Runs in a background thread so the item's own alert (already sent) is never
+    delayed by the slow web-search call. Best-effort: any failure just means no
+    follow-up is sent.
+    """
+    try:
+        rating = ai_deal_evaluator.evaluate(item)
+        if not rating:
+            return
+        # The query may have been paused or unsubscribed during the (slow)
+        # evaluation, so re-check who should still receive it.
+        current = {str(c) for c in db.get_query_subscribers(query_id)}
+        recipients = [c for c in chat_ids if str(c) in current]
+        if not recipients:
+            return
+        title = html.escape(str(getattr(item, "title", "") or "")[:120])
+        content = f"🤖 <b>AI check</b> — {title}\n{rating}"
+        db.enqueue_notification(
+            content,
+            getattr(item, "url", None),
+            "Open Vinted",
+            recipients,
+            query_id=query_id,
+        )
+    except Exception:
+        logger.warning("AI deal follow-up failed.", exc_info=True)
+
+
 def clear_item_queue(items_queue, new_items_queue):
     """
     Process items from the items_queue.
@@ -1038,14 +1069,13 @@ def clear_item_queue(items_queue, new_items_queue):
                         exc_info=True,
                     )
                     content = db.DEFAULT_MESSAGE_TEMPLATE.format(**format_values)
-                # Deal rating: an AI verdict for AI-enabled queries, otherwise
-                # the free listing-price ceiling evaluator. Both are best-effort
-                # and never block the alert.
-                if query_id in _ai_deal_query_ids():
-                    ai_rating = ai_deal_evaluator.evaluate(item)
-                    if ai_rating:
-                        content = f"{ai_rating}\n\n{content}"
-                else:
+                # Deal rating. AI-enabled queries get their verdict AFTER the
+                # alert, as a background follow-up (spawned below), so the slow
+                # live web-search call never blocks or delays delivery. Other
+                # queries get the free listing-price ceiling rating inline (it
+                # is instant).
+                is_ai_query = query_id in _ai_deal_query_ids()
+                if not is_ai_query:
                     content, _deal_rating = deal_evaluator.prepend_deal_rating(
                         content,
                         item.price,
@@ -1105,6 +1135,16 @@ def clear_item_queue(items_queue, new_items_queue):
                         subscriber_chat_ids,
                     )
                 )
+
+                # AI-enabled query: compute the verdict in the background and
+                # deliver it as a follow-up message, so this alert was never
+                # held up by the slow web-search call.
+                if is_ai_query and subscriber_chat_ids:
+                    threading.Thread(
+                        target=_dispatch_ai_followup,
+                        args=(item, query_id, list(subscriber_chat_ids)),
+                        daemon=True,
+                    ).start()
 
 
 def contains_banwords(title, banwords_str):
