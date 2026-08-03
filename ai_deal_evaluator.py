@@ -13,6 +13,7 @@ description or personal data is transmitted.
 import html
 import json
 import os
+import re
 
 import requests
 
@@ -20,8 +21,8 @@ from logger import get_logger
 
 logger = get_logger(__name__)
 
-_ENDPOINT = "https://api.openai.com/v1/chat/completions"
-_TIMEOUT = (10, 25)  # (connect, read) seconds
+_ENDPOINT = "https://api.openai.com/v1/responses"
+_TIMEOUT = (10, 60)  # (connect, read); web search needs a longer read timeout
 
 _LABELS = {
     "excellent": "\U0001f525 <b>AI: EXCELLENT DEAL</b>",
@@ -30,17 +31,17 @@ _LABELS = {
 }
 
 _SYSTEM_PROMPT = (
-    "You are a savvy UK reseller who knows brand pricing. Pick the benchmark "
-    "from the item's condition: if NEW (new with tags / new without tags), use "
-    "the item's RETAIL (new) price; if USED (very good / good / satisfactory), "
-    "use the typical SECOND-HAND resale price for that condition. Estimate that "
-    "benchmark from the brand, title, condition and photo, then judge the "
-    "asking price against it. Reply ONLY as compact JSON: "
-    '{"verdict":"excellent|good|dont_buy","reason":"<=16 words; name the '
-    'benchmark used and the discount"}. '
-    "Guide: excellent = a clear bargain well below the benchmark; good = a fair "
-    "price / modest saving; dont_buy = around or above the benchmark, or not "
-    "worth it. Be decisive on clear bargains."
+    "You are a savvy UK reseller. Use web search to find this item's current UK "
+    "RETAIL (new) price and recent second-hand asking/sold prices. Pick the "
+    "benchmark by condition: if NEW (new with tags / new without tags) use "
+    "retail; if USED (very good / good / satisfactory) use the typical "
+    "second-hand resale price for that condition. Judge the asking price "
+    "against that benchmark. After searching, reply with ONLY compact JSON on "
+    "the final line: "
+    '{"verdict":"excellent|good|dont_buy","reason":"<=18 words; name the '
+    'benchmark, its rough figure and the discount"}. '
+    "excellent = a clear bargain below the benchmark; good = a fair price / "
+    "modest saving; dont_buy = around or above the benchmark, or not worth it."
 )
 
 
@@ -58,11 +59,21 @@ def is_configured():
 
 
 def format_verdict(raw_json):
-    """Turn the model's JSON reply into a Telegram-HTML rating line, or None."""
+    """Turn the model's JSON reply into a Telegram-HTML rating line, or None.
+
+    The reply may include prose (e.g. web-search notes) around the JSON, so if
+    the whole string is not valid JSON, extract the first flat {...} object.
+    """
+    data = None
     try:
         data = json.loads(raw_json)
     except (TypeError, ValueError):
-        return None
+        match = re.search(r"\{[^{}]*\}", raw_json or "")
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except (TypeError, ValueError):
+                data = None
     if not isinstance(data, dict):
         return None
     verdict = (
@@ -93,21 +104,18 @@ def evaluate(item):
             f"Condition: {getattr(item, 'condition', None) or 'unknown'}\n"
             f"Asking price: {item.price} {item.currency}"
         )
-        user_content = [{"type": "text", "text": details}]
+        user_content = [{"type": "input_text", "text": details}]
         photo = getattr(item, "photo", None)
         if photo:
-            user_content.append(
-                {"type": "image_url", "image_url": {"url": str(photo)}}
-            )
+            user_content.append({"type": "input_image", "image_url": str(photo)})
         payload = {
             "model": _model(),
-            "messages": [
+            "tools": [{"type": "web_search_preview"}],
+            "input": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            "response_format": {"type": "json_object"},
-            "max_tokens": 60,
-            "temperature": 0.2,
+            "max_output_tokens": 500,
         }
         response = requests.post(
             _ENDPOINT,
@@ -116,11 +124,25 @@ def evaluate(item):
             timeout=_TIMEOUT,
         )
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        return format_verdict(content)
+        return format_verdict(_response_text(response.json()))
     except Exception:
         logger.warning(
             "AI deal evaluation failed; the alert will be sent without a rating.",
             exc_info=True,
         )
         return None
+
+
+def _response_text(data):
+    """Extract the assistant's final text from an OpenAI Responses API result."""
+    aggregated = data.get("output_text")
+    if isinstance(aggregated, str) and aggregated.strip():
+        return aggregated
+    parts = []
+    for entry in data.get("output") or []:
+        if entry.get("type") == "message":
+            for chunk in entry.get("content") or []:
+                text = chunk.get("text")
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
