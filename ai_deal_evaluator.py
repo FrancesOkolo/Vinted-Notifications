@@ -30,16 +30,17 @@ _LABELS = {
 }
 
 _SYSTEM_PROMPT = (
-    "You are a savvy UK reseller who knows brand pricing. From the brand, "
-    "title, condition and photo, estimate the item's typical RETAIL (new) "
-    "price, then judge the asking price against that retail price. Reply ONLY "
-    "as compact JSON: "
-    '{"verdict":"excellent|good|dont_buy","reason":"<=16 words; state rough '
-    'retail and the discount"}. '
-    "Guide by discount off retail: excellent = a clear steal, about 40% of "
-    "retail or less; good = a decent saving, about 40-70% of retail; dont_buy "
-    "= little saving, overpriced, or not worth it. Be decisive — a big "
-    "discount off retail is 'excellent', not 'good'."
+    "You are a savvy UK reseller who knows brand pricing. Pick the benchmark "
+    "from the item's condition: if NEW (new with tags / new without tags), use "
+    "the item's RETAIL (new) price; if USED (very good / good / satisfactory), "
+    "use the typical SECOND-HAND resale price for that condition. Estimate that "
+    "benchmark from the brand, title, condition and photo, then judge the "
+    "asking price against it. Reply ONLY as compact JSON: "
+    '{"verdict":"excellent|good|dont_buy","reason":"<=16 words; name the '
+    'benchmark used and the discount"}. '
+    "Guide: excellent = a clear bargain well below the benchmark; good = a fair "
+    "price / modest saving; dont_buy = around or above the benchmark, or not "
+    "worth it. Be decisive on clear bargains."
 )
 
 
