@@ -31,20 +31,17 @@ _LABELS = {
 }
 
 _SYSTEM_PROMPT = (
-    "You are a savvy UK reseller. First identify the EXACT product from its "
-    "Vinted listing link, title and photo (mind the precise variant, e.g. a "
-    "lampshade is not a whole lamp). Then use web search to find THAT specific "
-    "product's current UK RETAIL (new) price and recent second-hand asking/sold "
-    "prices. Pick the "
-    "benchmark by condition: if NEW (new with tags / new without tags) use "
-    "retail; if USED (very good / good / satisfactory) use the typical "
-    "second-hand resale price for that condition. Judge the asking price "
-    "against that benchmark. After searching, reply with ONLY compact JSON on "
-    "the final line: "
-    '{"verdict":"excellent|good|dont_buy","reason":"<=18 words; name the '
-    'benchmark, its rough figure and the discount"}. '
-    "excellent = a clear bargain below the benchmark; good = a fair price / "
-    "modest saving; dont_buy = around or above the benchmark, or not worth it."
+    "You are a savvy UK reseller who knows brand pricing. Using ONLY your own "
+    "knowledge (do NOT browse the web), estimate the item's benchmark price "
+    "from its brand, title, condition and photo: if NEW (new with tags / new "
+    "without tags) use its typical UK RETAIL (new) price; if USED (very good / "
+    "good / satisfactory) use its typical second-hand resale price for that "
+    "condition. Judge the asking price against that benchmark. Reply ONLY as "
+    "compact JSON: "
+    '{"verdict":"excellent|good|dont_buy","reason":"<=16 words; state the '
+    'benchmark figure and the discount"}. '
+    "excellent = a clear bargain well below the benchmark; good = a fair price "
+    "/ modest saving; dont_buy = around or above the benchmark, or not worth it."
 )
 
 
@@ -114,17 +111,14 @@ def evaluate(item):
             user_content.append({"type": "input_image", "image_url": str(photo)})
         payload = {
             "model": _model(),
-            # "high" search context: accuracy first while the evaluator is
-            # being tuned (low context was cheaper but less reliable).
-            "tools": [{"type": "web_search_preview", "search_context_size": "high"}],
             "input": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            # Reasoning models (gpt-5.x) spend most output tokens on internal
-            # reasoning across several web searches, so leave generous room or
-            # the final JSON verdict gets truncated. Unused tokens are not billed.
-            "max_output_tokens": 3000,
+            # Reasoning models spend output tokens on internal reasoning, so
+            # leave headroom or the final JSON verdict is truncated. Unused
+            # tokens are not billed.
+            "max_output_tokens": 1500,
         }
         response = requests.post(
             _ENDPOINT,
