@@ -31,8 +31,11 @@ _LABELS = {
 }
 
 _SYSTEM_PROMPT = (
-    "You are a savvy UK reseller. Use web search to find this item's current UK "
-    "RETAIL (new) price and recent second-hand asking/sold prices. Pick the "
+    "You are a savvy UK reseller. First identify the EXACT product from its "
+    "Vinted listing link, title and photo (mind the precise variant, e.g. a "
+    "lampshade is not a whole lamp). Then use web search to find THAT specific "
+    "product's current UK RETAIL (new) price and recent second-hand asking/sold "
+    "prices. Pick the "
     "benchmark by condition: if NEW (new with tags / new without tags) use "
     "retail; if USED (very good / good / satisfactory) use the typical "
     "second-hand resale price for that condition. Judge the asking price "
@@ -99,6 +102,7 @@ def evaluate(item):
         return None
     try:
         details = (
+            f"Vinted listing: {getattr(item, 'url', None) or 'unknown'}\n"
             f"Brand: {getattr(item, 'brand_title', None) or 'unknown'}\n"
             f"Title: {item.title}\n"
             f"Condition: {getattr(item, 'condition', None) or 'unknown'}\n"
@@ -115,7 +119,10 @@ def evaluate(item):
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            "max_output_tokens": 500,
+            # Reasoning models (gpt-5.x) spend most output tokens on internal
+            # reasoning across several web searches, so leave generous room or
+            # the final JSON verdict gets truncated. Unused tokens are not billed.
+            "max_output_tokens": 3000,
         }
         response = requests.post(
             _ENDPOINT,
