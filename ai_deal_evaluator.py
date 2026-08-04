@@ -114,7 +114,9 @@ def evaluate(item):
             user_content.append({"type": "input_image", "image_url": str(photo)})
         payload = {
             "model": _model(),
-            "tools": [{"type": "web_search_preview"}],
+            # "low" search context roughly halves the (dominant) input-token
+            # cost versus the default, with no measured loss of accuracy here.
+            "tools": [{"type": "web_search_preview", "search_context_size": "low"}],
             "input": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
