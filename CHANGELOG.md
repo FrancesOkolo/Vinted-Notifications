@@ -2,15 +2,73 @@
 
 ## Unreleased
 
+### Telegram item sharing
+
+- Add Share on WhatsApp and Copy item link actions to Vinted item alerts while
+  preserving the existing Open Vinted and unsubscribe/resubscribe controls.
+- Share a short canonical public listing URL without tracking parameters, and
+  leave status, health, and version-notification links unchanged.
+
+### Scraper session and logging recovery
+
+- Replace independent per-query jobs with one central, coalescing dispatcher
+  and a shared capacity plan. Fast searches receive priority without starving
+  Normal searches, while requested cadences are lengthened when necessary to
+  fit the safe aggregate budget.
+- Enforce at least 12 seconds from completion of one catalogue/authentication
+  request to the start of the next, plus positive jitter; retries and cookie
+  refreshes consume the same gate.
+- Rebuild an expired Vinted catalogue session once after HTTP 401, then open
+  the shared scraper cooldown if the fresh session is also rejected.
+- Open one bounded global cooldown on the first HTTP 429 response instead of
+  sleeping inside every queued per-query job and starving the scheduler.
+- Keep per-query failures from being counted as failed whole-query sweeps, and
+  fail allowlist country lookups safely without terminating item processing.
+- Treat one HTTP 403 that remains after a fresh-session retry as a confirmed
+  block and open protection immediately without testing more queries.
+- After an expired HTTP 403 cooldown, make one recovery probe and escalate
+  repeated rejection from 5 minutes to 30 minutes, 2 hours, then 8 hours.
+- Log one warning per open cooldown instead of repeating it on every dispatcher
+  tick.
+- Route all Windows child-process logs through one parent-owned rotating file
+  writer so rollover cannot freeze when several processes reach 10 MiB.
+
+### AI deal-evaluator hardening
+
+- Keep AI ratings asynchronous without spawning an unbounded thread per item.
+  A single serialized worker now uses a durable leased SQLite queue, bounded
+  retries, and crash-safe handoff to the Telegram outbox.
+- Preserve each item's immediate alert even when OpenAI is slow or unavailable,
+  and keep a later AI verdict behind its parent alert.
+- Send AI follow-ups only to recipients whose primary Telegram alert was
+  confirmed delivered. Mixed-recipient retries reuse one cached verdict, while
+  pause, unsubscribe, revocation, and exhausted deliveries remain distinct.
+- Default the evaluator to `gpt-5.6-terra`, keep browsing disabled, distinguish
+  retryable API failures from permanent ones, and avoid truncating escaped HTML
+  entities into malformed Telegram messages.
+- Document the optional OpenAI environment settings and the listing metadata
+  sent for evaluation.
+
+### Live editing safeguards
+
+- Apply Normal/Fast polling changes to the live scheduler without requiring an
+  application restart.
+- Refresh Edit-query data when the modal opens and reject a stale browser tab
+  before it can overwrite newer URL, name, polling, quiet-hours, or deal-rating
+  settings.
+- Save query details, preferences, and AI membership in one SQLite transaction.
+- Enforce the five-active-Fast-query safety cap inside the same SQLite write
+  transaction for Add, Edit, single Resume, and bulk Resume operations.
+
 ### Priority monitoring and deal guidance
 
-- Add per-query Normal and Fast monitoring modes. Fast searches use a safe,
-  serialized 90-second schedule while ordinary searches retain the configured
-  refresh interval.
+- Add per-query Normal and Fast monitoring modes. The selected values are base
+  cadence requests; the central safety plan may lengthen either cadence to keep
+  total Vinted traffic inside the shared budget.
 - Allow selected priority queries to keep scraping and notify immediately
   during quiet hours, while all ordinary queries remain paused.
-- Stagger per-query schedules and keep one scraper worker so priority searches
-  do not create a second concurrent request stream or a cold-start burst.
+- Coalesce overdue work and keep one scraper worker so priority searches do not
+  create a second concurrent request stream or a cold-start burst.
 - Add optional per-query Excellent and Good listing-price ceilings. Telegram
   alerts are labelled Excellent, Good, or Don't Buy (above the chosen limit),
   with an explicit reminder that postage, buyer fees, condition, and

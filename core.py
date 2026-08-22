@@ -1,4 +1,3 @@
-import ai_deal_evaluator
 import db
 import deal_evaluator
 import html
@@ -24,11 +23,29 @@ _VERSION_CACHE_TIME = 0.0
 _VERSION_CACHE_TTL_SECONDS = 6 * 60 * 60
 _VERSION_CACHE_LOCK = threading.Lock()
 _ITEM_PAGE_REQUEST_TIMEOUT = (5, 10)
-_SCRAPER_FORBIDDEN_LIMIT = 3
+_USER_COUNTRY_CACHE = {}
+_USER_COUNTRY_CACHE_LOCK = threading.Lock()
+_USER_COUNTRY_CACHE_MAX_ENTRIES = 5000
+_SCRAPER_FORBIDDEN_LIMIT = 1
 _SCRAPER_COOLDOWN_SECONDS = (5 * 60, 10 * 60, 15 * 60)
+_SCRAPER_FORBIDDEN_COOLDOWN_SECONDS = (
+    5 * 60,
+    30 * 60,
+    2 * 60 * 60,
+    8 * 60 * 60,
+)
+_SCRAPER_RATE_LIMIT_MIN_COOLDOWN_SECONDS = 30
+_SCRAPER_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 5 * 60
 _SCRAPER_MIN_QUERY_SPACING_SECONDS = 1.0
 _SCRAPER_MAX_QUERY_SPACING_SECONDS = 5.0
 _SCRAPER_TARGET_ACTIVE_FRACTION = 0.50
+_SCRAPER_LOCAL_COOLDOWN_LOCK = threading.Lock()
+_SCRAPER_LOCAL_COOLDOWN = {
+    "until": 0,
+    "level": 0,
+    "status_code": None,
+    "skip_logged_until": 0,
+}
 _ITEM_PAGE_NAVIGATION_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -212,37 +229,121 @@ def process_remove_country(country):
 
 
 def get_user_country(profile_id):
-    """
-    Get the country code for a Vinted user.
+    """Get one seller country with one paced request and no auth retry."""
+    if not profile_id or get_scraper_cooldown()["active"]:
+        return "XX"
 
-    Makes an API request to retrieve the user's country code.
-    Handles rate limiting by trying an alternative endpoint.
-
-    Args:
-        profile_id (str): The Vinted user's profile ID
-
-    Returns:
-        str: The user's country code (2-letter ISO code) or "XX" if it can't be determined
-    """
-    # Users are shared between all Vinted platforms, so we can use whatever locale we want
+    # Users are shared between all Vinted platforms, so we can use whatever locale we want.
     url = f"https://www.vinted.fr/api/v2/users/{profile_id}?localize=false"
-    response = requester.get(url)
-    # That's a LOT of requests, so if we get a 429 we wait a bit before retrying once
-    if response.status_code == 429:
-        # In case of rate limit, we're switching the endpoint. This one is slower, but it doesn't RL as soon.
-        # We're limiting the items per page to 1 to grab as little data as possible
-        url = f"https://www.vinted.fr/api/v2/users/{profile_id}/items?page=1&per_page=1"
-        response = requester.get(url)
-        try:
-            user_country = response.json()["items"][0]["user"]["country_iso_code"]
-        except KeyError:
-            logger.warning(
-                "Couldn't get the country due to too many requests. Returning default value."
+    response = None
+    try:
+        response = requester.get_once(
+            url,
+            cancel_if=lambda: get_scraper_cooldown()["active"],
+        )
+    except requests.exceptions.RequestException:
+        logger.warning(
+            "Could not reach Vinted while determining the user country; "
+            "using the unknown-country fallback."
+        )
+        return "XX"
+
+    # A cooldown may open while this call waits for the shared request slot.
+    # Cancellation returns None without performing the HTTP request.
+    if response is None:
+        return "XX"
+
+    status_code = getattr(response, "status_code", None)
+    if status_code != 200:
+        if status_code == 429:
+            _activate_scraper_cooldown(
+                status_code,
+                duration_seconds=_get_bounded_retry_after_seconds(response),
             )
-            user_country = "XX"
-    else:
-        user_country = response.json()["user"]["country_iso_code"]
-    return user_country
+        elif status_code in (401, 403):
+            _activate_scraper_cooldown(status_code)
+        logger.warning(
+            "Could not determine the Vinted user country after HTTP %s; "
+            "using the unknown-country fallback.",
+            status_code,
+        )
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+        return "XX"
+
+    try:
+        country = _normalise_country_code(response.json()["user"]["country_iso_code"])
+        return country or "XX"
+    except (KeyError, TypeError, ValueError):
+        logger.warning(
+            "Vinted returned an invalid user-country response; using the "
+            "unknown-country fallback."
+        )
+        return "XX"
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+
+def _normalise_country_code(value):
+    text = str(value or "").strip().upper()
+    return text if len(text) == 2 and text.isalpha() else None
+
+
+def _embedded_item_country(item):
+    """Return a seller country already embedded in the catalogue item."""
+    raw_data = getattr(item, "raw_data", {})
+    if not isinstance(raw_data, dict):
+        return None
+
+    user = raw_data.get("user")
+    user = user if isinstance(user, dict) else {}
+    country = user.get("country")
+    country = country if isinstance(country, dict) else {}
+    for value in (
+        user.get("country_iso_code"),
+        user.get("country_code"),
+        country.get("iso_code"),
+        country.get("code"),
+        raw_data.get("country_iso_code"),
+    ):
+        normalised = _normalise_country_code(value)
+        if normalised:
+            return normalised
+    return None
+
+
+def _resolve_item_country(item):
+    """Prefer catalogue metadata, then one cached and paced profile lookup."""
+    embedded = _embedded_item_country(item)
+    if embedded:
+        return embedded
+
+    raw_data = getattr(item, "raw_data", {})
+    user = raw_data.get("user") if isinstance(raw_data, dict) else None
+    profile_id = user.get("id") if isinstance(user, dict) else None
+    if profile_id in (None, ""):
+        return "XX"
+
+    cache_key = str(profile_id)
+    with _USER_COUNTRY_CACHE_LOCK:
+        cached = _USER_COUNTRY_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    country = get_user_country(profile_id)
+    # Preserve the historical fail-open "XX" allowlist semantics, but do not
+    # cache unknown: later catalogue data or a recovered request may resolve it.
+    if country != "XX":
+        with _USER_COUNTRY_CACHE_LOCK:
+            if len(_USER_COUNTRY_CACHE) >= _USER_COUNTRY_CACHE_MAX_ENTRIES:
+                oldest_key = next(iter(_USER_COUNTRY_CACHE), None)
+                if oldest_key is not None:
+                    _USER_COUNTRY_CACHE.pop(oldest_key, None)
+            _USER_COUNTRY_CACHE[cache_key] = country
+    return country
 
 
 def _parse_quiet_time(value, fallback):
@@ -366,7 +467,8 @@ def _get_retry_after_seconds(response, fallback_seconds):
     if response is None:
         return fallback_seconds
 
-    retry_after = response.headers.get("Retry-After")
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
     if not retry_after:
         return fallback_seconds
 
@@ -383,6 +485,15 @@ def _get_retry_after_seconds(response, fallback_seconds):
         return max(1, seconds)
     except (TypeError, ValueError, OverflowError):
         return fallback_seconds
+
+
+def _get_bounded_retry_after_seconds(response):
+    """Return a safe global cooldown for one confirmed HTTP 429 response."""
+    seconds = _get_retry_after_seconds(response, fallback_seconds=60)
+    return min(
+        max(seconds, _SCRAPER_RATE_LIMIT_MIN_COOLDOWN_SECONDS),
+        _SCRAPER_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+    )
 
 
 def _get_query_spacing_seconds(query_count, refresh_delay=None):
@@ -425,6 +536,19 @@ def get_scraper_cooldown(now=None):
     until = max(0, _parameter_int("scraper_cooldown_until"))
     level = max(0, _parameter_int("scraper_cooldown_level"))
     status_code = _parameter_int("scraper_last_block_status") or None
+
+    # Persistence is the source of truth across restarts, but a transient
+    # SQLite write failure must not let the very next queued scheduler job hit
+    # Vinted again. Merge in the scraper process's immediate fallback state.
+    with _SCRAPER_LOCAL_COOLDOWN_LOCK:
+        local = dict(_SCRAPER_LOCAL_COOLDOWN)
+    if local["until"] > until:
+        status_code = local["status_code"]
+    until = max(until, local["until"])
+    level = max(level, local["level"])
+    if status_code is None and local["status_code"] is not None:
+        status_code = local["status_code"]
+
     remaining = max(0, until - now)
     return {
         "active": remaining > 0,
@@ -435,26 +559,49 @@ def get_scraper_cooldown(now=None):
     }
 
 
-def _activate_scraper_cooldown(status_code, now=None):
-    """Open or escalate the persistent 5/10/15-minute circuit breaker."""
+def _activate_scraper_cooldown(status_code, now=None, duration_seconds=None):
+    """Open the persistent circuit breaker, optionally for an exact duration."""
     now = int(now if now is not None else time.time())
+    cooldown_seconds = (
+        _SCRAPER_FORBIDDEN_COOLDOWN_SECONDS
+        if status_code == 403
+        else _SCRAPER_COOLDOWN_SECONDS
+    )
     current_level = min(
         get_scraper_cooldown(now=now)["level"],
-        len(_SCRAPER_COOLDOWN_SECONDS),
+        len(cooldown_seconds),
     )
-    duration = _SCRAPER_COOLDOWN_SECONDS[
-        min(current_level, len(_SCRAPER_COOLDOWN_SECONDS) - 1)
-    ]
-    new_level = min(current_level + 1, len(_SCRAPER_COOLDOWN_SECONDS))
+    escalated_duration = cooldown_seconds[min(current_level, len(cooldown_seconds) - 1)]
+    duration = (
+        escalated_duration
+        if duration_seconds is None
+        else max(1, int(duration_seconds))
+    )
+    new_level = min(current_level + 1, len(cooldown_seconds))
     until = now + duration
-    if not db.set_parameters(
-        {
-            "scraper_cooldown_until": str(until),
-            "scraper_cooldown_level": str(new_level),
-            "scraper_last_block_status": str(status_code),
-            "scraper_consecutive_403s": "0",
-        }
-    ):
+
+    with _SCRAPER_LOCAL_COOLDOWN_LOCK:
+        _SCRAPER_LOCAL_COOLDOWN.update(
+            {
+                "until": until,
+                "level": new_level,
+                "status_code": status_code,
+                "skip_logged_until": 0,
+            }
+        )
+
+    try:
+        persisted = db.set_parameters(
+            {
+                "scraper_cooldown_until": str(until),
+                "scraper_cooldown_level": str(new_level),
+                "scraper_last_block_status": str(status_code),
+                "scraper_consecutive_403s": "0",
+            }
+        )
+    except Exception:
+        persisted = False
+    if not persisted:
         logger.warning("Could not persist the scraper cooldown state.")
     return {
         "active": True,
@@ -470,15 +617,45 @@ def _clear_scraper_cooldown():
     cooldown = get_scraper_cooldown()
     consecutive_403s = _parameter_int("scraper_consecutive_403s")
     if cooldown["level"] or cooldown["until"] or consecutive_403s:
-        if not db.set_parameters(
-            {
-                "scraper_cooldown_until": "0",
-                "scraper_cooldown_level": "0",
-                "scraper_last_block_status": "",
-                "scraper_consecutive_403s": "0",
-            }
-        ):
+        try:
+            persisted = db.set_parameters(
+                {
+                    "scraper_cooldown_until": "0",
+                    "scraper_cooldown_level": "0",
+                    "scraper_last_block_status": "",
+                    "scraper_consecutive_403s": "0",
+                }
+            )
+        except Exception:
+            persisted = False
+        if not persisted:
             logger.warning("Could not clear the scraper cooldown state.")
+    with _SCRAPER_LOCAL_COOLDOWN_LOCK:
+        _SCRAPER_LOCAL_COOLDOWN.update(
+            {
+                "until": 0,
+                "level": 0,
+                "status_code": None,
+                "skip_logged_until": 0,
+            }
+        )
+
+
+def _log_scraper_cooldown_skip(cooldown):
+    """Warn once per opened cooldown; queued jobs only emit debug noise."""
+    with _SCRAPER_LOCAL_COOLDOWN_LOCK:
+        already_logged = (
+            _SCRAPER_LOCAL_COOLDOWN["skip_logged_until"] == cooldown["until"]
+        )
+        _SCRAPER_LOCAL_COOLDOWN["skip_logged_until"] = cooldown["until"]
+
+    log = logger.debug if already_logged else logger.warning
+    log(
+        "Scraper circuit breaker is open after HTTP %s; skipping this "
+        "cycle with approximately %s minute(s) remaining.",
+        cooldown["status_code"] or "403",
+        max(1, (cooldown["remaining"] + 59) // 60),
+    )
 
 
 def record_scraper_heartbeat():
@@ -498,19 +675,25 @@ def _finalize_scrape_cycle(
     successful_fetches,
     query_count,
     blocked_status=None,
+    count_failed_cycle=True,
 ):
-    """Update health counters after a scrape cycle completes."""
+    """Update health counters after a complete cycle or scheduled query run.
+
+    Serialized per-query scheduling calls :func:`process_items` once per due
+    query. Such a call may update successful health, but one failed query must
+    not masquerade as an entire failed sweep of every active query.
+    """
     now = int(time.time())
     try:
         db.set_parameter("scraper_last_cycle", str(now))
-        if blocked_status is not None:
+        if blocked_status is not None and count_failed_cycle:
             failed = _parameter_int("scraper_failed_cycles")
             db.set_parameter("scraper_failed_cycles", str(failed + 1))
         elif successful_fetches > 0:
             db.set_parameter("scraper_last_ok", str(now))
             db.set_parameter("scraper_failed_cycles", "0")
             _clear_scraper_cooldown()
-        elif query_count > 0:
+        elif query_count > 0 and count_failed_cycle:
             # A full cycle that reached nothing usually means Vinted is
             # blocking every request (403/429), not an empty marketplace.
             failed = _parameter_int("scraper_failed_cycles")
@@ -588,7 +771,6 @@ def process_items(
     searches remain silent overnight, while an opted-in priority search can
     still be scraped and delivered immediately.
     """
-    record_scraper_heartbeat()
 
     quiet_active, quiet_start, quiet_end, quiet_timezone = get_quiet_hours_status()
     if quiet_active and not monitor_during_quiet_hours:
@@ -602,17 +784,21 @@ def process_items(
 
     cooldown = get_scraper_cooldown()
     if cooldown["active"]:
-        logger.warning(
-            "Scraper circuit breaker is open after HTTP %s; skipping this "
-            "cycle with approximately %s minute(s) remaining.",
-            cooldown["status_code"] or "403",
-            max(1, (cooldown["remaining"] + 59) // 60),
-        )
+        _log_scraper_cooldown_skip(cooldown)
         return
+    recovery_probe = cooldown["level"] > 0
 
     # Only scrape enabled queries; paused ones stay in the database but make
     # no requests.
-    all_queries = db.get_queries(enabled_only=True)
+    try:
+        all_queries = db.get_queries(enabled_only=True, raise_errors=True)
+    except Exception:
+        logger.error(
+            "Could not read active queries; skipping this dispatch safely.",
+            exc_info=True,
+        )
+        return
+    record_scraper_heartbeat()
 
     if query_ids is not None:
         if isinstance(query_ids, (str, int)):
@@ -647,7 +833,6 @@ def process_items(
         base_spacing,
     )
 
-    total_429s = 0
     successful_fetches = 0
     consecutive_403s = _parameter_int("scraper_consecutive_403s")
     cycle_block_status = None
@@ -671,37 +856,42 @@ def process_items(
             logger.info("Skipping query %s because it was paused mid-cycle.", query_id)
             continue
 
-        for attempt in range(2):
-            if _quiet_hours_active() and not monitor_during_quiet_hours:
-                logger.info(
-                    "Quiet hours began before a retry; ending this scrape cycle."
-                )
-                break
+        try:
+            # Requester owns the one bounded session-refresh retry. The scrape
+            # scheduler must never sleep and retry a rate-limited query itself.
+            all_items = vinted.items.search(
+                query_url,
+                nbr_items=items_per_query,
+            )
+            consecutive_403s = 0
+        except requests.exceptions.HTTPError as error:
+            response = error.response
+            status_code = response.status_code if response is not None else None
 
-            try:
-                all_items = vinted.items.search(
-                    query_url,
-                    nbr_items=items_per_query,
+            if status_code == 401:
+                cooldown = _activate_scraper_cooldown(401)
+                cycle_block_status = 401
+                logger.error(
+                    "Scraper circuit breaker opened after a confirmed "
+                    "HTTP 401 response. Stopping requests and cooling "
+                    "down for %s minutes.",
+                    max(1, (cooldown["remaining"] + 59) // 60),
                 )
-                consecutive_403s = 0
-                break
-            except requests.exceptions.HTTPError as error:
-                response = error.response
-                status_code = response.status_code if response is not None else None
-
-                if status_code == 403:
-                    consecutive_403s += 1
-                    logger.warning(
-                        "Vinted rejected query %s/%s with HTTP 403 "
-                        "(%s/%s consecutive).",
-                        position,
-                        query_count,
-                        consecutive_403s,
-                        _SCRAPER_FORBIDDEN_LIMIT,
-                    )
-                    if consecutive_403s >= _SCRAPER_FORBIDDEN_LIMIT:
-                        cooldown = _activate_scraper_cooldown(403)
-                        cycle_block_status = 403
+            elif status_code == 403:
+                consecutive_403s += 1
+                forbidden_limit = 1 if recovery_probe else _SCRAPER_FORBIDDEN_LIMIT
+                if consecutive_403s >= forbidden_limit:
+                    cooldown = _activate_scraper_cooldown(403)
+                    cycle_block_status = 403
+                    if recovery_probe:
+                        logger.error(
+                            "Scraper recovery probe received a confirmed HTTP 403; "
+                            "reopening the circuit breaker at level %s for %s "
+                            "minutes.",
+                            cooldown["level"],
+                            cooldown["remaining"] // 60,
+                        )
+                    else:
                         logger.error(
                             "Scraper circuit breaker opened after %s "
                             "consecutive HTTP 403 responses. Stopping the "
@@ -709,64 +899,54 @@ def process_items(
                             consecutive_403s,
                             cooldown["remaining"] // 60,
                         )
-                    break
-
-                consecutive_403s = 0
-                if status_code != 429:
-                    logger.error(
-                        "HTTP error while scraping query %s/%s: %s",
+                else:
+                    logger.warning(
+                        "Vinted rejected query %s/%s with HTTP 403 "
+                        "(%s/%s consecutive).",
                         position,
                         query_count,
-                        query_url,
-                        exc_info=True,
+                        consecutive_403s,
+                        forbidden_limit,
                     )
-                    break
-
-                total_429s += 1
-                if total_429s >= 3:
-                    # The outer loop logs and stops the complete cycle. Do not
-                    # sleep and issue a fourth rate-limited request first.
-                    break
-
-                fallback = 60 * (attempt + 1)
-                wait_seconds = _get_retry_after_seconds(
-                    response,
-                    fallback_seconds=fallback,
+            elif status_code == 429:
+                consecutive_403s = 0
+                wait_seconds = _get_bounded_retry_after_seconds(response)
+                cooldown = _activate_scraper_cooldown(
+                    429,
+                    duration_seconds=wait_seconds,
                 )
-                wait_seconds = min(max(wait_seconds, 30), 300)
-
-                logger.warning(
-                    "Vinted rate-limited query %s/%s. Waiting %s seconds " "before %s.",
-                    position,
-                    query_count,
-                    wait_seconds,
-                    "retrying" if attempt == 0 else "continuing",
-                )
-                time.sleep(wait_seconds)
-
-                if attempt == 1:
-                    logger.error(
-                        "Skipping query after repeated 429 responses: %s",
-                        query_url,
-                    )
-            except requests.exceptions.RequestException:
+                cycle_block_status = 429
                 logger.error(
-                    "Network error while scraping query %s/%s: %s",
+                    "Scraper circuit breaker opened after a confirmed "
+                    "HTTP 429 response. Stopping requests and cooling "
+                    "down for %s seconds.",
+                    cooldown["remaining"],
+                )
+            else:
+                consecutive_403s = 0
+                logger.error(
+                    "HTTP error while scraping query %s/%s: %s",
                     position,
                     query_count,
                     query_url,
                     exc_info=True,
                 )
-                break
-            except Exception:
-                logger.error(
-                    "Unexpected error while scraping query %s/%s: %s",
-                    position,
-                    query_count,
-                    query_url,
-                    exc_info=True,
-                )
-                break
+        except requests.exceptions.RequestException:
+            logger.error(
+                "Network error while scraping query %s/%s: %s",
+                position,
+                query_count,
+                query_url,
+                exc_info=True,
+            )
+        except Exception:
+            logger.error(
+                "Unexpected error while scraping query %s/%s: %s",
+                position,
+                query_count,
+                query_url,
+                exc_info=True,
+            )
 
         if cycle_block_status is not None:
             break
@@ -791,14 +971,6 @@ def process_items(
                 query_url,
             )
 
-        if total_429s >= 3:
-            logger.error(
-                "Stopping this scrape cycle after %s rate-limit responses. "
-                "The next scheduled cycle will try again.",
-                total_429s,
-            )
-            break
-
         if position < query_count and base_spacing > 0:
             jittered_spacing = base_spacing * random.uniform(0.85, 1.15)
             time.sleep(jittered_spacing)
@@ -812,6 +984,7 @@ def process_items(
         successful_fetches,
         query_count,
         blocked_status=cycle_block_status,
+        count_failed_cycle=query_ids is None,
     )
 
 
@@ -888,45 +1061,9 @@ def _get_item_description(item):
     description = getattr(item, "description", None)
     if description:
         return str(description).strip()
-
-    item_url = urlparse(str(getattr(item, "url", "")))
-    item_id = str(getattr(item, "id", ""))
-    if (
-        item_url.scheme not in ("http", "https")
-        or not item_url.netloc
-        or not item_id.isdigit()
-    ):
-        logger.warning("Could not build a safe detail URL for Vinted item %r", item_id)
-        return None
-
-    origin = f"{item_url.scheme}://{item_url.netloc}"
-    detail_url = f"{origin}/items/{item_id}"
-    navigation_headers = {
-        **_ITEM_PAGE_NAVIGATION_HEADERS,
-        "Referer": f"{origin}/",
-    }
-
-    try:
-        # Reuse the catalogue session and its current proxy/cookies, but make
-        # only one browser-style page request. Vinted rejects API-style page
-        # requests with 403, while a normal same-origin navigation exposes the
-        # product description in JSON-LD. Never retry here: enrichment must not
-        # amplify rate limits or hold up a notification indefinitely.
-        with requester.session.get(
-            detail_url,
-            headers=navigation_headers,
-            timeout=_ITEM_PAGE_REQUEST_TIMEOUT,
-            allow_redirects=True,
-        ) as response:
-            response.raise_for_status()
-            return _description_from_item_page(response.text)
-    except requests.exceptions.RequestException as error:
-        logger.warning(
-            "Could not load the description for Vinted item %s: %s",
-            item.id,
-            error,
-        )
-        return None
+    # Per-item Vinted pages are nonessential, high-risk traffic. Catalogue data
+    # is the only supported description source in the notification pipeline.
+    return None
 
 
 def _notification_value(value, fallback="Not provided", max_length=None):
@@ -951,35 +1088,18 @@ def _ai_deal_query_ids():
     return ids
 
 
-def _dispatch_ai_followup(item, query_id, chat_ids):
-    """Run the AI deal verdict off the delivery path and enqueue it as a
-    follow-up notification.
-
-    Runs in a background thread so the item's own alert (already sent) is never
-    delayed by the slow web-search call. Best-effort: any failure just means no
-    follow-up is sent.
-    """
-    try:
-        rating = ai_deal_evaluator.evaluate(item)
-        if not rating:
-            return
-        # The query may have been paused or unsubscribed during the (slow)
-        # evaluation, so re-check who should still receive it.
-        current = {str(c) for c in db.get_query_subscribers(query_id)}
-        recipients = [c for c in chat_ids if str(c) in current]
-        if not recipients:
-            return
-        title = html.escape(str(getattr(item, "title", "") or "")[:120])
-        content = f"🤖 <b>AI check</b> — {title}\n{rating}"
-        db.enqueue_notification(
-            content,
-            getattr(item, "url", None),
-            "Open Vinted",
-            recipients,
-            query_id=query_id,
-        )
-    except Exception:
-        logger.warning("AI deal follow-up failed.", exc_info=True)
+def _ai_evaluation_snapshot(item):
+    """Return primitives safe to persist with a durable AI-evaluation job."""
+    price = getattr(item, "price", None)
+    return {
+        "title": str(getattr(item, "title", "") or ""),
+        "brand": str(getattr(item, "brand_title", "") or ""),
+        "condition": str(getattr(item, "condition", "") or ""),
+        "price": "" if price is None else str(price),
+        "currency": str(getattr(item, "currency", "") or ""),
+        "photo_url": (str(getattr(item, "photo", "") or "") or None),
+        "item_url": str(getattr(item, "url", "") or "") or None,
+    }
 
 
 def clear_item_queue(items_queue, new_items_queue):
@@ -996,6 +1116,7 @@ def clear_item_queue(items_queue, new_items_queue):
             )
             return
         banwords_str = db.get_parameter("banwords")
+        allowlist = db.get_allowlist()
         for item in reversed(data):
 
             if not db.is_query_enabled(query_id):
@@ -1017,16 +1138,15 @@ def clear_item_queue(items_queue, new_items_queue):
                 # We update the timestamp
                 db.update_last_timestamp(query_id, item.raw_timestamp)
                 pass
-            # If there's an allowlist and
-            # If the user's country is not in the allowlist, we just update the timestamp
-            elif db.get_allowlist() != 0 and (
-                get_user_country(item.raw_data["user"]["id"])
-            ) not in (db.get_allowlist() + ["XX"]):
+            # Reject local title exclusions before any optional seller lookup.
+            elif banwords_str and contains_banwords(item.title, banwords_str):
                 db.update_last_timestamp(query_id, item.raw_timestamp)
                 pass
-            # Check if the item title contains any banwords
-            elif banwords_str and contains_banwords(item.title, banwords_str):
-                # If it contains banwords, just update the timestamp and skip
+            # If there's an allowlist and
+            # If the user's country is not in the allowlist, we just update the timestamp
+            elif allowlist != 0 and _resolve_item_country(item) not in (
+                allowlist + ["XX"]
+            ):
                 db.update_last_timestamp(query_id, item.raw_timestamp)
                 pass
             else:
@@ -1069,11 +1189,11 @@ def clear_item_queue(items_queue, new_items_queue):
                         exc_info=True,
                     )
                     content = db.DEFAULT_MESSAGE_TEMPLATE.format(**format_values)
-                # Deal rating. AI-enabled queries get their verdict AFTER the
-                # alert, as a background follow-up (spawned below), so the slow
-                # live web-search call never blocks or delays delivery. Other
-                # queries get the free listing-price ceiling rating inline (it
-                # is instant).
+                # Deal rating. AI-enabled queries persist a durable evaluation
+                # snapshot in the same transaction as the item and its primary
+                # alert. A separate serialized worker sends the result later,
+                # so an API call can never delay the primary notification.
+                # Other queries get the instant listing-price ceiling rating.
                 is_ai_query = query_id in _ai_deal_query_ids()
                 if not is_ai_query:
                     content, _deal_rating = deal_evaluator.prepend_deal_rating(
@@ -1097,6 +1217,9 @@ def clear_item_queue(items_queue, new_items_queue):
                     content=content,
                     notification_url=item.url,
                     button_text="Open Vinted",
+                    ai_evaluation=(
+                        _ai_evaluation_snapshot(item) if is_ai_query else None
+                    ),
                 )
                 if persistence is None:
                     logger.error(
@@ -1135,16 +1258,6 @@ def clear_item_queue(items_queue, new_items_queue):
                         subscriber_chat_ids,
                     )
                 )
-
-                # AI-enabled query: compute the verdict in the background and
-                # deliver it as a follow-up message, so this alert was never
-                # held up by the slow web-search call.
-                if is_ai_query and subscriber_chat_ids:
-                    threading.Thread(
-                        target=_dispatch_ai_followup,
-                        args=(item, query_id, list(subscriber_chat_ids)),
-                        daemon=True,
-                    ).start()
 
 
 def contains_banwords(title, banwords_str):

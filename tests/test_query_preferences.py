@@ -70,13 +70,24 @@ def test_query_preferences_migration_backfills_triggers_and_cascades(
                 enabled INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE parameters (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO parameters (key, value) VALUES ('version', '1.2.1');
             INSERT INTO queries (query) VALUES ('https://www.vinted.co.uk/catalog');
             """)
+
+    # Simulate a live installation that already applied the 1.2.1 migration
+    # before the request-spacing key was added to that migration file.
+    assert db.get_parameter("version") == "1.2.1"
+    assert db.get_parameter("catalogue_request_spacing_seconds") is None
 
     assert db.migrate_query_preferences_schema()
     assert db.migrate_query_preferences_schema()
     assert db.get_query_preferences(1) == db.QUERY_PREFERENCE_DEFAULTS
     assert db.get_parameter("fast_query_refresh_delay") == "90"
+    assert db.get_parameter("catalogue_request_spacing_seconds") == "12"
+
+    db.set_parameter("catalogue_request_spacing_seconds", "30")
+    assert db.migrate_query_preferences_schema()
+    assert db.get_parameter("catalogue_request_spacing_seconds") == "30"
 
     with db.get_db_connection() as conn:
         second_id = conn.execute(

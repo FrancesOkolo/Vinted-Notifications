@@ -1,4 +1,7 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import re
+from urllib.parse import urlencode, urlsplit
+
+from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 from telegram.error import RetryAfter, NetworkError, BadRequest, Conflict
 import db
@@ -16,9 +19,96 @@ logger = get_logger(__name__)
 SEND_MAX_ATTEMPTS = 4
 SEND_BACKOFFS = (2, 5, 10)  # seconds to wait before attempts 2, 3, 4
 OUTBOX_MAX_ATTEMPTS = 10
+_DELIVERY_INELIGIBLE = object()
+_COPY_TEXT_MAX_LENGTH = 256
 
 
-def _eligible_outbox_chat_ids(query_id, queued_chat_ids):
+def _canonical_vinted_item_url(url):
+    """Return a public canonical item URL, or ``None`` for other links."""
+    if not isinstance(url, str):
+        return None
+
+    candidate = url.strip()
+    if not candidate or any(
+        ord(character) < 32 or ord(character) == 127 for character in candidate
+    ):
+        return None
+
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        return None
+
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    is_vinted_uk = hostname == "vinted.co.uk" or hostname.endswith(".vinted.co.uk")
+    item_match = re.match(r"^/items/([0-9]{1,20})(?:[-/]|$)", parsed.path)
+    if (
+        parsed.scheme.lower() != "https"
+        or not is_vinted_uk
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or item_match is None
+    ):
+        return None
+
+    return f"https://www.vinted.co.uk/items/{item_match.group(1)}"
+
+
+def _build_notification_markup(
+    url,
+    text,
+    *,
+    buy_url=None,
+    buy_text=None,
+    query_id=None,
+    polling_enabled=False,
+):
+    """Build item actions consistently for immediate and retried alerts."""
+    buttons = []
+    if url and text:
+        buttons.append([InlineKeyboardButton(text=text, url=url)])
+    if buy_url and buy_text:
+        buttons.append([InlineKeyboardButton(text=buy_text, url=buy_url)])
+
+    item_url = _canonical_vinted_item_url(url)
+    if item_url:
+        share_row = [
+            InlineKeyboardButton(
+                text="Share on WhatsApp",
+                url=f"https://wa.me/?{urlencode({'text': item_url})}",
+            )
+        ]
+        # Telegram accepts 1-256 characters in CopyTextButton. Keep this
+        # explicit because python-telegram-bot does not enforce the limit.
+        if 1 <= len(item_url) <= _COPY_TEXT_MAX_LENGTH:
+            share_row.append(
+                InlineKeyboardButton(
+                    text="Copy item link",
+                    copy_text=CopyTextButton(text=item_url),
+                )
+            )
+        buttons.append(share_row)
+
+    if query_id is not None and polling_enabled:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="Unsubscribe from this search",
+                    callback_data=f"unsubscribe:{int(query_id)}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def _eligible_outbox_chat_ids(
+    query_id,
+    queued_chat_ids,
+    *,
+    ignore_query_pause=False,
+):
     """Filter an alert against current query/subscription state.
 
     ``None`` means the database state could not be read. Callers must retain
@@ -31,7 +121,7 @@ def _eligible_outbox_chat_ids(query_id, queued_chat_ids):
     if state is None:
         return None
     enabled, subscribers = state
-    if not enabled:
+    if not enabled and not ignore_query_pause:
         return []
 
     current_subscribers = {str(value) for value in subscribers}
@@ -690,23 +780,16 @@ class LeRobot:
         if isinstance(chat_ids, (str, int)):
             chat_ids = [chat_ids]
 
-        # Only attach buttons when a link is supplied. Watchdog/status
-        # messages pass url=None and send as plain text.
-        buttons = []
-        if url and text:
-            buttons.append([InlineKeyboardButton(text=text, url=url)])
-        if buy_url and buy_text:
-            buttons.append([InlineKeyboardButton(text=buy_text, url=buy_url)])
-        if query_id is not None and self.polling_enabled:
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text="Unsubscribe from this search",
-                        callback_data=f"unsubscribe:{int(query_id)}",
-                    )
-                ]
-            )
-        markup = InlineKeyboardMarkup(buttons) if buttons else None
+        # Watchdog/status messages pass url=None and send as plain text. The
+        # same builder runs for immediate and durable-outbox retry delivery.
+        markup = _build_notification_markup(
+            url,
+            text,
+            buy_url=buy_url,
+            buy_text=buy_text,
+            query_id=query_id,
+            polling_enabled=self.polling_enabled,
+        )
 
         normalised_chat_ids = list(
             dict.fromkeys(
@@ -728,21 +811,28 @@ class LeRobot:
             approval_states[chat_id] = approval
 
         all_delivered = True
+        had_ineligible_recipient = False
         for chat_id in normalised_chat_ids:
             if not approval_states[chat_id]:
                 logger.info(
                     "Skipping alert for unapproved Telegram chat %s.",
                     chat_id,
                 )
+                had_ineligible_recipient = True
                 continue
 
             delivered = await self._send_message_with_retries(chat_id, content, markup)
             all_delivered = all_delivered and delivered
 
-        # True when every approved recipient received it (or every supplied
-        # recipient was definitively ineligible), False on a Telegram delivery
-        # failure, and None when approval could not be read. The outbox retains
-        # the recipient unchanged for the latter case.
+        # The outbox calls this method with one recipient at a time. Preserve a
+        # distinct ineligible result so a revocation race is discarded without
+        # being mistaken for a successful Telegram acknowledgement.
+        if had_ineligible_recipient:
+            return _DELIVERY_INELIGIBLE
+
+        # True when every supplied recipient received it, False on a Telegram
+        # delivery failure, and None when approval could not be read. The
+        # outbox retains the recipient unchanged for the latter case.
         return all_delivered
 
     async def unsubscribe_query(
@@ -1018,6 +1108,7 @@ class LeRobot:
                 chat_ids_json,
                 query_id,
                 attempts,
+                ignore_query_pause,
             ) in due:
                 if chat_ids_json is None:
                     configured_chat_id = db.get_parameter("telegram_chat_id")
@@ -1069,7 +1160,11 @@ class LeRobot:
                 )
 
                 if query_id is not None:
-                    eligible_chat_ids = _eligible_outbox_chat_ids(query_id, chat_ids)
+                    eligible_chat_ids = _eligible_outbox_chat_ids(
+                        query_id,
+                        chat_ids,
+                        ignore_query_pause=bool(ignore_query_pause),
+                    )
                     if eligible_chat_ids is None:
                         logger.error(
                             "Could not verify recipients for notification %s; "
@@ -1102,7 +1197,11 @@ class LeRobot:
                     # is being delivered. Drop a recipient that became ineligible
                     # before their individual send.
                     current_eligibility = (
-                        _eligible_outbox_chat_ids(query_id, [chat_id])
+                        _eligible_outbox_chat_ids(
+                            query_id,
+                            [chat_id],
+                            ignore_query_pause=bool(ignore_query_pause),
+                        )
                         if query_id is not None
                         else [chat_id]
                     )
@@ -1115,7 +1214,7 @@ class LeRobot:
                         )
                         return
                     if not current_eligibility:
-                        remaining_count = db.ack_notification_recipient(
+                        remaining_count = db.discard_notification_recipient(
                             notif_id, chat_id
                         )
                         if remaining_count is None:
@@ -1164,6 +1263,18 @@ class LeRobot:
                             notif_id,
                         )
                         return
+                    if delivered is _DELIVERY_INELIGIBLE:
+                        remaining_count = db.discard_notification_recipient(
+                            notif_id, chat_id
+                        )
+                        if remaining_count is None:
+                            logger.error(
+                                "Could not discard newly ineligible recipient "
+                                "for notification %s; stopping this outbox pass.",
+                                notif_id,
+                            )
+                            return
+                        continue
                     if delivered:
                         remaining_count = db.ack_notification_recipient(
                             notif_id, chat_id

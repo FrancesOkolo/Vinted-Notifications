@@ -15,7 +15,9 @@ _PROXY_CACHE_INITIALIZED = False
 _SINGLE_PROXY = None
 
 # URL to test proxies against
-_TEST_URL = "https://www.vinted.fr/"
+# Use a neutral endpoint: proxy discovery must never create a parallel Vinted
+# request stream outside the application's shared pacing/cooldown controls.
+_TEST_URL = "https://example.com/"
 _TEST_TIMEOUT = 2  # seconds
 # Maximum number of concurrent workers for proxy checking
 MAX_PROXY_WORKERS = 10

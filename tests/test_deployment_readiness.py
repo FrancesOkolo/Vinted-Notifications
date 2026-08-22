@@ -458,45 +458,22 @@ def test_rss_dispatches_when_no_telegram_subscribers(database):
         conn.close()
 
 
-def test_item_description_uses_browser_navigation_headers(database, monkeypatch):
+def test_item_description_never_fetches_a_vinted_detail_page(database, monkeypatch):
     core = _core()
-    calls = []
-
-    class Response:
-        text = """
-        <script type="application/ld+json">
-        {"@type": "Product", "description": "A detailed Vinted listing"}
-        </script>
-        """
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def raise_for_status(self):
-            return None
-
-    def fake_get(url, **kwargs):
-        calls.append((url, kwargs))
-        return Response()
 
     class Item:
         id = 12345
         url = "https://www.vinted.co.uk/items/12345-example"
         description = None
 
-    monkeypatch.setattr(core.requester.session, "get", fake_get)
-
-    assert core._get_item_description(Item()) == "A detailed Vinted listing"
-    assert len(calls) == 1
-    assert calls[0][0] == "https://www.vinted.co.uk/items/12345"
-    assert calls[0][1]["timeout"] == (5, 10)
-    assert calls[0][1]["allow_redirects"] is True
-    assert calls[0][1]["headers"]["Sec-Fetch-Dest"] == "document"
-    assert calls[0][1]["headers"]["Sec-Fetch-Mode"] == "navigate"
-    assert calls[0][1]["headers"]["Referer"] == "https://www.vinted.co.uk/"
+    monkeypatch.setattr(
+        core.requester.session,
+        "get",
+        lambda *args, **kwargs: pytest.fail("detail page request must not run"),
+    )
+    assert core._get_item_description(Item()) is None
+    Item.description = " Catalogue description "
+    assert core._get_item_description(Item()) == "Catalogue description"
 
 
 def test_version_check_is_cached_and_has_a_timeout(database, monkeypatch):
@@ -643,6 +620,27 @@ def test_remove_description_migration_repairs_stored_template(database):
     assert db.get_parameter("message_template") == migrated
 
 
+@pytest.fixture
+def requester_clock(database, monkeypatch):
+    """Make the process-wide requester gate instant and deterministic."""
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+    clock = [0.0]
+    waits = []
+
+    def sleep(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+
+    requester_module._reset_catalogue_request_gate()
+    monkeypatch.setattr(requester_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(requester_module.time, "sleep", sleep)
+    monkeypatch.setattr(requester_module.random, "uniform", lambda low, high: 0.0)
+    yield waits
+    requester_module._reset_catalogue_request_gate()
+
+
 @pytest.mark.parametrize(
     ("status_code", "expected_calls"),
     [(403, 2), (429, 1)],
@@ -652,6 +650,7 @@ def test_requester_uses_one_bounded_retry_for_block_responses(
     monkeypatch,
     status_code,
     expected_calls,
+    requester_clock,
 ):
     import importlib
 
@@ -683,21 +682,22 @@ def test_requester_uses_one_bounded_retry_for_block_responses(
     client = requester_module.Requester()
     client.session = Session()
     monkeypatch.setattr(client, "_rebuild_session", lambda: None)
-    waits = []
-    monkeypatch.setattr(requester_module.time, "sleep", waits.append)
 
     response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
 
     assert response.status_code == status_code
     assert client.session.calls == expected_calls
-    assert waits == (
-        [requester_module.FORBIDDEN_RETRY_DELAY_SECONDS] if status_code == 403 else []
+    assert requester_clock == (
+        [requester_module.FORBIDDEN_RETRY_DELAY_SECONDS, 9.0]
+        if status_code == 403
+        else []
     )
 
 
 def test_requester_recovers_from_transient_403_with_fresh_session(
     database,
     monkeypatch,
+    requester_clock,
 ):
     import importlib
 
@@ -736,7 +736,6 @@ def test_requester_recovers_from_transient_403_with_fresh_session(
         "_rebuild_session",
         lambda: setattr(client, "session", fresh_session),
     )
-    monkeypatch.setattr(requester_module.time, "sleep", lambda seconds: None)
 
     response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
 
@@ -745,9 +744,65 @@ def test_requester_recovers_from_transient_403_with_fresh_session(
     assert fresh_session.calls == 1
 
 
+@pytest.mark.parametrize("fresh_status", [200, 401])
+def test_requester_rebuilds_session_once_for_401(
+    database,
+    monkeypatch,
+    fresh_status,
+    requester_clock,
+):
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class Session:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            return Response(self.status_code)
+
+    monkeypatch.setattr(
+        requester_module.proxies,
+        "configure_proxy",
+        lambda session: False,
+    )
+    client = requester_module.Requester()
+    rejected_session = Session(401)
+    fresh_session = Session(fresh_status)
+    client.session = rejected_session
+    rebuilds = []
+
+    def rebuild():
+        rebuilds.append(True)
+        client.session = fresh_session
+
+    monkeypatch.setattr(client, "_rebuild_session", rebuild)
+
+    response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
+
+    assert response.status_code == fresh_status
+    assert rejected_session.calls == 1
+    assert fresh_session.calls == 1
+    assert rebuilds == [True]
+
+
 def test_requester_retries_connection_reset_then_succeeds(
     database,
     monkeypatch,
+    requester_clock,
 ):
     """A reset keep-alive socket (common on the first request of a cycle) is
     retried on a fresh connection instead of surfacing as a network error."""
@@ -785,7 +840,6 @@ def test_requester_retries_connection_reset_then_succeeds(
     )
     client = requester_module.Requester()
     client.session = Session()
-    monkeypatch.setattr(requester_module.time, "sleep", lambda seconds: None)
 
     response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
 
@@ -796,6 +850,7 @@ def test_requester_retries_connection_reset_then_succeeds(
 def test_requester_gives_up_after_persistent_connection_resets(
     database,
     monkeypatch,
+    requester_clock,
 ):
     """Persistent resets are surfaced to the scraper after bounded retries."""
     import importlib
@@ -818,12 +873,281 @@ def test_requester_gives_up_after_persistent_connection_resets(
     )
     client = requester_module.Requester()
     client.session = Session()
-    monkeypatch.setattr(requester_module.time, "sleep", lambda seconds: None)
 
     with pytest.raises(requests.exceptions.ConnectionError):
         client.get("https://www.vinted.co.uk/api/v2/catalog/items")
 
     assert client.session.calls == requester_module.CONNECTION_RESET_MAX_RETRIES + 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({}, "XX"),
+        ({"user": {"country_iso_code": "gb"}}, "GB"),
+    ],
+)
+def test_get_user_country_fails_closed_on_payload_errors(
+    database,
+    monkeypatch,
+    payload,
+    expected,
+):
+    core = _core()
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return payload
+
+        def close(self):
+            return None
+
+    def get_once(url, **kwargs):
+        calls.append((url, kwargs.get("cancel_if")))
+        return Response()
+
+    monkeypatch.setattr(core.requester, "get_once", get_once, raising=False)
+
+    assert core.get_user_country("123") == expected
+    assert len(calls) == 1
+    assert callable(calls[0][1])
+
+
+def test_get_user_country_fails_closed_on_network_error(database, monkeypatch):
+    import requests
+
+    core = _core()
+    calls = []
+
+    def get_once(url, **kwargs):
+        calls.append((url, kwargs.get("cancel_if")))
+        raise requests.exceptions.ConnectionError("offline")
+
+    monkeypatch.setattr(core.requester, "get_once", get_once, raising=False)
+
+    assert core.get_user_country("123") == "XX"
+    assert len(calls) == 1
+    assert callable(calls[0][1])
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 429])
+def test_country_profile_block_opens_global_cooldown_with_missing_headers(
+    database,
+    monkeypatch,
+    status_code,
+):
+    core = _core()
+    core._clear_scraper_cooldown()
+    calls = []
+
+    class Response:
+        def __init__(self):
+            self.status_code = status_code
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+
+    def get_once(url, **kwargs):
+        calls.append((url, kwargs.get("cancel_if")))
+        return response
+
+    monkeypatch.setattr(core.requester, "get_once", get_once, raising=False)
+    try:
+        assert core.get_user_country("123") == "XX"
+        cooldown = core.get_scraper_cooldown()
+        assert cooldown["active"] is True
+        assert cooldown["status_code"] == status_code
+        assert len(calls) == 1
+        assert callable(calls[0][1])
+        assert response.closed is True
+    finally:
+        core._clear_scraper_cooldown()
+
+
+def test_country_lookup_cancels_if_cooldown_opens_while_waiting(
+    database,
+    monkeypatch,
+):
+    core = _core()
+    core._clear_scraper_cooldown()
+    calls = []
+
+    def get_once(url, *, cancel_if=None, **kwargs):
+        calls.append(url)
+        assert callable(cancel_if)
+        assert cancel_if() is False
+        core._activate_scraper_cooldown(
+            403,
+            now=int(core.time.time()),
+            duration_seconds=60,
+        )
+        assert cancel_if() is True
+        return None
+
+    monkeypatch.setattr(core.requester, "get_once", get_once, raising=False)
+    try:
+        assert core.get_user_country("123") == "XX"
+        assert len(calls) == 1
+    finally:
+        core._clear_scraper_cooldown()
+
+
+def test_item_country_lookup_is_suppressed_during_open_cooldown(
+    database,
+    monkeypatch,
+):
+    core = _core()
+    core._USER_COUNTRY_CACHE.clear()
+    core._activate_scraper_cooldown(
+        403,
+        now=int(core.time.time()),
+        duration_seconds=60,
+    )
+    monkeypatch.setattr(
+        core.requester,
+        "get_once",
+        lambda *args, **kwargs: pytest.fail("country request must not run"),
+        raising=False,
+    )
+    try:
+        assert core.get_user_country("123") == "XX"
+    finally:
+        core._clear_scraper_cooldown()
+
+
+def test_item_country_prefers_embedded_data_and_bounds_successful_cache(
+    database,
+    monkeypatch,
+):
+    core = _core()
+    core._USER_COUNTRY_CACHE.clear()
+    monkeypatch.setattr(core, "_USER_COUNTRY_CACHE_MAX_ENTRIES", 2)
+    calls = []
+
+    def get_country(profile_id):
+        calls.append(profile_id)
+        return "XX" if profile_id == 5 else "GB"
+
+    monkeypatch.setattr(core, "get_user_country", get_country)
+
+    class Item:
+        raw_data = {"user": {"id": 1, "country_iso_code": "fr"}}
+
+    try:
+        assert core._resolve_item_country(Item()) == "FR"
+        assert calls == []
+
+        Item.raw_data = {"user": {"id": 2}}
+        assert core._resolve_item_country(Item()) == "GB"
+        assert core._resolve_item_country(Item()) == "GB"
+        assert calls == [2]
+
+        for profile_id in (3, 4):
+            Item.raw_data = {"user": {"id": profile_id}}
+            assert core._resolve_item_country(Item()) == "GB"
+        assert set(core._USER_COUNTRY_CACHE) == {"3", "4"}
+
+        Item.raw_data = {"user": {"id": 5}}
+        assert core._resolve_item_country(Item()) == "XX"
+        assert core._resolve_item_country(Item()) == "XX"
+        assert calls == [2, 3, 4, 5, 5]
+
+        Item.raw_data = {}
+        assert core._resolve_item_country(Item()) == "XX"
+        assert calls == [2, 3, 4, 5, 5]
+    finally:
+        core._USER_COUNTRY_CACHE.clear()
+
+
+def test_banword_filter_runs_before_country_and_reads_allowlist_once(
+    database,
+    monkeypatch,
+):
+    core = _core()
+    conn = db.get_db_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO queries(query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=blocked", "Blocked"),
+        )
+        query_id = cursor.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    db.set_parameter("banwords", "blocked")
+    db.add_to_allowlist("GB")
+
+    class Item:
+        id = 99
+        title = "Blocked listing"
+        raw_timestamp = 123
+        raw_data = {"user": {"id": 1}}
+
+    allowlist_calls = []
+    original_get_allowlist = core.db.get_allowlist
+
+    def get_allowlist():
+        allowlist_calls.append(True)
+        return original_get_allowlist()
+
+    monkeypatch.setattr(core.db, "get_allowlist", get_allowlist)
+    monkeypatch.setattr(
+        core,
+        "_resolve_item_country",
+        lambda item: pytest.fail("country lookup must follow banword filtering"),
+    )
+    source = queue.Queue()
+    destination = queue.Queue()
+    source.put(([Item()], query_id))
+    core.clear_item_queue(source, destination)
+    assert destination.empty()
+    assert allowlist_calls == [True]
+
+
+def test_unknown_country_keeps_existing_allowlist_fail_open_semantics(
+    database,
+    monkeypatch,
+):
+    core = _core()
+    assert db.migrate_pending_notifications_table()
+    db.set_parameter("banwords", "")
+    db.set_parameter("message_template", db.DEFAULT_MESSAGE_TEMPLATE)
+    db.add_to_allowlist("GB")
+    conn = db.get_db_connection()
+    try:
+        query_id = conn.execute(
+            "INSERT INTO queries(query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=unknown", "Unknown"),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    class Item:
+        id = 199
+        title = "Unknown-country listing"
+        price = 12
+        currency = "GBP"
+        brand_title = "Brand"
+        condition = "Good"
+        description = None
+        photo = None
+        url = "https://www.vinted.co.uk/items/199"
+        raw_timestamp = 200
+        raw_data = {"user": {}}
+
+    monkeypatch.setattr(core, "_resolve_item_country", lambda item: "XX")
+    source = queue.Queue()
+    destination = queue.Queue()
+    source.put(([Item()], query_id))
+    core.clear_item_queue(source, destination)
+    assert not destination.empty()
 
 
 def test_ai_deal_evaluator_formats_verdicts():
@@ -896,6 +1220,7 @@ def test_403_circuit_breaker_stops_cycle_and_escalates_cooldown(
     import requests
 
     core = _core()
+    core._clear_scraper_cooldown()
     db.set_parameter("quiet_hours_enabled", "False")
     db.set_parameter("query_refresh_delay", "300")
 
@@ -940,10 +1265,10 @@ def test_403_circuit_breaker_stops_cycle_and_escalates_cooldown(
     monkeypatch.setattr(core.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(core.random, "uniform", lambda low, high: 1.0)
 
-    # Three confirmed rejected catalogue requests stop the first cycle. The remaining
-    # queries are never contacted.
+    # Requester has already retried with a fresh session, so the first confirmed
+    # rejected query opens protection immediately. No other query is contacted.
     core.process_items(queue.Queue())
-    assert len(search_calls) == 3
+    assert len(search_calls) == 1
     cooldown = core.get_scraper_cooldown(now=clock[0])
     assert cooldown["active"]
     assert cooldown["remaining"] == 5 * 60
@@ -952,29 +1277,77 @@ def test_403_circuit_breaker_stops_cycle_and_escalates_cooldown(
 
     # Scheduled runs during the cooldown make no Vinted requests.
     core.process_items(queue.Queue())
-    assert len(search_calls) == 3
+    assert len(search_calls) == 1
 
-    # A repeated block after each timer expires escalates to 10 then 15 min.
+    # An expired cooldown is a recovery probe. Its first confirmed 403
+    # immediately reopens the breaker.
     clock[0] += 5 * 60 + 1
     core.process_items(queue.Queue())
-    assert len(search_calls) == 6
-    assert core.get_scraper_cooldown(now=clock[0])["remaining"] == 10 * 60
-
-    clock[0] += 10 * 60 + 1
-    core.process_items(queue.Queue())
-    assert len(search_calls) == 9
+    assert len(search_calls) == 2
     cooldown = core.get_scraper_cooldown(now=clock[0])
-    assert cooldown["remaining"] == 15 * 60
+    assert cooldown["remaining"] == 30 * 60
+    assert cooldown["level"] == 2
+
+    # Other already-queued jobs see the reopened global cooldown and make no
+    # Vinted request.
+    core.process_items(queue.Queue())
+    assert len(search_calls) == 2
+
+    # Further failed recovery probes back off substantially for an IP-wide
+    # block, while still making only one confirmed query each time.
+    clock[0] += 30 * 60 + 1
+    core.process_items(queue.Queue())
+    assert len(search_calls) == 3
+    cooldown = core.get_scraper_cooldown(now=clock[0])
+    assert cooldown["remaining"] == 2 * 60 * 60
     assert cooldown["level"] == 3
 
+    clock[0] += 2 * 60 * 60 + 1
+    core.process_items(queue.Queue())
+    assert len(search_calls) == 4
+    cooldown = core.get_scraper_cooldown(now=clock[0])
+    assert cooldown["remaining"] == 8 * 60 * 60
+    assert cooldown["level"] == 4
 
-def test_429_handling_stops_after_three_catalogue_requests(
+
+def test_active_403_cooldown_warns_once_for_queued_jobs(
+    database,
+    monkeypatch,
+    caplog,
+):
+    import logging
+
+    core = _core()
+    core._clear_scraper_cooldown()
+    db.set_parameter("quiet_hours_enabled", "False")
+    monkeypatch.setattr(core.time, "time", lambda: 1_000)
+    core._activate_scraper_cooldown(403, now=1_000)
+    caplog.set_level(logging.DEBUG, logger=core.logger.name)
+
+    for _ in range(3):
+        core.process_items(queue.Queue(), query_ids=[1])
+
+    skips = [
+        record
+        for record in caplog.records
+        if "circuit breaker is open" in record.getMessage()
+        and "skipping this cycle" in record.getMessage()
+    ]
+    assert [record.levelno for record in skips] == [
+        logging.WARNING,
+        logging.DEBUG,
+        logging.DEBUG,
+    ]
+
+
+def test_429_opens_global_cooldown_without_sleeping_in_scheduled_job(
     database,
     monkeypatch,
 ):
     import requests
 
     core = _core()
+    core._clear_scraper_cooldown()
     db.set_parameter("quiet_hours_enabled", "False")
 
     conn = db.get_db_connection()
@@ -990,6 +1363,7 @@ def test_429_handling_stops_after_three_catalogue_requests(
             ],
         )
         conn.commit()
+        query_id = conn.execute("SELECT MIN(id) FROM queries").fetchone()[0]
     finally:
         conn.close()
 
@@ -1002,7 +1376,7 @@ def test_429_handling_stops_after_three_catalogue_requests(
             response = type(
                 "Response",
                 (),
-                {"status_code": 429, "headers": {}},
+                {"status_code": 429, "headers": {"Retry-After": "120"}},
             )()
             raise requests.exceptions.HTTPError(
                 "429 Client Error",
@@ -1014,19 +1388,184 @@ def test_429_handling_stops_after_three_catalogue_requests(
             self.items = Items()
 
     monkeypatch.setattr(core, "Vinted", FakeVinted)
+    monkeypatch.setattr(core.time, "time", lambda: 1_000)
     monkeypatch.setattr(core.time, "sleep", waits.append)
     monkeypatch.setattr(core.random, "uniform", lambda low, high: 1.0)
 
-    core.process_items(queue.Queue())
+    core.process_items(queue.Queue(), query_ids=[query_id])
 
-    assert len(search_calls) == 3
-    # The first two responses retain the existing bounded backoff. The third
-    # opens the rate-limit circuit immediately instead of waiting for a fourth.
-    assert waits[:2] == [60, 120]
+    assert len(search_calls) == 1
+    assert waits == []
+    cooldown = core.get_scraper_cooldown(now=1_000)
+    assert cooldown["active"]
+    assert cooldown["remaining"] == 120
+    assert cooldown["status_code"] == 429
+
+    # Other already-queued per-query jobs return before touching Vinted.
+    core.process_items(queue.Queue(), query_ids=[query_id])
+    assert len(search_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected"),
+    [("1", 30), ("9999", 5 * 60), ("invalid", 60)],
+)
+def test_429_retry_after_is_bounded(database, retry_after, expected):
+    core = _core()
+    response = type("Response", (), {"headers": {"Retry-After": retry_after}})()
+    assert core._get_bounded_retry_after_seconds(response) == expected
+
+
+def test_confirmed_401_opens_global_cooldown_after_one_scheduled_query(
+    database,
+    monkeypatch,
+):
+    import requests
+
+    core = _core()
+    core._clear_scraper_cooldown()
+    db.set_parameter("quiet_hours_enabled", "False")
+    conn = db.get_db_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO queries(query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=auth", "Auth"),
+        )
+        query_id = cursor.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    search_calls = []
+
+    class Items:
+        def search(self, url, nbr_items):
+            search_calls.append(url)
+            response = type("Response", (), {"status_code": 401, "headers": {}})()
+            raise requests.exceptions.HTTPError(
+                "401 Client Error",
+                response=response,
+            )
+
+    class FakeVinted:
+        def __init__(self):
+            self.items = Items()
+
+    monkeypatch.setattr(core, "Vinted", FakeVinted)
+    monkeypatch.setattr(core.time, "time", lambda: 1_000)
+    waits = []
+    monkeypatch.setattr(core.time, "sleep", waits.append)
+
+    core.process_items(queue.Queue(), query_ids=[query_id])
+
+    assert len(search_calls) == 1
+    assert waits == []
+    cooldown = core.get_scraper_cooldown(now=1_000)
+    assert cooldown["active"]
+    assert cooldown["remaining"] == 5 * 60
+    assert cooldown["status_code"] == 401
+    assert db.get_parameter("scraper_failed_cycles") in (None, "0")
+
+    core.process_items(queue.Queue(), query_ids=[query_id])
+    assert len(search_calls) == 1
+
+
+def test_local_cooldown_skips_queued_job_when_persistence_fails(
+    database,
+    monkeypatch,
+):
+    import requests
+
+    core = _core()
+    core._clear_scraper_cooldown()
+    db.set_parameter("quiet_hours_enabled", "False")
+    conn = db.get_db_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO queries(query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=limited", "Limited"),
+        )
+        query_id = cursor.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    search_calls = []
+
+    class Items:
+        def search(self, url, nbr_items):
+            search_calls.append(url)
+            response = type(
+                "Response",
+                (),
+                {"status_code": 429, "headers": {"Retry-After": "75"}},
+            )()
+            raise requests.exceptions.HTTPError(
+                "429 Client Error",
+                response=response,
+            )
+
+    class FakeVinted:
+        def __init__(self):
+            self.items = Items()
+
+    monkeypatch.setattr(core, "Vinted", FakeVinted)
+    monkeypatch.setattr(core.time, "time", lambda: 1_000)
+    monkeypatch.setattr(core.db, "set_parameters", lambda values: False)
+
+    core.process_items(queue.Queue(), query_ids=[query_id])
+    assert len(search_calls) == 1
+    assert core.get_scraper_cooldown(now=1_000)["remaining"] == 75
+
+    core.process_items(queue.Queue(), query_ids=[query_id])
+    assert len(search_calls) == 1
+    core._clear_scraper_cooldown()
+
+
+def test_scheduled_query_failure_is_not_counted_as_a_failed_full_cycle(
+    database,
+    monkeypatch,
+):
+    import requests
+
+    core = _core()
+    db.set_parameter("quiet_hours_enabled", "False")
+    conn = db.get_db_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO queries(query, query_name) VALUES (?, ?)",
+            ("https://www.vinted.co.uk/catalog?search_text=broken", "Broken"),
+        )
+        query_id = cursor.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    class Items:
+        def search(self, url, nbr_items):
+            response = type("Response", (), {"status_code": 500, "headers": {}})()
+            raise requests.exceptions.HTTPError(
+                "500 Server Error",
+                response=response,
+            )
+
+    class FakeVinted:
+        def __init__(self):
+            self.items = Items()
+
+    monkeypatch.setattr(core, "Vinted", FakeVinted)
+
+    core.process_items(queue.Queue(), query_ids=[query_id])
+    assert db.get_parameter("scraper_failed_cycles") in (None, "0")
+
+    # The legacy all-query entry point still represents one complete sweep.
+    core.process_items(queue.Queue())
+    assert db.get_parameter("scraper_failed_cycles") == "1"
 
 
 def test_successful_scrape_clears_persisted_cooldown(database, monkeypatch):
     core = _core()
+    core._clear_scraper_cooldown()
     db.set_parameter("quiet_hours_enabled", "False")
     db.set_parameters(
         {
@@ -1072,6 +1611,7 @@ def test_successful_scrape_clears_persisted_cooldown(database, monkeypatch):
 
 def test_scraper_health_reports_stall_block_and_recovery(database):
     core = _core()
+    core._clear_scraper_cooldown()
     import time as _time
 
     now = int(_time.time())
@@ -1276,7 +1816,8 @@ def test_notification_outbox_persists_and_retries(database):
     due = db.get_due_notifications(limit=10)
     assert {row[0] for row in due} == {first, second}
     # Row shape:
-    # (id, content, url, button_text, chat_ids_json, query_id, attempts)
+    # (id, content, url, button_text, chat_ids_json, query_id, attempts,
+    #  ignore_query_pause)
     first_row = next(row for row in due if row[0] == first)
     second_row = next(row for row in due if row[0] == second)
     assert first_row[5] == 7
@@ -1335,7 +1876,7 @@ def test_strict_telegram_approval_state_distinguishes_database_errors(
 
 def test_send_new_post_fails_closed_when_approval_cannot_be_read(database, monkeypatch):
     import asyncio
-    from telegram_bot_plugin.telegram_bot import LeRobot
+    from telegram_bot_plugin.telegram_bot import LeRobot, _DELIVERY_INELIGIBLE
 
     robot = LeRobot.__new__(LeRobot)
     robot.polling_enabled = False
@@ -1357,7 +1898,7 @@ def test_send_new_post_fails_closed_when_approval_cannot_be_read(database, monke
     assert sent == []
 
     monkeypatch.setattr(db, "get_telegram_user_approval_state", lambda chat_id: False)
-    assert asyncio.run(send_once()) is True
+    assert asyncio.run(send_once()) is _DELIVERY_INELIGIBLE
     assert sent == []
 
     monkeypatch.setattr(db, "get_telegram_user_approval_state", lambda chat_id: True)
@@ -1944,12 +2485,22 @@ def test_subscribed_item_is_persisted_to_outbox_atomically(database):
 
     due = db.get_due_notifications(limit=10)
     assert len(due) == 1
-    _, content, url, button_text, chat_ids_json, queued_query_id, attempts = due[0]
+    (
+        _,
+        content,
+        url,
+        button_text,
+        chat_ids_json,
+        queued_query_id,
+        attempts,
+        ignore_query_pause,
+    ) = due[0]
     assert json.loads(chat_ids_json) == ["123"]
     assert queued_query_id == query_id
     assert url == "https://www.vinted.co.uk/items/77"
     assert button_text == "Open Vinted"
     assert attempts == 0
+    assert ignore_query_pause == 0
     assert "Wool Coat" in content
     conn = db.get_db_connection()
     try:
@@ -2661,7 +3212,7 @@ def test_config_page_health_test_and_single_quiet_hours(database, monkeypatch):
     assert 'id="refreshHealthBtn"' in html_text
 
     # Input guardrails.
-    assert 'min="30"' in html_text  # query refresh delay
+    assert 'min="60"' in html_text  # query refresh delay
     assert 'min="1"' in html_text  # items per query
 
 

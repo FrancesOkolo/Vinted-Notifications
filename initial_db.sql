@@ -92,6 +92,39 @@ CREATE INDEX IF NOT EXISTS idx_query_subscriptions_chat
 CREATE INDEX IF NOT EXISTS idx_query_subscriptions_query
     ON query_subscriptions (query_id);
 
+-- AI verdicts are evaluated asynchronously by one serialized worker. The
+-- durable queue keeps a slow or interrupted OpenAI call from delaying or
+-- losing the primary item alert.
+CREATE TABLE IF NOT EXISTS pending_ai_evaluations
+(
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id                NUMERIC NOT NULL,
+    query_id               INTEGER NOT NULL,
+    title                  TEXT,
+    brand                  TEXT,
+    condition              TEXT,
+    price                  TEXT,
+    currency               TEXT,
+    photo_url              TEXT,
+    item_url               TEXT,
+    chat_ids               TEXT NOT NULL,
+    parent_notification_id INTEGER,
+    delivered_chat_ids     TEXT NOT NULL DEFAULT '[]',
+    handled_chat_ids       TEXT NOT NULL DEFAULT '[]',
+    result_content         TEXT,
+    evaluation_started_at  REAL,
+    attempts               INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at        REAL NOT NULL DEFAULT 0,
+    locked_until           REAL NOT NULL DEFAULT 0,
+    last_error             TEXT,
+    created_at             REAL NOT NULL,
+    UNIQUE (item_id, query_id),
+    FOREIGN KEY (query_id) REFERENCES queries (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_ai_evaluations_due
+    ON pending_ai_evaluations (next_attempt_at, locked_until, id);
+
 
 -- Parameters table
 CREATE TABLE IF NOT EXISTS parameters
@@ -119,8 +152,9 @@ VALUES ('telegram_enabled', 'False'),
        ('github_url', 'https://github.com/FrancesOkolo/Vinted-Notifications'),
 
        ('items_per_query', '20'),
-       ('query_refresh_delay', '60'),
+       ('query_refresh_delay', '180'),
        ('fast_query_refresh_delay', '90'),
+       ('catalogue_request_spacing_seconds', '12'),
        ('quiet_hours_enabled', 'True'),
        ('quiet_hours_start', '01:00'),
        ('quiet_hours_end', '06:00'),

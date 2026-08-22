@@ -13,6 +13,7 @@ from flask import (
 )
 import db
 import core
+import scraper_rate
 import hmac
 import ipaddress
 import json
@@ -41,7 +42,7 @@ mimetypes.add_type("application/javascript", ".mjs")
 # Get logger for this module
 logger = get_logger(__name__)
 
-_MAX_ACTIVE_FAST_QUERIES = 5
+_MAX_ACTIVE_FAST_QUERIES = db.MAX_ACTIVE_FAST_QUERIES
 _QUERY_PREFERENCE_DEFAULTS = {
     "poll_mode": "normal",
     "monitor_during_quiet_hours": False,
@@ -604,6 +605,37 @@ def _query_preferences_with_defaults(preferences):
     return merged
 
 
+def _current_query_edit_state(query_id):
+    """Load current raw editable values and their deterministic revision."""
+    state = db.get_query_edit_state(query_id)
+    if state is None:
+        return None
+    state = dict(state)
+    # Hash the raw database state (where an absent name is NULL). The atomic
+    # writer compares against that same representation inside its transaction.
+    revision = db.query_edit_revision(state)
+    if not revision:
+        raise RuntimeError("Could not create an edit revision.")
+    # The database intentionally preserves a NULL name. Keep it blank in the
+    # form instead of substituting the display label derived from search_text.
+    state["query_name"] = state.get("query_name") or ""
+    ai_enabled = bool(state.get("deal_ai_enabled"))
+    state["deal_mode"] = (
+        "ai"
+        if ai_enabled
+        else "ceiling" if state.get("deal_evaluator_enabled") else "off"
+    )
+    state["revision"] = revision
+    return state
+
+
+def _no_store_json(payload, status=200):
+    response = jsonify(payload)
+    response.status_code = status
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _active_fast_query_ids(preferences_map=None, enabled_map=None):
     preferences_map = (
         preferences_map
@@ -655,16 +687,6 @@ def _ai_deal_query_ids():
         if part.isdigit():
             ids.add(int(part))
     return ids
-
-
-def _set_query_ai_deal(query_id, enabled):
-    """Add or remove one query from the AI-deal-evaluation ID list."""
-    ids = _ai_deal_query_ids()
-    if enabled:
-        ids.add(int(query_id))
-    else:
-        ids.discard(int(query_id))
-    db.set_parameter("deal_ai_query_ids", ",".join(str(i) for i in sorted(ids)))
 
 
 @app.route("/queries")
@@ -738,6 +760,26 @@ def queries():
         queries=formatted_queries,
         max_active_fast_queries=_MAX_ACTIVE_FAST_QUERIES,
     )
+
+
+@app.route("/api/queries/<int:query_id>/edit-state")
+def query_edit_state(query_id):
+    """Return fresh editable values so a stale page cannot seed the modal."""
+    try:
+        state = _current_query_edit_state(query_id)
+    except Exception:
+        logger.exception("Could not load edit state for query %s", query_id)
+        return _no_store_json(
+            {"status": "error", "message": "Could not load this query."},
+            500,
+        )
+
+    if state is None:
+        return _no_store_json(
+            {"status": "error", "message": "Query not found."},
+            404,
+        )
+    return _no_store_json(state)
 
 
 @app.route("/add_query", methods=["POST"])
@@ -922,8 +964,17 @@ def resume_query_bulk():
         )
         return redirect(url_for("queries"))
 
-    resumed = db.set_queries_enabled(selected_ids, True)
-    if resumed is None:
+    resume_status, resumed = db.set_queries_enabled_with_fast_limit(
+        selected_ids,
+        True,
+    )
+    if resume_status == "fast_limit":
+        flash(
+            f"Cannot resume these queries: at most {_MAX_ACTIVE_FAST_QUERIES} "
+            "active queries can use Fast polling.",
+            "error",
+        )
+    elif resume_status == "error":
         flash("Could not resume the selected queries.", "error")
     elif resumed:
         flash(
@@ -976,7 +1027,23 @@ def toggle_query(query_id):
             ),
             409,
         )
-    if db.set_query_enabled(query_id, new_state):
+    toggle_status = db.set_query_enabled_with_fast_limit(query_id, new_state)
+    if toggle_status == "fast_limit":
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": (
+                        f"At most {_MAX_ACTIVE_FAST_QUERIES} active queries "
+                        "can use Fast polling."
+                    ),
+                }
+            ),
+            409,
+        )
+    if toggle_status == "not_found":
+        return jsonify({"status": "error", "message": "Query not found."}), 404
+    if toggle_status in {"updated", "unchanged"}:
         return jsonify({"status": "success", "enabled": new_state})
 
     return (
@@ -989,6 +1056,15 @@ def toggle_query(query_id):
 def update_query(query_id):
     query = request.form.get("query")
     query_name = request.form.get("query_name", "").strip()
+
+    submitted_revision = request.form.get("edit_revision", "").strip()
+    if not submitted_revision:
+        flash(
+            "This edit form is incomplete. Nothing was saved; please reopen it "
+            "and try again.",
+            "warning",
+        )
+        return redirect(url_for("queries"))
 
     if query:
         try:
@@ -1003,24 +1079,38 @@ def update_query(query_id):
                     f"At most {_MAX_ACTIVE_FAST_QUERIES} active queries can use Fast polling."
                 )
             query = normalise_vinted_url(query)
-            message, success = core.process_update_query(
-                query_id, query, name=query_name if query_name != "" else None
+            ai_enabled = request.form.get("deal_mode", "off").strip().lower() == "ai"
+            result = db.update_query_configuration_atomic(
+                query_id,
+                query,
+                query_name if query_name != "" else None,
+                preferences,
+                ai_enabled,
+                expected_revision=submitted_revision,
             )
-            if success and _save_query_preferences(query_id, preferences):
-                _set_query_ai_deal(
-                    query_id,
-                    request.form.get("deal_mode", "off").strip().lower() == "ai",
-                )
+            if result == "updated":
                 flash("Query updated", "success")
-            elif success:
+            elif result == "fast_limit":
                 flash(
-                    "The query was updated, but its alert preferences could not be saved.",
-                    "error",
+                    f"At most {_MAX_ACTIVE_FAST_QUERIES} active queries can "
+                    "use Fast polling. Nothing was saved.",
+                    "warning",
                 )
+            elif result == "stale":
+                flash(
+                    "This query changed after the edit form was opened. Nothing "
+                    "was saved; please reopen it and try again.",
+                    "warning",
+                )
+            elif result == "not_found":
+                flash("That query no longer exists. Nothing was changed.", "warning")
             else:
-                flash(message, "error")
+                flash("The query could not be updated. Nothing was changed.", "error")
         except (ValueError, TypeError) as error:
             flash(str(error), "error")
+        except Exception:
+            logger.exception("Could not atomically update query %s", query_id)
+            flash("The query could not be updated. Nothing was changed.", "error")
     else:
         flash("No query provided", "error")
 
@@ -1213,26 +1303,48 @@ def config():
     params["telegram_token"] = ""
 
     enabled_map = db.get_query_enabled_map()
-    active_count = sum(1 for on in enabled_map.values() if on)
+    active_ids = [query_id for query_id, on in enabled_map.items() if on]
+    active_count = len(active_ids)
     try:
-        refresh_delay = int(params.get("query_refresh_delay") or 300)
+        refresh_delay = int(params.get("query_refresh_delay") or 180)
     except (TypeError, ValueError):
-        refresh_delay = 300
-    # Use the scraper's real pacing calculation so the Config estimate cannot
-    # drift when the production cadence changes.
-    if active_count > 1:
-        spacing = core._get_query_spacing_seconds(active_count, refresh_delay)
-        cycle_seconds = int(spacing * (active_count - 1))
-    else:
-        cycle_seconds = 0
+        refresh_delay = 180
+    try:
+        fast_delay = int(params.get("fast_query_refresh_delay") or 90)
+    except (TypeError, ValueError):
+        fast_delay = 90
+    request_spacing = scraper_rate.bounded_request_spacing(
+        params.get("catalogue_request_spacing_seconds")
+    )
+    try:
+        preferences = db.get_query_preferences_map(query_ids=active_ids) or {}
+    except Exception:
+        preferences = {}
+    fast_count = sum(
+        str(preferences.get(query_id, {}).get("poll_mode", "normal")).lower() == "fast"
+        for query_id in active_ids
+    )
+    cadence = scraper_rate.build_cadence_plan(
+        normal_count=active_count - fast_count,
+        fast_count=fast_count,
+        requested_normal_seconds=refresh_delay,
+        requested_fast_seconds=fast_delay,
+        request_spacing_seconds=request_spacing,
+    )
     query_health = {
         "total": len(enabled_map),
         "active": active_count,
         "paused": sum(1 for on in enabled_map.values() if not on),
-        "refresh_delay": refresh_delay,
-        "cycle_seconds": cycle_seconds,
-        "cycle_minutes": round(cycle_seconds / 60, 1),
-        "keeps_up": cycle_seconds <= refresh_delay,
+        "normal_count": cadence["normal_count"],
+        "fast_count": cadence["fast_count"],
+        "requested_normal_seconds": cadence["requested_normal_seconds"],
+        "requested_fast_seconds": cadence["requested_fast_seconds"],
+        "effective_normal_seconds": cadence["effective_normal_seconds"],
+        "effective_fast_seconds": cadence["effective_fast_seconds"],
+        "request_spacing_seconds": cadence["request_spacing_seconds"],
+        "scheduled_requests_per_minute": round(
+            cadence["scheduled_requests_per_minute"], 1
+        ),
     }
 
     return render_template(
@@ -1409,9 +1521,15 @@ def update_config():
         items_per_query = _validated_int("items_per_query", 20, 1, 100)
         query_refresh_delay = _validated_int(
             "query_refresh_delay",
+            180,
             60,
-            30,
             86400,
+        )
+        catalogue_request_spacing = _validated_int(
+            "catalogue_request_spacing_seconds",
+            12,
+            12,
+            120,
         )
         rss_port = _validated_int("rss_port", 8080, 1024, 65535)
         rss_max_items = _validated_int("rss_max_items", 100, 1, 1000)
@@ -1470,6 +1588,7 @@ def update_config():
         "rss_max_items": rss_max_items,
         "items_per_query": items_per_query,
         "query_refresh_delay": query_refresh_delay,
+        "catalogue_request_spacing_seconds": catalogue_request_spacing,
         "banwords": request.form.get("banwords", ""),
         "quiet_hours_enabled": str("quiet_hours_enabled" in request.form),
         "quiet_hours_start": quiet_start,

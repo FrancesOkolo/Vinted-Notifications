@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 import json
 import time
@@ -22,6 +23,7 @@ QUERY_PREFERENCE_DEFAULTS = {
     "deal_currency": "GBP",
 }
 _QUERY_POLL_MODES = {"normal", "fast"}
+MAX_ACTIVE_FAST_QUERIES = 5
 
 
 def get_db_connection():
@@ -929,7 +931,7 @@ def is_telegram_user_admin(chat_id):
     return bool(user and user[2] == "approved" and int(user[3]) == 1)
 
 
-def get_queries(chat_id=None, enabled_only=False):
+def get_queries(chat_id=None, enabled_only=False, raise_errors=False):
     """
     Return all queries, or only those subscribed to by chat_id.
 
@@ -965,6 +967,8 @@ def get_queries(chat_id=None, enabled_only=False):
         return cursor.fetchall()
     except Exception:
         print_exc()
+        if raise_errors:
+            raise
         return []
     finally:
         if conn:
@@ -1547,6 +1551,8 @@ def migrate_pending_notifications_table():
                 button_text TEXT,
                 chat_ids TEXT,
                 query_id INTEGER,
+                ignore_query_pause INTEGER NOT NULL DEFAULT 0
+                    CHECK (ignore_query_pause IN (0, 1)),
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at REAL NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -1559,9 +1565,85 @@ def migrate_pending_notifications_table():
             conn.execute(
                 "ALTER TABLE pending_notifications ADD COLUMN query_id INTEGER"
             )
+        if "ignore_query_pause" not in columns:
+            conn.execute(
+                "ALTER TABLE pending_notifications ADD COLUMN "
+                "ignore_query_pause INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (ignore_query_pause IN (0, 1))"
+            )
         conn.commit()
         return True
     except Exception:
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def migrate_pending_ai_evaluations_table():
+    """Create the durable, leased queue used by the serialized AI worker."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_ai_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id NUMERIC NOT NULL,
+                query_id INTEGER NOT NULL,
+                title TEXT,
+                brand TEXT,
+                condition TEXT,
+                price TEXT,
+                currency TEXT,
+                photo_url TEXT,
+                item_url TEXT,
+                chat_ids TEXT NOT NULL,
+                parent_notification_id INTEGER,
+                delivered_chat_ids TEXT NOT NULL DEFAULT '[]',
+                handled_chat_ids TEXT NOT NULL DEFAULT '[]',
+                result_content TEXT,
+                evaluation_started_at REAL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                locked_until REAL NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                UNIQUE (item_id, query_id),
+                FOREIGN KEY (query_id) REFERENCES queries (id) ON DELETE CASCADE
+            )
+            """)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(pending_ai_evaluations)")
+        }
+        if "delivered_chat_ids" not in columns:
+            conn.execute(
+                "ALTER TABLE pending_ai_evaluations ADD COLUMN "
+                "delivered_chat_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "handled_chat_ids" not in columns:
+            conn.execute(
+                "ALTER TABLE pending_ai_evaluations ADD COLUMN "
+                "handled_chat_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "result_content" not in columns:
+            conn.execute(
+                "ALTER TABLE pending_ai_evaluations ADD COLUMN result_content TEXT"
+            )
+        if "evaluation_started_at" not in columns:
+            conn.execute(
+                "ALTER TABLE pending_ai_evaluations "
+                "ADD COLUMN evaluation_started_at REAL"
+            )
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_ai_evaluations_due
+            ON pending_ai_evaluations (next_attempt_at, locked_until, id)
+            """)
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
         print_exc()
         return False
     finally:
@@ -1590,6 +1672,7 @@ def _insert_notification(
     button_text,
     chat_ids,
     query_id=None,
+    ignore_query_pause=False,
 ):
     """Insert an outbox row using an existing transaction/cursor."""
     recipients = _normalise_notification_chat_ids(chat_ids)
@@ -1599,9 +1682,10 @@ def _insert_notification(
         INSERT INTO pending_notifications
             (
                 content, url, button_text, chat_ids, query_id,
+                ignore_query_pause,
                 attempts, next_attempt_at
             )
-        VALUES (?, ?, ?, ?, ?, 0, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
         """,
         (
             content,
@@ -1609,6 +1693,7 @@ def _insert_notification(
             button_text,
             chat_ids_json,
             query_id,
+            int(bool(ignore_query_pause)),
             time.time(),
         ),
     )
@@ -1627,6 +1712,7 @@ def persist_item_and_notification(
     content,
     notification_url,
     button_text,
+    ai_evaluation=None,
 ):
     """Atomically mark an item seen and queue its Telegram notification.
 
@@ -1672,8 +1758,9 @@ def persist_item_and_notification(
             """,
             (id, title, price, currency, timestamp, photo_url, query_id),
         )
+        parent_notification_id = None
         if recipients:
-            _insert_notification(
+            parent_notification_id = _insert_notification(
                 cursor,
                 content,
                 notification_url,
@@ -1681,6 +1768,34 @@ def persist_item_and_notification(
                 recipients,
                 query_id=query_id,
             )
+            if isinstance(ai_evaluation, dict):
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO pending_ai_evaluations
+                        (
+                            item_id, query_id, title, brand, condition, price,
+                            currency, photo_url, item_url, chat_ids,
+                            parent_notification_id, attempts, next_attempt_at,
+                            locked_until, created_at
+                        )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?)
+                    """,
+                    (
+                        ai_evaluation.get("item_id", id),
+                        query_id,
+                        ai_evaluation.get("title", title),
+                        ai_evaluation.get("brand"),
+                        ai_evaluation.get("condition"),
+                        ai_evaluation.get("price", price),
+                        ai_evaluation.get("currency", currency),
+                        ai_evaluation.get("photo_url", photo_url),
+                        ai_evaluation.get("item_url", notification_url),
+                        json.dumps(_normalise_notification_chat_ids(recipients)),
+                        parent_notification_id,
+                        time.time(),
+                        time.time(),
+                    ),
+                )
 
         cursor.execute(
             "UPDATE queries SET last_item=? WHERE id=?",
@@ -1701,7 +1816,15 @@ def persist_item_and_notification(
             conn.close()
 
 
-def enqueue_notification(content, url, button_text, chat_ids, query_id=None):
+def enqueue_notification(
+    content,
+    url,
+    button_text,
+    chat_ids,
+    query_id=None,
+    *,
+    ignore_query_pause=False,
+):
     """Persist one Telegram notification for delivery. Returns the new row id."""
     conn = None
     try:
@@ -1715,6 +1838,7 @@ def enqueue_notification(content, url, button_text, chat_ids, query_id=None):
             button_text,
             recipients,
             query_id=query_id,
+            ignore_query_pause=ignore_query_pause,
         )
         conn.commit()
         return notification_id
@@ -1730,7 +1854,8 @@ def get_due_notifications(limit=10):
     """Return notifications whose next attempt time has arrived.
 
     Each row is
-    (id, content, url, button_text, chat_ids_json, query_id, attempts).
+    (id, content, url, button_text, chat_ids_json, query_id, attempts,
+    ignore_query_pause).
     """
     conn = None
     try:
@@ -1739,7 +1864,8 @@ def get_due_notifications(limit=10):
         cursor.execute(
             """
             SELECT
-                id, content, url, button_text, chat_ids, query_id, attempts
+                id, content, url, button_text, chat_ids, query_id, attempts,
+                ignore_query_pause
             FROM pending_notifications
             WHERE next_attempt_at <= ?
             ORDER BY id
@@ -1853,6 +1979,82 @@ def ack_notification_recipient(notification_id, chat_id):
             return None
 
         target = str(chat_id).strip()
+        # Record the successful Telegram acknowledgement on any linked AI job
+        # before removing this recipient from the primary outbox. Keeping the
+        # outcome on the job means it survives parent-row deletion but is
+        # automatically cleaned up when the job completes or is cancelled.
+        for ai_job_id, delivered_json in conn.execute(
+            """
+            SELECT id, delivered_chat_ids
+            FROM pending_ai_evaluations
+            WHERE parent_notification_id=?
+            """,
+            (notification_id,),
+        ).fetchall():
+            try:
+                delivered = json.loads(delivered_json or "[]")
+            except (TypeError, ValueError):
+                conn.rollback()
+                return None
+            delivered = _normalise_notification_chat_ids(delivered)
+            if target not in delivered:
+                delivered.append(target)
+                conn.execute(
+                    """
+                    UPDATE pending_ai_evaluations
+                    SET delivered_chat_ids=?, next_attempt_at=MIN(next_attempt_at, ?)
+                    WHERE id=?
+                    """,
+                    (json.dumps(delivered), time.time(), ai_job_id),
+                )
+        remaining = [
+            value
+            for value in _normalise_notification_chat_ids(stored)
+            if value != target
+        ]
+        if remaining:
+            conn.execute(
+                "UPDATE pending_notifications SET chat_ids=? WHERE id=?",
+                (json.dumps(remaining), notification_id),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM pending_notifications WHERE id=?",
+                (notification_id,),
+            )
+        conn.commit()
+        return len(remaining)
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def discard_notification_recipient(notification_id, chat_id):
+    """Remove one ineligible recipient without recording a delivery ACK."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT chat_ids FROM pending_notifications WHERE id=?",
+            (notification_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return 0
+
+        try:
+            stored = json.loads(row[0]) if row[0] else []
+        except (TypeError, ValueError):
+            conn.rollback()
+            return None
+
+        target = str(chat_id).strip()
         remaining = [
             value
             for value in _normalise_notification_chat_ids(stored)
@@ -1888,6 +2090,341 @@ def count_pending_notifications():
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM pending_notifications")
         return cursor.fetchone()[0]
+    except Exception:
+        print_exc()
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
+
+# --- Durable AI evaluation queue -------------------------------------------
+
+
+def claim_due_ai_evaluation(now=None, lease_seconds=180):
+    """Lease and return the oldest due AI job for one serialized worker.
+
+    The tuple layout is ``(job_id, item_id, query_id, title, brand, condition,
+    price, currency, photo_url, item_url, chat_ids_json,
+    parent_notification_id, attempts, delivered_chat_ids_json,
+    handled_chat_ids_json, result_content, evaluation_started_at)``. An expired
+    lease can be reclaimed after an abrupt process exit, so work is delayed
+    rather than lost.
+    """
+    try:
+        now = float(time.time() if now is None else now)
+        lease_seconds = max(30, int(lease_seconds))
+    except (TypeError, ValueError):
+        return None
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT
+                id, item_id, query_id, title, brand, condition, price,
+                currency, photo_url, item_url, chat_ids,
+                parent_notification_id, attempts, delivered_chat_ids,
+                handled_chat_ids, result_content, evaluation_started_at
+            FROM pending_ai_evaluations
+            WHERE next_attempt_at<=? AND locked_until<=?
+            ORDER BY next_attempt_at, id
+            LIMIT 1
+            """,
+            (now, now),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        conn.execute(
+            "UPDATE pending_ai_evaluations SET locked_until=? WHERE id=?",
+            (now + lease_seconds, row[0]),
+        )
+        conn.commit()
+        return row
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def reschedule_ai_evaluation(job_id, attempts, next_attempt_at, last_error=None):
+    """Release one AI job's lease and persist its bounded retry state."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.execute(
+            """
+            UPDATE pending_ai_evaluations
+            SET attempts=?, next_attempt_at=?, locked_until=0, last_error=?
+            WHERE id=?
+            """,
+            (
+                max(0, int(attempts)),
+                float(next_attempt_at),
+                str(last_error)[:500] if last_error else None,
+                int(job_id),
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def begin_ai_evaluation(job_id, now=None):
+    """Atomically establish whether evaluation began before a query pause.
+
+    Returns ``"started"`` when the job may call OpenAI, ``"cancelled"`` when
+    the query was already paused (and deletes the job), ``"missing"`` when the
+    job no longer exists, and ``None`` on database failure. Once marked as
+    started, later pauses do not cancel the already-started verdict.
+    """
+    conn = None
+    try:
+        started_at = float(time.time() if now is None else now)
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT a.evaluation_started_at, q.enabled
+            FROM pending_ai_evaluations a
+            JOIN queries q ON q.id=a.query_id
+            WHERE a.id=?
+            """,
+            (int(job_id),),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return "missing"
+        if row[0] is not None:
+            conn.commit()
+            return "started"
+        if not bool(row[1]):
+            conn.execute(
+                "DELETE FROM pending_ai_evaluations WHERE id=?", (int(job_id),)
+            )
+            conn.commit()
+            return "cancelled"
+        conn.execute(
+            "UPDATE pending_ai_evaluations SET evaluation_started_at=? WHERE id=?",
+            (started_at, int(job_id)),
+        )
+        conn.commit()
+        return "started"
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def settle_ai_evaluation_recipients(
+    job_id,
+    *,
+    handled_chat_ids,
+    eligible_chat_ids,
+    result_content=None,
+):
+    """Atomically cache/publish one AI result and advance recipient state.
+
+    ``handled_chat_ids`` is the worker's snapshot of primary-ACKed recipients
+    considered in this pass. Only its currently eligible subset receives a
+    follow-up. The job remains while its primary outbox row can still produce
+    later ACKs; those recipients reuse the cached result without another API
+    call. Once the parent is terminal and every ACK is handled, the job is
+    deleted in the same transaction as the final follow-up insertion.
+    """
+    conn = None
+    try:
+        candidates = _normalise_notification_chat_ids(handled_chat_ids)
+        requested = set(_normalise_notification_chat_ids(eligible_chat_ids))
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        row = cursor.execute(
+            """
+            SELECT
+                query_id, item_url, parent_notification_id,
+                delivered_chat_ids, handled_chat_ids, result_content
+            FROM pending_ai_evaluations
+            WHERE id=?
+            """,
+            (int(job_id),),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+
+        query_id, item_url, parent_id, delivered_json, handled_json, cached = row
+        try:
+            delivered = _normalise_notification_chat_ids(
+                json.loads(delivered_json or "[]")
+            )
+            already_handled = _normalise_notification_chat_ids(
+                json.loads(handled_json or "[]")
+            )
+        except (TypeError, ValueError):
+            conn.rollback()
+            return False
+
+        delivered_set = set(delivered)
+        already_handled_set = set(already_handled)
+        considered = [
+            chat_id
+            for chat_id in candidates
+            if chat_id in delivered_set and chat_id not in already_handled_set
+        ]
+        recipients = [chat_id for chat_id in considered if chat_id in requested]
+        content = cached or result_content
+        if recipients and not content:
+            conn.rollback()
+            return False
+        if recipients:
+            _insert_notification(
+                cursor,
+                content,
+                item_url,
+                "Open Vinted",
+                recipients,
+                query_id=query_id,
+                ignore_query_pause=True,
+            )
+
+        merged_handled = already_handled + [
+            chat_id for chat_id in considered if chat_id not in already_handled_set
+        ]
+        parent_pending = False
+        if parent_id is not None:
+            parent_pending = (
+                cursor.execute(
+                    "SELECT 1 FROM pending_notifications WHERE id=?",
+                    (int(parent_id),),
+                ).fetchone()
+                is not None
+            )
+        unhandled_delivered = delivered_set.difference(merged_handled)
+        if not parent_pending and not unhandled_delivered:
+            cursor.execute(
+                "DELETE FROM pending_ai_evaluations WHERE id=?",
+                (int(job_id),),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE pending_ai_evaluations
+                SET handled_chat_ids=?, result_content=?, attempts=0,
+                    next_attempt_at=?, locked_until=0, last_error=NULL
+                WHERE id=?
+                """,
+                (
+                    json.dumps(merged_handled),
+                    content,
+                    time.time() + 10,
+                    int(job_id),
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def is_notification_pending(notification_id):
+    """Return whether the parent item alert is still awaiting delivery."""
+    if notification_id is None:
+        return False
+    conn = None
+    try:
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT 1 FROM pending_notifications WHERE id=?",
+            (int(notification_id),),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def complete_ai_evaluation(
+    job_id,
+    *,
+    content=None,
+    url=None,
+    button_text=None,
+    chat_ids=None,
+    query_id=None,
+    ignore_query_pause=False,
+):
+    """Atomically enqueue an AI follow-up, if any, and remove its source job."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        row = cursor.execute(
+            "SELECT 1 FROM pending_ai_evaluations WHERE id=?",
+            (int(job_id),),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+
+        recipients = _normalise_notification_chat_ids(chat_ids)
+        if content and recipients:
+            _insert_notification(
+                cursor,
+                content,
+                url,
+                button_text,
+                recipients,
+                query_id=query_id,
+                ignore_query_pause=ignore_query_pause,
+            )
+        cursor.execute("DELETE FROM pending_ai_evaluations WHERE id=?", (int(job_id),))
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def count_pending_ai_evaluations():
+    """Return the number of AI verdicts still awaiting evaluation."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        return conn.execute("SELECT COUNT(*) FROM pending_ai_evaluations").fetchone()[0]
     except Exception:
         print_exc()
         return 0
@@ -1975,6 +2512,13 @@ def migrate_query_preferences_schema():
         cursor.execute(
             "INSERT OR IGNORE INTO parameters (key, value) VALUES (?, ?)",
             ("fast_query_refresh_delay", "90"),
+        )
+        # This helper runs on every startup, so it also repairs installations
+        # that already applied 1.2.0_1.2.1 before this setting was added to the
+        # migration file. INSERT OR IGNORE preserves any configured value.
+        cursor.execute(
+            "INSERT OR IGNORE INTO parameters (key, value) VALUES (?, ?)",
+            ("catalogue_request_spacing_seconds", "12"),
         )
         conn.commit()
         return True
@@ -2156,6 +2700,45 @@ def get_query_preferences(query_id):
     return preferences.get(query_id) if preferences is not None else None
 
 
+def _active_fast_query_count_with_cursor(cursor, exclude_query_ids=()):
+    """Count active Fast queries inside the caller's SQLite transaction."""
+    excluded = []
+    for query_id in exclude_query_ids:
+        try:
+            query_id = int(query_id)
+        except (TypeError, ValueError):
+            continue
+        if query_id > 0 and query_id not in excluded:
+            excluded.append(query_id)
+
+    where_excluded = ""
+    parameters = []
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        where_excluded = f" AND q.id NOT IN ({placeholders})"
+        parameters.extend(excluded)
+
+    row = cursor.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM queries q
+        LEFT JOIN query_preferences p ON p.query_id=q.id
+        WHERE q.enabled=1
+          AND COALESCE(p.poll_mode, 'normal')='fast'
+          {where_excluded}
+        """,
+        parameters,
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def _fast_query_limit_reached_with_cursor(cursor, exclude_query_ids=()):
+    return (
+        _active_fast_query_count_with_cursor(cursor, exclude_query_ids)
+        >= MAX_ACTIVE_FAST_QUERIES
+    )
+
+
 def set_query_preferences(
     query_id,
     *,
@@ -2185,9 +2768,19 @@ def set_query_preferences(
     conn = None
     try:
         conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM queries WHERE id=?", (query_id,))
-        if cursor.fetchone() is None:
+        cursor.execute("SELECT enabled FROM queries WHERE id=?", (query_id,))
+        query = cursor.fetchone()
+        if query is None:
+            conn.rollback()
+            return False
+        if (
+            bool(query[0])
+            and values["poll_mode"] == "fast"
+            and _fast_query_limit_reached_with_cursor(cursor, [query_id])
+        ):
+            conn.rollback()
             return False
         cursor.execute(
             """
@@ -2228,6 +2821,226 @@ def set_query_preferences(
             conn.close()
 
 
+def _query_ai_ids_from_value(value):
+    """Return the valid positive query IDs stored in the legacy CSV setting."""
+    query_ids = set()
+    for token in str(value or "").split(","):
+        try:
+            query_id = int(token.strip())
+        except (TypeError, ValueError):
+            continue
+        if query_id > 0:
+            query_ids.add(query_id)
+    return query_ids
+
+
+def _query_edit_state_with_cursor(cursor, query_id):
+    """Read the complete editable state using an existing transaction."""
+    row = cursor.execute(
+        """
+        SELECT
+            q.query,
+            q.query_name,
+            COALESCE(p.poll_mode, 'normal'),
+            COALESCE(p.monitor_during_quiet_hours, 0),
+            COALESCE(p.deal_evaluator_enabled, 0),
+            p.deal_excellent_max,
+            p.deal_good_max,
+            COALESCE(NULLIF(p.deal_currency, ''), 'GBP')
+        FROM queries q
+        LEFT JOIN query_preferences p ON p.query_id=q.id
+        WHERE q.id=?
+        """,
+        (query_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    ai_row = cursor.execute(
+        "SELECT value FROM parameters WHERE key='deal_ai_query_ids'"
+    ).fetchone()
+    ai_ids = _query_ai_ids_from_value(ai_row[0] if ai_row else "")
+    return {
+        "query": row[0],
+        "query_name": row[1],
+        "poll_mode": str(row[2]).lower(),
+        "monitor_during_quiet_hours": bool(row[3]),
+        "deal_evaluator_enabled": bool(row[4]),
+        "deal_excellent_max": row[5],
+        "deal_good_max": row[6],
+        "deal_currency": str(row[7]).upper(),
+        "deal_ai_enabled": query_id in ai_ids,
+    }
+
+
+def get_query_edit_state(query_id):
+    """Return one query's current raw editable state, or ``None`` on failure."""
+    try:
+        query_id = int(query_id)
+    except (TypeError, ValueError):
+        return None
+    if query_id <= 0:
+        return None
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        return _query_edit_state_with_cursor(conn.cursor(), query_id)
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def query_edit_revision(state):
+    """Return a deterministic revision for the fields the Edit form can write."""
+    if not isinstance(state, dict):
+        return None
+    editable = {
+        key: state.get(key)
+        for key in (
+            "query",
+            "query_name",
+            "poll_mode",
+            "monitor_during_quiet_hours",
+            "deal_evaluator_enabled",
+            "deal_excellent_max",
+            "deal_good_max",
+            "deal_currency",
+            "deal_ai_enabled",
+        )
+    }
+    payload = json.dumps(
+        editable,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def update_query_configuration_atomic(
+    query_id,
+    query,
+    name,
+    preferences,
+    ai_enabled,
+    *,
+    expected_revision,
+):
+    """Save every Edit-modal field atomically with optimistic concurrency.
+
+    The return value is one of ``updated``, ``stale``, ``fast_limit``,
+    ``not_found`` or ``error``. The revision and global Fast-query cap are
+    checked after acquiring SQLite's write lock, so two browser tabs cannot
+    silently restore older settings or jointly bypass the cap.
+    """
+    try:
+        query_id = int(query_id)
+        if query_id <= 0 or not str(query or "").strip():
+            return "error"
+        if not isinstance(preferences, dict):
+            return "error"
+        values = normalise_query_preferences(**preferences)
+        ai_enabled = _normalise_preference_bool(ai_enabled, "AI deal evaluator")
+    except (TypeError, ValueError):
+        return "error"
+
+    query = str(query).strip()
+    name = str(name).strip() if name is not None else ""
+    name = name or None
+    expected_revision = str(expected_revision or "").strip()
+    if not expected_revision:
+        return "stale"
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        current = _query_edit_state_with_cursor(cursor, query_id)
+        if current is None:
+            conn.rollback()
+            return "not_found"
+        if query_edit_revision(current) != expected_revision:
+            conn.rollback()
+            return "stale"
+
+        enabled_row = cursor.execute(
+            "SELECT enabled FROM queries WHERE id=?",
+            (query_id,),
+        ).fetchone()
+        if (
+            enabled_row
+            and bool(enabled_row[0])
+            and values["poll_mode"] == "fast"
+            and _fast_query_limit_reached_with_cursor(cursor, [query_id])
+        ):
+            conn.rollback()
+            return "fast_limit"
+
+        cursor.execute(
+            "UPDATE queries SET query=?, query_name=? WHERE id=?",
+            (query, name, query_id),
+        )
+        cursor.execute(
+            """
+            INSERT INTO query_preferences
+                (
+                    query_id, poll_mode, monitor_during_quiet_hours,
+                    deal_evaluator_enabled, deal_excellent_max,
+                    deal_good_max, deal_currency
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(query_id) DO UPDATE SET
+                poll_mode=excluded.poll_mode,
+                monitor_during_quiet_hours=excluded.monitor_during_quiet_hours,
+                deal_evaluator_enabled=excluded.deal_evaluator_enabled,
+                deal_excellent_max=excluded.deal_excellent_max,
+                deal_good_max=excluded.deal_good_max,
+                deal_currency=excluded.deal_currency
+            """,
+            (
+                query_id,
+                values["poll_mode"],
+                int(values["monitor_during_quiet_hours"]),
+                int(values["deal_evaluator_enabled"]),
+                values["deal_excellent_max"],
+                values["deal_good_max"],
+                values["deal_currency"],
+            ),
+        )
+
+        ai_row = cursor.execute(
+            "SELECT value FROM parameters WHERE key='deal_ai_query_ids'"
+        ).fetchone()
+        ai_ids = _query_ai_ids_from_value(ai_row[0] if ai_row else "")
+        if ai_enabled:
+            ai_ids.add(query_id)
+        else:
+            ai_ids.discard(query_id)
+        cursor.execute(
+            """
+            INSERT INTO parameters (key, value)
+            VALUES ('deal_ai_query_ids', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (",".join(str(value) for value in sorted(ai_ids)),),
+        )
+        conn.commit()
+        return "updated"
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return "error"
+    finally:
+        if conn:
+            conn.close()
+
+
 # --- Query pause/enable + counts -------------------------------------------
 
 
@@ -2251,23 +3064,71 @@ def migrate_query_enabled_column():
             conn.close()
 
 
-def set_query_enabled(query_id, enabled):
-    """Pause (enabled=0) or resume (enabled=1) a single query."""
+def set_query_enabled_with_fast_limit(query_id, enabled):
+    """Atomically pause/resume one query while enforcing the Fast cap.
+
+    Returns ``updated``, ``unchanged``, ``fast_limit``, ``not_found`` or
+    ``error``.
+    """
+    try:
+        query_id = int(query_id)
+    except (TypeError, ValueError):
+        return "not_found"
+    if query_id <= 0:
+        return "not_found"
+
     conn = None
     try:
         conn = get_db_connection()
-        conn.execute(
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        row = cursor.execute(
+            """
+            SELECT q.enabled, COALESCE(p.poll_mode, 'normal')
+            FROM queries q
+            LEFT JOIN query_preferences p ON p.query_id=q.id
+            WHERE q.id=?
+            """,
+            (query_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return "not_found"
+
+        enabled_value = 1 if enabled else 0
+        if int(bool(row[0])) == enabled_value:
+            conn.rollback()
+            return "unchanged"
+        if (
+            enabled_value
+            and str(row[1]).lower() == "fast"
+            and _fast_query_limit_reached_with_cursor(cursor, [query_id])
+        ):
+            conn.rollback()
+            return "fast_limit"
+
+        cursor.execute(
             "UPDATE queries SET enabled=? WHERE id=?",
-            (1 if enabled else 0, query_id),
+            (enabled_value, query_id),
         )
         conn.commit()
-        return True
+        return "updated"
     except Exception:
+        if conn:
+            conn.rollback()
         print_exc()
-        return False
+        return "error"
     finally:
         if conn:
             conn.close()
+
+
+def set_query_enabled(query_id, enabled):
+    """Pause or resume one query, returning the legacy boolean result."""
+    return set_query_enabled_with_fast_limit(query_id, enabled) in {
+        "updated",
+        "unchanged",
+    }
 
 
 def is_query_enabled(query_id):
@@ -2288,11 +3149,12 @@ def is_query_enabled(query_id):
             conn.close()
 
 
-def set_queries_enabled(query_ids, enabled):
-    """Pause or resume several queries in one atomic database update.
+def set_queries_enabled_with_fast_limit(query_ids, enabled):
+    """Atomically pause/resume queries while enforcing the global Fast cap.
 
-    Returns the number of queries whose state changed, or ``None`` if the
-    database update failed. Invalid and duplicate IDs are ignored.
+    Returns ``(status, changed_count)`` where status is ``updated``,
+    ``unchanged``, ``fast_limit`` or ``error``. Invalid, missing and duplicate
+    IDs are ignored, matching the bulk-action UI's existing behaviour.
     """
     normalised_ids = []
     for query_id in query_ids:
@@ -2304,13 +3166,37 @@ def set_queries_enabled(query_ids, enabled):
             normalised_ids.append(value)
 
     if not normalised_ids:
-        return 0
+        return "unchanged", 0
 
     conn = None
     try:
         conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
         enabled_value = 1 if enabled else 0
         placeholders = ",".join("?" for _ in normalised_ids)
+        rows = cursor.execute(
+            f"""
+            SELECT q.id, q.enabled, COALESCE(p.poll_mode, 'normal')
+            FROM queries q
+            LEFT JOIN query_preferences p ON p.query_id=q.id
+            WHERE q.id IN ({placeholders})
+            """,
+            normalised_ids,
+        ).fetchall()
+
+        if enabled_value:
+            active_fast_outside_selection = _active_fast_query_count_with_cursor(
+                cursor,
+                normalised_ids,
+            )
+            selected_fast = sum(
+                1 for _query_id, _current, mode in rows if str(mode).lower() == "fast"
+            )
+            if active_fast_outside_selection + selected_fast > MAX_ACTIVE_FAST_QUERIES:
+                conn.rollback()
+                return "fast_limit", 0
+
         cursor = conn.execute(
             f"""
             UPDATE queries
@@ -2320,13 +3206,24 @@ def set_queries_enabled(query_ids, enabled):
             [enabled_value, *normalised_ids, enabled_value],
         )
         conn.commit()
-        return cursor.rowcount
+        changed = cursor.rowcount
+        return ("updated" if changed else "unchanged"), changed
     except Exception:
+        if conn:
+            conn.rollback()
         print_exc()
-        return None
+        return "error", None
     finally:
         if conn:
             conn.close()
+
+
+def set_queries_enabled(query_ids, enabled):
+    """Pause/resume queries, preserving the legacy count-or-None result."""
+    status, changed = set_queries_enabled_with_fast_limit(query_ids, enabled)
+    if status in {"error", "fast_limit"}:
+        return None
+    return changed
 
 
 def get_query_enabled_map():

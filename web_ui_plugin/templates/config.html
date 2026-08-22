@@ -89,19 +89,33 @@
                                                 <input type="number" class="form-control" id="query_refresh_delay"
                                                        name="query_refresh_delay"
                                                        value="{{ params.query_refresh_delay }}"
-                                                       min="30" max="86400">
+                                                       min="60" max="86400">
                                                 <small class="form-text text-muted">
-                                                    Delay between query refreshes in seconds (min 30). Too low risks
-                                                    Vinted rate-limits.
-                                                    {% if query_health.active > 1 %}
-                                                    With {{ query_health.active }} active queries a full cycle takes
-                                                    about {{ query_health.cycle_minutes }} min.
-                                                    {% if not query_health.keeps_up %}
-                                                    <span class="text-danger">That is longer than the refresh delay, so
-                                                        scrapes will fall behind — raise the delay or pause some
-                                                        queries.</span>
-                                                    {% endif %}
-                                                    {% endif %}
+                                                    Requested Normal-query interval (minimum 60s). The shared safety
+                                                    budget adjusts the effective interval when many queries are active.
+                                                </small>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <div class="mb-3">
+                                                <label for="catalogue_request_spacing_seconds" class="form-label">
+                                                    Minimum Vinted Request Gap (seconds)
+                                                </label>
+                                                <input type="number" class="form-control"
+                                                       id="catalogue_request_spacing_seconds"
+                                                       name="catalogue_request_spacing_seconds"
+                                                       value="{{ params.catalogue_request_spacing_seconds or 12 }}"
+                                                       min="12" max="120">
+                                                <small class="form-text text-muted">
+                                                    Hard completion-to-next-start gap (12–120s), plus 0–3s jitter.
+                                                    Current plan: {{ query_health.fast_count }} Fast at
+                                                    {{ query_health.effective_fast_seconds }}s effective
+                                                    ({{ query_health.requested_fast_seconds }}s requested) and
+                                                    {{ query_health.normal_count }} Normal at
+                                                    {{ query_health.effective_normal_seconds }}s effective
+                                                    ({{ query_health.requested_normal_seconds }}s requested), up to
+                                                    {{ query_health.scheduled_requests_per_minute }} scheduled
+                                                    requests/minute.
                                                 </small>
                                             </div>
                                         </div>

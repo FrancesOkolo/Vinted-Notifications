@@ -6,10 +6,13 @@
         <div class="col-md-4">
             <label for="{{ prefix }}PollMode" class="form-label fw-semibold">Polling speed</label>
             <select class="form-select" id="{{ prefix }}PollMode" name="poll_mode">
-                <option value="normal">Normal (180s)</option>
-                <option value="fast">Fast (~90s)</option>
+                <option value="normal">Normal (base 180s)</option>
+                <option value="fast">Fast (base 90s)</option>
             </select>
-            <div class="form-text">Fast is limited to {{ max_active_fast_queries }} active queries.</div>
+            <div class="form-text">
+                These are requested cadences; shared protection may lengthen them.
+                Fast is limited to {{ max_active_fast_queries }} active queries.
+            </div>
         </div>
         <div class="col-md-8 d-flex align-items-center">
             <div class="form-check">
@@ -321,7 +324,7 @@
                                           {% if query.enabled %}hidden{% endif %}>Paused</span>
                                     {% if query.poll_mode == 'fast' %}
                                     <span class="badge bg-warning text-dark ms-1"
-                                          title="Priority query; polled approximately every 90 seconds">Fast</span>
+                                          title="Priority query; uses the Fast base cadence, adjusted by shared protection">Fast</span>
                                     {% endif %}
                                     {% if query.monitor_during_quiet_hours %}
                                     <span class="badge bg-info text-dark ms-1"
@@ -370,15 +373,7 @@
                                         </button>
                                         <button type="button" class="btn btn-sm btn-outline-secondary"
                                                 data-bs-toggle="modal" data-bs-target="#editQueryModal"
-                                                 data-query-id="{{ query.query_id }}"
-                                                 data-query-url="{{ query.query|e }}"
-                                                 data-query-name="{{ (query.display if query.display != query.query else '')|e }}"
-                                                 data-query-poll-mode="{{ query.poll_mode }}"
-                                                 data-query-quiet-override="{{ 'true' if query.monitor_during_quiet_hours else 'false' }}"
-                                                 data-query-deal-enabled="{{ 'true' if query.deal_evaluator_enabled else 'false' }}"
-                                                 data-query-deal-excellent="{{ query.deal_excellent_max if query.deal_excellent_max is not none else '' }}"
-                                                 data-query-deal-good="{{ query.deal_good_max if query.deal_good_max is not none else '' }}"
-                                                 data-query-deal-currency="{{ query.deal_currency }}" data-query-deal-ai="{{ 'true' if query.deal_ai_enabled else 'false' }}">
+                                                data-query-id="{{ query.query_id }}">
                                             <i class="bi bi-pencil"></i> Edit
                                         </button>
                                         <button type="button" class="btn btn-sm btn-outline-danger"
@@ -478,7 +473,7 @@
     </div>
 </div>
 
-<!-- Shared Edit Query modal (populated from the clicked row's data attributes) -->
+<!-- Shared Edit Query modal (populated from fresh server state when opened) -->
 <div class="modal fade" id="editQueryModal" tabindex="-1" aria-labelledby="editQueryModalLabel" aria-hidden="true">
     <div class="modal-dialog">
         <div class="modal-content">
@@ -488,7 +483,11 @@
             </div>
             <form id="editQueryForm" method="post">
                 <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="edit_revision" id="editQueryRevision" value="">
                 <div class="modal-body">
+                    <div class="alert alert-info py-2" id="editQueryLoadStatus" role="status">
+                        Loading current settings&hellip;
+                    </div>
                     <div class="mb-3">
                         <label for="editQueryUrl" class="form-label">Vinted search URL <span
                                 class="text-danger">*</span></label>
@@ -501,12 +500,11 @@
                                pattern="^https?:\/\/(?:www\.)?vinted\.[a-z]{2,}(?:\.[a-z]{2,})*(\/.*)?$">
                     </div>
                     <div class="mb-3">
-                        <label for="editQueryName" class="form-label">Name <span class="text-danger">*</span></label>
+                        <label for="editQueryName" class="form-label">Name</label>
                         <input type="text"
                                class="form-control"
                                id="editQueryName"
                                name="query_name"
-                               required
                                placeholder="My search">
                     </div>
                     <div class="mb-3">
@@ -516,7 +514,7 @@
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    <button type="submit" class="btn btn-primary" id="editQuerySave" disabled>Save Changes</button>
                 </div>
             </form>
         </div>
@@ -597,10 +595,15 @@
 
         document.querySelectorAll('.query-preference-fields').forEach(setupDealEvaluatorFields);
 
-        // Populate the single shared Edit modal from the clicked row's data.
+        // Populate Edit from current database state, never from a potentially
+        // stale page snapshot. The revision is verified again inside the
+        // database transaction when the form is submitted.
         const editQueryModal = document.getElementById('editQueryModal');
         if (editQueryModal) {
             const editForm = document.getElementById('editQueryForm');
+            const editRevision = document.getElementById('editQueryRevision');
+            const editLoadStatus = document.getElementById('editQueryLoadStatus');
+            const editSave = document.getElementById('editQuerySave');
             const editUrl = document.getElementById('editQueryUrl');
             const editName = document.getElementById('editQueryName');
             const editPollMode = document.getElementById('editPollMode');
@@ -609,27 +612,86 @@
             const editExcellentMax = document.getElementById('editExcellentMax');
             const editGoodMax = document.getElementById('editGoodMax');
             const editDealCurrency = document.getElementById('editDealCurrency');
+            let editLoadController = null;
+
+            const showEditStatus = function (message, isError) {
+                editLoadStatus.textContent = message;
+                editLoadStatus.className = isError
+                    ? 'alert alert-danger py-2'
+                    : 'alert alert-info py-2';
+                editLoadStatus.hidden = false;
+            };
+
             editQueryModal.addEventListener('show.bs.modal', function (event) {
                 const button = event.relatedTarget;
                 if (!button) {
                     return;
                 }
-                editForm.action = '/update_query/' + button.dataset.queryId;
-                editUrl.value = button.dataset.queryUrl || '';
-                editName.value = button.dataset.queryName || '';
-                editPollMode.value = button.dataset.queryPollMode || 'normal';
-                editQuietOverride.checked = button.dataset.queryQuietOverride === 'true';
-                if (button.dataset.queryDealAi === 'true') {
-                    editDealMode.value = 'ai';
-                } else if (button.dataset.queryDealEnabled === 'true') {
-                    editDealMode.value = 'ceiling';
-                } else {
-                    editDealMode.value = 'off';
-                }
-                editExcellentMax.value = button.dataset.queryDealExcellent || '';
-                editGoodMax.value = button.dataset.queryDealGood || '';
-                editDealCurrency.value = button.dataset.queryDealCurrency || 'GBP';
+                const queryId = button.dataset.queryId;
+                editForm.reset();
+                editRevision.value = '';
+                editSave.disabled = true;
+                editForm.action = '/update_query/' + queryId;
+                showEditStatus('Loading current settings…', false);
                 editDealMode.dispatchEvent(new Event('change'));
+
+                if (editLoadController) {
+                    editLoadController.abort();
+                }
+                const loadController = new AbortController();
+                editLoadController = loadController;
+                fetch('/api/queries/' + encodeURIComponent(queryId) + '/edit-state', {
+                    cache: 'no-store',
+                    headers: {'Accept': 'application/json'},
+                    signal: loadController.signal
+                })
+                    .then(async function (response) {
+                        if (editLoadController !== loadController) {
+                            return null;
+                        }
+                        const data = await response.json().catch(function () { return {}; });
+                        if (!response.ok) {
+                            throw new Error(data.message || 'Could not load this query.');
+                        }
+                        return data;
+                    })
+                    .then(function (data) {
+                        if (!data || editLoadController !== loadController) {
+                            return;
+                        }
+                        editUrl.value = data.query || '';
+                        editName.value = data.query_name || '';
+                        editPollMode.value = data.poll_mode || 'normal';
+                        editQuietOverride.checked = data.monitor_during_quiet_hours === true;
+                        editDealMode.value = data.deal_mode || 'off';
+                        editExcellentMax.value = data.deal_excellent_max || '';
+                        editGoodMax.value = data.deal_good_max || '';
+                        editDealCurrency.value = data.deal_currency || 'GBP';
+                        editRevision.value = data.revision || '';
+                        editDealMode.dispatchEvent(new Event('change'));
+                        if (!editRevision.value) {
+                            throw new Error('The server did not return an edit revision.');
+                        }
+                        editLoadStatus.hidden = true;
+                        editSave.disabled = false;
+                    })
+                    .catch(function (error) {
+                        if (error.name === 'AbortError' || editLoadController !== loadController) {
+                            return;
+                        }
+                        editRevision.value = '';
+                        editSave.disabled = true;
+                        showEditStatus(error.message || 'Could not load this query.', true);
+                    });
+            });
+
+            editQueryModal.addEventListener('hidden.bs.modal', function () {
+                if (editLoadController) {
+                    editLoadController.abort();
+                    editLoadController = null;
+                }
+                editRevision.value = '';
+                editSave.disabled = true;
             });
         }
 
