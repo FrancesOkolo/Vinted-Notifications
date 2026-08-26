@@ -122,7 +122,15 @@ def update_last_timestamp(query_id, timestamp):
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE queries SET last_item=? WHERE id=?", (timestamp, query_id)
+            """
+            UPDATE queries
+            SET last_item=CASE
+                WHEN last_item IS NULL OR last_item < ? THEN ?
+                ELSE last_item
+            END
+            WHERE id=?
+            """,
+            (timestamp, timestamp, query_id),
         )
         conn.commit()
     except Exception:
@@ -144,7 +152,15 @@ def add_item_to_db(id, title, query_id, price, timestamp, photo_url, currency="E
         )
         # Update the last item for the query
         cursor.execute(
-            "UPDATE queries SET last_item=? WHERE id=?", (timestamp, query_id)
+            """
+            UPDATE queries
+            SET last_item=CASE
+                WHEN last_item IS NULL OR last_item < ? THEN ?
+                ELSE last_item
+            END
+            WHERE id=?
+            """,
+            (timestamp, timestamp, query_id),
         )
         conn.commit()
     except Exception:
@@ -170,10 +186,17 @@ def update_query_in_db(query_id, query, name):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        existing = cursor.execute(
+            "SELECT query FROM queries WHERE id=?", (query_id,)
+        ).fetchone()
         cursor.execute(
             "UPDATE queries SET query=?, query_name=? WHERE id=?",
             (query, name, query_id),
         )
+        if existing is not None and str(existing[0]) != str(query):
+            import query_observability
+
+            query_observability.reset_query_state_with_cursor(cursor, query_id, query)
         conn.commit()
         return True
     except Exception:
@@ -1713,6 +1736,7 @@ def persist_item_and_notification(
     notification_url,
     button_text,
     ai_evaluation=None,
+    execution_id=None,
 ):
     """Atomically mark an item seen and queue its Telegram notification.
 
@@ -1798,11 +1822,33 @@ def persist_item_and_notification(
                 )
 
         cursor.execute(
-            "UPDATE queries SET last_item=? WHERE id=?",
-            (timestamp, query_id),
+            """
+            UPDATE queries
+            SET last_item=CASE
+                WHEN last_item IS NULL OR last_item < ? THEN ?
+                ELSE last_item
+            END
+            WHERE id=?
+            """,
+            (timestamp, timestamp, query_id),
         )
         if cursor.rowcount != 1:
             raise sqlite3.OperationalError("query disappeared while persisting item")
+
+        if execution_id is not None:
+            import query_observability
+
+            if not query_observability.classify_pending(
+                execution_id,
+                query_id,
+                id,
+                "accepted",
+                notification_generated=int(bool(recipients)),
+                cursor=cursor,
+            ):
+                raise sqlite3.OperationalError(
+                    "durable catalogue item disappeared while persisting alert"
+                )
 
         conn.commit()
         return True, recipients
@@ -3029,6 +3075,10 @@ def update_query_configuration_atomic(
             """,
             (",".join(str(value) for value in sorted(ai_ids)),),
         )
+        if str(current["query"]) != query:
+            import query_observability
+
+            query_observability.reset_query_state_with_cursor(cursor, query_id, query)
         conn.commit()
         return "updated"
     except Exception:

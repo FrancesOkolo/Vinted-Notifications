@@ -2,12 +2,15 @@ import db
 import deal_evaluator
 import html
 import json
+import query_observability
 import random
 import requests
 import threading
 import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from queue import Empty
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from email.utils import parsedate_to_datetime
 from pyVintedVN import Vinted, requester
@@ -849,12 +852,33 @@ def process_items(
         query_id = query[0]
         query_url = query[1]
         all_items = None
+        execution_id = None
 
         # The enabled-query list is a snapshot taken at the beginning of the
         # cycle. Honour a pause made while that cycle is already running.
         if not db.is_query_enabled(query_id):
             logger.info("Skipping query %s because it was paused mid-cycle.", query_id)
             continue
+
+        request_started_at = time.time()
+        request_started_monotonic = time.monotonic()
+        try:
+            execution_id = query_observability.start_execution(
+                query_id,
+                query_url,
+                items_per_query,
+                started_at=request_started_at,
+            )
+        except Exception:
+            # Observability must never prevent the established scraper path
+            # from running. Startup normally creates the schema before this
+            # point; this fallback also keeps isolated legacy tests working.
+            logger.error(
+                "Could not start catalogue execution telemetry for query %s; "
+                "using legacy discovery for this request.",
+                query_id,
+                exc_info=True,
+            )
 
         try:
             # Requester owns the one bounded session-refresh retry. The scrape
@@ -867,6 +891,21 @@ def process_items(
         except requests.exceptions.HTTPError as error:
             response = error.response
             status_code = response.status_code if response is not None else None
+            if execution_id is not None:
+                try:
+                    query_observability.record_failure(
+                        execution_id,
+                        f"http_{status_code or 'error'}",
+                        http_status=status_code,
+                        duration_ms=(time.monotonic() - request_started_monotonic)
+                        * 1000,
+                    )
+                except Exception:
+                    logger.error(
+                        "Could not finish catalogue failure telemetry for " "query %s.",
+                        query_id,
+                        exc_info=True,
+                    )
 
             if status_code == 401:
                 cooldown = _activate_scraper_cooldown(401)
@@ -932,6 +971,20 @@ def process_items(
                     exc_info=True,
                 )
         except requests.exceptions.RequestException:
+            if execution_id is not None:
+                try:
+                    query_observability.record_failure(
+                        execution_id,
+                        "network_error",
+                        duration_ms=(time.monotonic() - request_started_monotonic)
+                        * 1000,
+                    )
+                except Exception:
+                    logger.error(
+                        "Could not finish catalogue failure telemetry for " "query %s.",
+                        query_id,
+                        exc_info=True,
+                    )
             logger.error(
                 "Network error while scraping query %s/%s: %s",
                 position,
@@ -940,6 +993,20 @@ def process_items(
                 exc_info=True,
             )
         except Exception:
+            if execution_id is not None:
+                try:
+                    query_observability.record_failure(
+                        execution_id,
+                        "unexpected_error",
+                        duration_ms=(time.monotonic() - request_started_monotonic)
+                        * 1000,
+                    )
+                except Exception:
+                    logger.error(
+                        "Could not finish catalogue failure telemetry for " "query %s.",
+                        query_id,
+                        exc_info=True,
+                    )
             logger.error(
                 "Unexpected error while scraping query %s/%s: %s",
                 position,
@@ -954,18 +1021,93 @@ def process_items(
         if all_items is not None:
             successful_fetches += 1
             if db.is_query_enabled(query_id):
-                data = [item for item in all_items if item.is_new_item()]
-                queue.put((data, query_id))
+                data = None
+                if execution_id is not None:
+                    try:
+                        observation = query_observability.record_success(
+                            execution_id,
+                            query_id,
+                            query_url,
+                            [
+                                query_observability.item_snapshot(item)
+                                for item in all_items
+                            ],
+                            duration_ms=(time.monotonic() - request_started_monotonic)
+                            * 1000,
+                        )
+                        candidate_ids = {
+                            str(item_id) for item_id in observation.candidate_ids
+                        }
+                        data = [
+                            item for item in all_items if str(item.id) in candidate_ids
+                        ]
+                    except Exception:
+                        logger.error(
+                            "Could not persist catalogue observations for "
+                            "query %s; using legacy discovery for this response.",
+                            query_id,
+                            exc_info=True,
+                        )
+                        try:
+                            query_observability.record_failure(
+                                execution_id,
+                                "observation_persistence_error",
+                                http_status=200,
+                                duration_ms=(
+                                    time.monotonic() - request_started_monotonic
+                                )
+                                * 1000,
+                            )
+                        except Exception:
+                            logger.error(
+                                "Could not close failed catalogue telemetry for "
+                                "query %s.",
+                                query_id,
+                                exc_info=True,
+                            )
+                if data is not None:
+                    try:
+                        # Pending snapshots were committed with the successful
+                        # progress marker. If this handoff is lost, the queue
+                        # consumer recovers the same batch from SQLite.
+                        queue.put((data, query_id, execution_id))
+                    except Exception:
+                        logger.error(
+                            "Could not hand query %s to the in-memory queue; "
+                            "durable recovery will process it.",
+                            query_id,
+                            exc_info=True,
+                        )
+                if data is None:
+                    data = [item for item in all_items if item.is_new_item()]
+                    queue.put((data, query_id))
             else:
                 data = []
+                if execution_id is not None:
+                    try:
+                        query_observability.record_failure(
+                            execution_id,
+                            "discarded_paused",
+                            http_status=200,
+                            duration_ms=(time.monotonic() - request_started_monotonic)
+                            * 1000,
+                        )
+                    except Exception:
+                        logger.error(
+                            "Could not finish paused-query telemetry for query %s.",
+                            query_id,
+                            exc_info=True,
+                        )
                 logger.info(
                     "Discarding results for query %s because it was paused "
                     "while the request was in progress.",
                     query_id,
                 )
             logger.info(
-                "Scraped %s items for query %s/%s: %s",
+                "Discovered %s candidate(s) from %s returned item(s) for "
+                "query %s/%s: %s",
                 len(data),
+                len(all_items),
                 position,
                 query_count,
                 query_url,
@@ -1102,14 +1244,107 @@ def _ai_evaluation_snapshot(item):
     }
 
 
+def _pending_snapshot_item(snapshot):
+    """Rebuild the small item interface used by local filtering/delivery.
+
+    Pending snapshots intentionally omit seller data and descriptions. The
+    catalogue-provided country code is retained only when already present, so
+    restart recovery never creates an additional Vinted request.
+    """
+    country_code = _normalise_country_code(snapshot.get("country_code"))
+    raw_data = {"country_iso_code": country_code} if country_code else {}
+    return SimpleNamespace(
+        id=snapshot.get("item_id"),
+        title=snapshot.get("title") or "",
+        brand_title=snapshot.get("brand") or "",
+        condition=snapshot.get("condition") or "",
+        description=None,
+        size_title=None,
+        currency=snapshot.get("currency") or "",
+        price=snapshot.get("price") or "",
+        photo=snapshot.get("photo_url"),
+        url=snapshot.get("item_url"),
+        raw_timestamp=snapshot.get("listed_at"),
+        raw_data=raw_data,
+    )
+
+
+def _classify_pending_safely(
+    execution_id,
+    query_id,
+    item_id,
+    disposition,
+    **kwargs,
+):
+    try:
+        return query_observability.classify_pending(
+            execution_id,
+            query_id,
+            item_id,
+            disposition,
+            **kwargs,
+        )
+    except Exception:
+        logger.error(
+            "Could not classify pending catalogue item %s as %s.",
+            item_id,
+            disposition,
+            exc_info=True,
+        )
+        return False
+
+
+def _release_pending_items(execution_id, query_id, items, retry_delay=5):
+    if execution_id is None:
+        return
+    for item in items:
+        _classify_pending_safely(
+            execution_id,
+            query_id,
+            item.id,
+            "retry",
+            retry_delay=retry_delay,
+        )
+
+
 def clear_item_queue(items_queue, new_items_queue):
     """
     Process items from the items_queue.
     This function is scheduled to run frequently.
     """
-    if not items_queue.empty():
-        data, query_id = items_queue.get()
+    batch = None
+    try:
+        batch = items_queue.get_nowait()
+    except Empty:
+        pass
+    except AttributeError:
+        # Compatibility with simple queue fakes and legacy direct callers.
+        if not items_queue.empty():
+            batch = items_queue.get()
+    if batch is None:
+        try:
+            durable_batch = query_observability.pending_batch()
+        except Exception:
+            # Startup creates this schema. Keep legacy/unit-test databases
+            # compatible without making queue processing fail closed.
+            logger.debug("Durable pending catalogue queue unavailable.", exc_info=True)
+            durable_batch = None
+        if durable_batch is not None:
+            execution_id, query_id, snapshots = durable_batch
+            batch = (
+                [_pending_snapshot_item(snapshot) for snapshot in snapshots],
+                query_id,
+                execution_id,
+            )
+
+    if batch is not None:
+        if len(batch) == 3:
+            data, query_id, execution_id = batch
+        else:
+            data, query_id = batch
+            execution_id = None
         if not db.is_query_enabled(query_id):
+            _release_pending_items(execution_id, query_id, data)
             logger.info(
                 "Discarding queued results for paused query %s.",
                 query_id,
@@ -1124,22 +1359,47 @@ def clear_item_queue(items_queue, new_items_queue):
                     "Stopping queued item processing because query %s was paused.",
                     query_id,
                 )
+                _release_pending_items(execution_id, query_id, data)
                 break
 
-            # If already in db, pass
+            # Legacy queue entries retain their historical timestamp guard.
+            # Durable executions use per-query item IDs and progress anchors,
+            # so correctness no longer depends on a 20-minute age window.
             last_query_timestamp = db.get_last_timestamp(query_id)
             if (
-                last_query_timestamp is not None
+                execution_id is None
+                and last_query_timestamp is not None
                 and last_query_timestamp >= item.raw_timestamp
             ):
                 pass
             # In case of multiple queries, we need to check if the item is already in the db
             elif db.is_item_in_db_by_id(item.id) is True:
-                # We update the timestamp
+                if execution_id is not None and not _classify_pending_safely(
+                    execution_id,
+                    query_id,
+                    item.id,
+                    "already_known",
+                ):
+                    logger.info(
+                        "Stopping stale or unavailable durable batch for query %s.",
+                        query_id,
+                    )
+                    break
                 db.update_last_timestamp(query_id, item.raw_timestamp)
                 pass
             # Reject local title exclusions before any optional seller lookup.
             elif banwords_str and contains_banwords(item.title, banwords_str):
+                if execution_id is not None and not _classify_pending_safely(
+                    execution_id,
+                    query_id,
+                    item.id,
+                    "locally_rejected",
+                ):
+                    logger.info(
+                        "Stopping stale or unavailable durable batch for query %s.",
+                        query_id,
+                    )
+                    break
                 db.update_last_timestamp(query_id, item.raw_timestamp)
                 pass
             # If there's an allowlist and
@@ -1147,6 +1407,17 @@ def clear_item_queue(items_queue, new_items_queue):
             elif allowlist != 0 and _resolve_item_country(item) not in (
                 allowlist + ["XX"]
             ):
+                if execution_id is not None and not _classify_pending_safely(
+                    execution_id,
+                    query_id,
+                    item.id,
+                    "locally_rejected",
+                ):
+                    logger.info(
+                        "Stopping stale or unavailable durable batch for query %s.",
+                        query_id,
+                    )
+                    break
                 db.update_last_timestamp(query_id, item.raw_timestamp)
                 pass
             else:
@@ -1220,8 +1491,15 @@ def clear_item_queue(items_queue, new_items_queue):
                     ai_evaluation=(
                         _ai_evaluation_snapshot(item) if is_ai_query else None
                     ),
+                    execution_id=execution_id,
                 )
                 if persistence is None:
+                    _release_pending_items(
+                        execution_id,
+                        query_id,
+                        [item],
+                        retry_delay=5,
+                    )
                     logger.error(
                         "Could not persist item %s and its notification; "
                         "stopping this query batch so it can be retried.",
@@ -1231,6 +1509,12 @@ def clear_item_queue(items_queue, new_items_queue):
 
                 persisted, subscriber_chat_ids = persistence
                 if not persisted:
+                    _release_pending_items(
+                        execution_id,
+                        query_id,
+                        [item],
+                        retry_delay=5,
+                    )
                     logger.info(
                         "Stopping queued item processing because query %s was "
                         "paused or removed before item %s could be persisted.",

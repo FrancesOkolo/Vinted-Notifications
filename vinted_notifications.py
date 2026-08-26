@@ -37,6 +37,7 @@ def _load_env_file():
 _env_loaded, _env_detail = _load_env_file()
 
 import db  # noqa: E402
+import query_observability  # noqa: E402
 import scraper_rate  # noqa: E402
 from apscheduler.executors.pool import ThreadPoolExecutor  # noqa: E402
 from apscheduler.schedulers.background import BackgroundScheduler  # noqa: E402
@@ -206,6 +207,14 @@ def initialise_database():
         (db.migrate_query_uniqueness, "query uniqueness"),
         (db.migrate_quiet_hours_schema, "quiet-hours configuration"),
         (db.migrate_query_preferences_schema, "per-query monitoring preferences"),
+        (
+            query_observability.migrate_schema,
+            "catalogue execution telemetry and durable discovery progress",
+        ),
+        (
+            query_observability.prune_retention,
+            "catalogue execution telemetry retention",
+        ),
         (db.migrate_fork_identity, "fork identity"),
     ]
     for migration, label in migrations:

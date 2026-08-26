@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Durable catalogue discovery and query-efficiency evidence
+
+- Record every catalogue execution durably, including outcome, HTTP status,
+  duration, raw/unique returned counts, new candidates, already-known items,
+  accepted and locally rejected items, generated notifications, result-window
+  saturation, and observed cross-query overlap.
+- Replace the fixed 20-minute ongoing discovery rule with per-query successful
+  progress anchors and item-ID observations. The age check remains only as a
+  first-observation bootstrap guard for a genuinely new query.
+- Persist privacy-minimised pending listing snapshots with successful progress,
+  allowing an app restart or lost in-memory queue handoff to resume local
+  filtering and create the item/outbox transaction exactly once.
+- Keep failed requests from advancing progress; fail old in-flight responses
+  closed after a URL edit, and preserve monotonic query timestamps when durable
+  batches complete out of order.
+- Scope pre-delivery claims per query so a paused overlapping query cannot
+  starve an active one, while retaining the existing global final item-ID
+  deduplication that prevents duplicate listing alerts.
+- Add a read-only Query Efficiency admin page with 7/30/90-day per-query yield,
+  failure, overlap, cadence, request-volume, and latency evidence. It does not
+  mutate scheduler/query settings or create Vinted requests.
+- Prune execution-detail evidence older than 90 days at startup while retaining
+  the durable progress and per-query item observations needed for correctness.
+- Keep the scheduler, shared request gate, Fast/Normal allocation, and default
+  result window of 20 unchanged until representative evidence supports a
+  separate recommendation.
+
 ### Telegram item sharing
 
 - Add Share on WhatsApp and Copy item link actions to Vinted item alerts while

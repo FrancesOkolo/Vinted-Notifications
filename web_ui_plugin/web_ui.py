@@ -13,6 +13,8 @@ from flask import (
 )
 import db
 import core
+import query_efficiency
+import query_observability
 import scraper_rate
 import hmac
 import ipaddress
@@ -1293,6 +1295,83 @@ def _validate_message_template(template):
         )
 
     template.format(**{field: "test" for field in allowed})
+
+
+def _query_efficiency_schedule():
+    """Return the current clean-run cadence model for the read-only report."""
+
+    params = db.get_all_parameters()
+    enabled_map = db.get_query_enabled_map()
+    active_ids = [query_id for query_id, enabled in enabled_map.items() if enabled]
+
+    try:
+        refresh_delay = int(params.get("query_refresh_delay") or 180)
+    except (TypeError, ValueError):
+        refresh_delay = 180
+    try:
+        fast_delay = int(params.get("fast_query_refresh_delay") or 90)
+    except (TypeError, ValueError):
+        fast_delay = 90
+
+    request_spacing = scraper_rate.bounded_request_spacing(
+        params.get("catalogue_request_spacing_seconds")
+    )
+    try:
+        preferences = db.get_query_preferences_map(query_ids=active_ids) or {}
+    except Exception:
+        logger.exception("Could not load preferences for the efficiency report.")
+        preferences = {}
+
+    fast_count = sum(
+        str(preferences.get(query_id, {}).get("poll_mode", "normal")).lower() == "fast"
+        for query_id in active_ids
+    )
+    normal_count = len(active_ids) - fast_count
+    cadence = scraper_rate.build_cadence_plan(
+        normal_count=normal_count,
+        fast_count=fast_count,
+        requested_normal_seconds=refresh_delay,
+        requested_fast_seconds=fast_delay,
+        request_spacing_seconds=request_spacing,
+    )
+    volume = query_efficiency.request_volume_scenario(
+        normal_count=normal_count,
+        fast_count=fast_count,
+        effective_normal_seconds=cadence["effective_normal_seconds"],
+        effective_fast_seconds=cadence["effective_fast_seconds"],
+    )
+    return {
+        "cadence": cadence,
+        "volume": volume,
+        "normal_latency": query_efficiency.periodic_poll_latency(
+            cadence["effective_normal_seconds"]
+        ),
+        "fast_latency": query_efficiency.periodic_poll_latency(
+            cadence["effective_fast_seconds"]
+        ),
+    }
+
+
+@app.route("/query-efficiency")
+def query_efficiency_report():
+    """Render privacy-safe, read-only catalogue-query evidence."""
+
+    try:
+        days = int(request.args.get("days", "30"))
+    except (TypeError, ValueError):
+        abort(400, description="days must be one of 7, 30, or 90")
+    if days not in {7, 30, 90}:
+        abort(400, description="days must be one of 7, 30, or 90")
+
+    report = query_observability.get_efficiency_report(days=days)
+    schedule = _query_efficiency_schedule()
+    return render_template(
+        "query_efficiency.html",
+        report=report,
+        schedule=schedule,
+        selected_days=days,
+        allowed_days=(7, 30, 90),
+    )
 
 
 @app.route("/config")
