@@ -1,0 +1,33 @@
+{% if item %}
+<div class="d-flex align-items-center justify-content-center dashboard-last-item">
+    {% if item.photo_url %}
+    <img src="{{ item.photo_url }}" alt="{{ item.title }}" data-image-fallback
+         class="img-thumbnail me-2" style="width: 50px; height: 50px; object-fit: cover;">
+    {% else %}
+    <div class="bg-light d-flex align-items-center justify-content-center me-2"
+         style="width: 50px; height: 50px;">
+        <i class="bi bi-image text-muted"></i>
+    </div>
+    {% endif %}
+    <div class="text-start">
+        <h6 class="mb-0 text-truncate" style="max-width: 150px;">
+            <a href="{{ item.url }}" target="_blank" class="text-decoration-none">
+                {{ item.title }}
+            </a>
+        </h6>
+        <small class="text-muted">
+            Found
+            <time datetime="{{ item.timestamp_iso }}"
+                  data-relative-time="{{ item.timestamp_raw }}"
+                  title="{{ item.timestamp }}">{{ item.timestamp }}</time>
+        </small>
+        <div class="mt-1">
+            <a href="{{ item.url }}" target="_blank" class="btn btn-sm btn-outline-info">
+                <i class="bi bi-box-arrow-up-right"></i> View
+            </a>
+        </div>
+    </div>
+</div>
+{% else %}
+<p class="text-muted">No items found yet</p>
+{% endif %}

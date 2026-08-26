@@ -207,6 +207,7 @@ def initialise_database():
         (db.migrate_query_uniqueness, "query uniqueness"),
         (db.migrate_quiet_hours_schema, "quiet-hours configuration"),
         (db.migrate_query_preferences_schema, "per-query monitoring preferences"),
+        (db.migrate_item_discovery_schema, "item discovery timestamps"),
         (
             query_observability.migrate_schema,
             "catalogue execution telemetry and durable discovery progress",

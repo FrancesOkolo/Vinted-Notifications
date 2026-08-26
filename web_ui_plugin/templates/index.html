@@ -17,7 +17,7 @@
                     <i class="bi bi-box-seam text-primary"></i>
                 </div>
                 <h5 class="card-title stat-label">Total Items</h5>
-                <h2 class="fw-bold text-primary stat-value">{{ stats.total_items }}</h2>
+                <h2 class="fw-bold text-primary stat-value" id="dashboardTotalItems">{{ stats.total_items }}</h2>
                 <p class="card-text text-muted stat-description">Items grabbed for monitored queries so far</p>
             </div>
         </a>
@@ -30,8 +30,8 @@
                     <i class="bi bi-search text-success"></i>
                 </div>
                 <h5 class="card-title stat-label">Active Queries</h5>
-                <h2 class="fw-bold text-success stat-value">{{ stats.active_queries }}</h2>
-                <p class="card-text text-muted stat-description">
+                <h2 class="fw-bold text-success stat-value" id="dashboardActiveQueries">{{ stats.active_queries }}</h2>
+                <p class="card-text text-muted stat-description" id="dashboardQuerySummary">
                     Queries being monitored{% if stats.paused_queries %}; {{ stats.paused_queries }} paused{% endif %}
                 </p>
             </div>
@@ -45,7 +45,7 @@
                     <i class="bi bi-bar-chart-fill text-warning"></i>
                 </div>
                 <h5 class="card-title stat-label">Items per Day</h5>
-                <h2 class="fw-bold text-warning stat-value">{{ stats.items_per_day }}</h2>
+                <h2 class="fw-bold text-warning stat-value" id="dashboardItemsPerDay">{{ stats.items_per_day }}</h2>
                 <p class="card-text text-muted stat-description">Average items found daily</p>
             </div>
         </a>
@@ -56,43 +56,12 @@
                 <div class="d-flex align-items-center justify-content-center stat-icon">
                     <i class="bi bi-clock-history text-info"></i>
                 </div>
-                <h5 class="card-title stat-label">Last Found Item</h5>
-                {% if stats.last_item %}
-                <div class="d-flex align-items-center justify-content-center dashboard-last-item">
-                    {% if stats.last_item.photo_url %}
-                    <img src="{{ stats.last_item.photo_url }}" alt="{{ stats.last_item.title }}" data-image-fallback
-                         class="img-thumbnail me-2" style="width: 50px; height: 50px; object-fit: cover;">
-                    {% else %}
-                    <div class="bg-light d-flex align-items-center justify-content-center me-2"
-                         style="width: 50px; height: 50px;">
-                        <i class="bi bi-image text-muted"></i>
-                    </div>
-                    {% endif %}
-                    <div class="text-start">
-                        <h6 class="mb-0 text-truncate" style="max-width: 150px;">
-                            <a href="{{ stats.last_item.url }}" target="_blank"
-                               class="text-decoration-none">
-                                {{ stats.last_item.title }}
-                            </a>
-                        </h6>
-                        <small class="text-muted">
-                            <time datetime="{{ stats.last_item.timestamp_iso }}"
-                                  data-relative-time="{{ stats.last_item.timestamp_raw }}"
-                                  title="{{ stats.last_item.timestamp }}">
-                                {{ stats.last_item.timestamp }}
-                            </time>
-                        </small>
-                        <div class="mt-1">
-                            <a href="{{ stats.last_item.url }}" target="_blank"
-                               class="btn btn-sm btn-outline-info">
-                                <i class="bi bi-box-arrow-up-right"></i> View
-                            </a>
-                        </div>
-                    </div>
+                <h5 class="card-title stat-label">Last Alerted Item</h5>
+                <div id="dashboardLastItem">
+                    {% with item=stats.last_item %}
+                        {% include "_dashboard_last_item.html" %}
+                    {% endwith %}
                 </div>
-                {% else %}
-                <p class="text-muted">No items found yet</p>
-                {% endif %}
             </div>
         </div>
     </div>
@@ -246,42 +215,7 @@
             <div class="card-body" id="recentItemsContent">
                 <!-- Card View -->
                 <div class="row" id="cardView">
-                    {% for item in items %}
-                    <div class="col-6 col-md-6 col-xl-4 mb-3">
-                        <div class="card h-100">
-                            {% if item.photo_url %}
-                            <img src="{{ item.photo_url }}" class="card-img-top" alt="{{ item.title }}" data-image-fallback
-                                 style="height: 150px; object-fit: cover;">
-                            {% else %}
-                            <div class="card-img-top bg-light d-flex align-items-center justify-content-center"
-                                 style="height: 150px;">
-                                <i class="bi bi-image text-muted" style="font-size: 2rem;"></i>
-                            </div>
-                            {% endif %}
-                            <div class="card-body p-2">
-                                <h6 class="card-title" style="height: 40px; overflow: hidden; font-size: 0.9rem;">
-                                    <strong>{{ item.title }}</strong></h6>
-                                <p class="card-text small mb-1">
-                                    Price: {{ item.price }} {{ item.currency }}<br>
-                                    Date:
-                                    <time datetime="{{ item.timestamp_iso }}"
-                                          data-relative-time="{{ item.timestamp_raw }}"
-                                          title="{{ item.timestamp }}">{{ item.timestamp }}</time>
-                                </p>
-                            </div>
-                            <div class="card-footer bg-white p-2">
-                                <a href="{{ item.url }}" target="_blank"
-                                   class="btn btn-sm btn-primary w-100">
-                                    <i class="bi bi-box-arrow-up-right"></i> View
-                                </a>
-                            </div>
-                        </div>
-                    </div>
-                    {% else %}
-                    <div class="col-12 text-center py-5">
-                        <p class="text-muted">No items found</p>
-                    </div>
-                    {% endfor %}
+                    {% include "_dashboard_recent_item_cards.html" %}
                 </div>
 
                 <!-- List View -->
@@ -292,43 +226,13 @@
                             <th>Image</th>
                             <th>Title</th>
                             <th>Price</th>
-                            <th>Timestamp</th>
+                            <th>Found</th>
+                            <th>Listed</th>
                             <th>Actions</th>
                         </tr>
                         </thead>
-                        <tbody>
-                        {% for item in items %}
-                        <tr>
-                            <td style="width: 60px;">
-                                {% if item.photo_url %}
-                                <img src="{{ item.photo_url }}" alt="{{ item.title }}" class="img-thumbnail" data-image-fallback
-                                     style="width: 50px; height: 50px; object-fit: cover;">
-                                {% else %}
-                                <div class="bg-light d-flex align-items-center justify-content-center"
-                                     style="width: 50px; height: 50px;">
-                                    <i class="bi bi-image text-muted"></i>
-                                </div>
-                                {% endif %}
-                            </td>
-                            <td>{{ item.title }}</td>
-                            <td>{{ item.price }} {{ item.currency }}</td>
-                            <td>
-                                <time datetime="{{ item.timestamp_iso }}"
-                                      data-relative-time="{{ item.timestamp_raw }}"
-                                      title="{{ item.timestamp }}">{{ item.timestamp }}</time>
-                            </td>
-                            <td>
-                                <a href="{{ item.url }}" target="_blank"
-                                   class="btn btn-sm btn-outline-primary">
-                                    <i class="bi bi-box-arrow-up-right"></i> View
-                                </a>
-                            </td>
-                        </tr>
-                        {% else %}
-                        <tr>
-                            <td colspan="5" class="text-center">No items found</td>
-                        </tr>
-                        {% endfor %}
+                        <tbody id="recentItemsListBody">
+                        {% include "_dashboard_recent_item_rows.html" %}
                         </tbody>
                     </table>
                 </div>
@@ -370,7 +274,7 @@
                 <div class="table-responsive">
                     <table class="table table-hover mb-0 sortable-query-table" id="dashboardQueriesTable">
                         <caption class="visually-hidden">
-                            Active queries. Use the Query and Last Found Item column buttons to change the sort order.
+                            Saved queries. Use the Query and Last Alert column buttons to change the sort order.
                         </caption>
                         <thead>
                         <tr>
@@ -385,34 +289,16 @@
                             <th scope="col" class="last-found-column" aria-sort="descending"
                                 data-sort-header="lastFound">
                                 <button type="button" class="table-sort-button" data-sort-key="lastFound"
-                                        data-sort-label="Last Found Item"
-                                        aria-label="Last Found Item, sorted descending. Activate to sort ascending">
-                                    <span>Last Found Item</span>
+                                        data-sort-label="Last Alert"
+                                        aria-label="Last Alert, sorted descending. Activate to sort ascending">
+                                    <span>Last Alert</span>
                                     <span class="sort-indicator is-active" aria-hidden="true">&#8595;</span>
                                 </button>
                             </th>
                         </tr>
                         </thead>
-                        <tbody>
-                        {% for query in queries %}
-                        <tr data-query-row data-query="{{ query.display|e }}"
-                            data-last-found="{{ query.last_found_timestamp if query.last_found_timestamp is not none else '' }}">
-                            <td data-row-number>{{ query.id }}</td>
-                            <td>{{ query.display }}</td>
-                            <td class="last-found-cell">
-                                {% if query.last_found_timestamp is not none %}
-                                <time datetime="{{ query.last_found_item|replace(' ', 'T') }}"
-                                      data-relative-time="{{ query.last_found_timestamp }}"
-                                      title="{{ query.last_found_item }}">{{ query.last_found_item }}</time>
-                                {% else %}
-                                Never
-                                {% endif %}
-                            </td>
-                        </tr>
-                        {% endfor %}
-                        <tr id="queryNoResultsRow" {% if queries %}hidden{% endif %}>
-                            <td colspan="3" class="text-center">No queries found</td>
-                        </tr>
+                        <tbody id="dashboardQueriesBody">
+                        {% include "_dashboard_query_rows.html" %}
                         </tbody>
                     </table>
                 </div>
@@ -750,12 +636,13 @@
 
         // Sort, search, and paginate the dashboard query table without a page reload.
         const queryTable = document.getElementById('dashboardQueriesTable');
+        let refreshDashboardQueryRows = function () {};
         if (queryTable) {
             const queryTableBody = queryTable.querySelector('tbody');
             const sortHeaders = Array.from(queryTable.querySelectorAll('[data-sort-header]'));
             const sortStatus = document.getElementById('querySortStatus');
-            const queryRows = Array.from(queryTableBody.querySelectorAll('[data-query-row]'));
-            const noResultsRow = document.getElementById('queryNoResultsRow');
+            let queryRows = Array.from(queryTableBody.querySelectorAll('[data-query-row]'));
+            let noResultsRow = document.getElementById('queryNoResultsRow');
             const searchInput = document.getElementById('querySearchInput');
             const clearSearchButton = document.getElementById('clearQuerySearch');
             const resultsCount = document.getElementById('queryResultsCount');
@@ -914,9 +801,72 @@
                 queryTable.scrollIntoView({block: 'nearest'});
             });
 
+            refreshDashboardQueryRows = function () {
+                queryRows = Array.from(queryTableBody.querySelectorAll('[data-query-row]'));
+                noResultsRow = document.getElementById('queryNoResultsRow');
+                renderQueryTable();
+            };
+
             updateSortHeaders(activeSortKey, activeSortDirection);
             renderQueryTable();
         }
+
+        // Refresh discovery-led panels without disturbing the selected view,
+        // query search, sort order, or pagination state.
+        const recentItemsListBody = document.getElementById('recentItemsListBody');
+        const dashboardQueriesBody = document.getElementById('dashboardQueriesBody');
+        const dashboardLastItem = document.getElementById('dashboardLastItem');
+        const dashboardTotalItems = document.getElementById('dashboardTotalItems');
+        const dashboardActiveQueries = document.getElementById('dashboardActiveQueries');
+        const dashboardQuerySummary = document.getElementById('dashboardQuerySummary');
+        const dashboardItemsPerDay = document.getElementById('dashboardItemsPerDay');
+        let dashboardFeedLoading = false;
+
+        function loadDashboardFeed() {
+            if (dashboardFeedLoading || document.hidden) return;
+            dashboardFeedLoading = true;
+
+            fetch('/api/dashboard/feed', {
+                headers: {'Accept': 'application/json'},
+                cache: 'no-store'
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Dashboard feed returned ' + response.status);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    cardView.innerHTML = data.recent_item_cards_html;
+                    recentItemsListBody.innerHTML = data.recent_item_rows_html;
+                    dashboardQueriesBody.innerHTML = data.query_rows_html;
+                    dashboardLastItem.innerHTML = data.last_item_html;
+                    dashboardTotalItems.textContent = String(data.total_items);
+                    dashboardActiveQueries.textContent = String(data.active_queries);
+                    dashboardQuerySummary.textContent = data.paused_queries
+                        ? `Queries being monitored; ${data.paused_queries} paused`
+                        : 'Queries being monitored';
+                    dashboardItemsPerDay.textContent = String(data.items_per_day);
+
+                    const querySearchInput = document.getElementById('querySearchInput');
+                    if (querySearchInput) {
+                        querySearchInput.placeholder = `Search ${data.query_count} queries`;
+                    }
+                    refreshDashboardQueryRows();
+                    updateRelativeTimes();
+                })
+                .catch(error => {
+                    console.error('Dashboard feed refresh failed:', error);
+                })
+                .finally(() => {
+                    dashboardFeedLoading = false;
+                });
+        }
+
+        window.setInterval(loadDashboardFeed, 20000);
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) loadDashboardFeed();
+        });
     });
 </script>
 {% endblock %}

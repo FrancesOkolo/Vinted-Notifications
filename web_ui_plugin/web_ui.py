@@ -340,15 +340,34 @@ def _queries_newest_first(queries):
     return sorted(queries, key=_query_last_found_sort_key)
 
 
-@app.route("/")
-def index():
-    # Get parameters
-    params = db.get_all_parameters()
+def _format_dashboard_timestamp(value):
+    """Return display fields for one local epoch timestamp."""
+    try:
+        timestamp = float(value)
+        moment = datetime.fromtimestamp(timestamp)
+        return {
+            "text": moment.strftime("%Y-%m-%d %H:%M:%S"),
+            "iso": moment.astimezone().isoformat(),
+            "raw": timestamp,
+        }
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
-    # Get queries, newest Last Found Item first; Never entries last.
-    queries = _queries_newest_first(db.get_queries())
-    formatted_queries = []
-    for i, query in enumerate(queries):
+
+def _format_dashboard_queries():
+    """Return saved queries ordered by the time this app last raised an alert."""
+    discoveries = db.get_query_last_discovery_map()
+    queries = list(db.get_queries())
+    queries.sort(
+        key=lambda query: (
+            0 if discoveries.get(int(query[0])) is not None else 1,
+            -float(discoveries.get(int(query[0])) or 0),
+            int(query[0]),
+        )
+    )
+
+    formatted = []
+    for position, query in enumerate(queries, start=1):
         parsed_query = urlparse(query[1])
         query_params = parse_qs(parsed_query.query)
         query_name = (
@@ -356,91 +375,81 @@ def index():
             if query[3] is not None
             else query_params.get("search_text", [None])[0]
         )
-
-        # last_item is already included in db.get_queries().
-        last_timestamp = query[2]
-        last_found_timestamp = None
-        if last_timestamp is None:
-            last_found_item = "Never"
-        else:
-            try:
-                last_found_timestamp = float(last_timestamp)
-                last_found_item = datetime.fromtimestamp(last_found_timestamp).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-            except (TypeError, ValueError, OSError, OverflowError) as error:
-                logger.warning(
-                    "Could not format last_item %r for query %s: %s",
-                    last_timestamp,
-                    query[0],
-                    error,
-                )
-                last_found_item = "Never"
-
-        formatted_queries.append(
+        discovery = _format_dashboard_timestamp(discoveries.get(int(query[0])))
+        formatted.append(
             {
-                "id": i + 1,
+                "id": position,
                 "query_id": query[0],
                 "query": query[1],
                 "display": query_name if query_name else query[1],
-                "last_found_item": last_found_item,
-                "last_found_timestamp": last_found_timestamp,
+                # Keep these established template keys while changing their
+                # semantics from marketplace publication time to local alert time.
+                "last_found_item": discovery["text"] if discovery else "Never",
+                "last_found_timestamp": discovery["raw"] if discovery else None,
             }
         )
+    return formatted
 
-    # Keep the dashboard concise; the Items page remains the full browsing view.
-    items = db.get_items(limit=6)
-    formatted_items = []
-    for item in items:
-        item_timestamp = float(item[4])
-        item_datetime = datetime.fromtimestamp(item_timestamp)
-        formatted_items.append(
+
+def _format_dashboard_items():
+    """Return the six items most recently discovered by this application."""
+    formatted = []
+    for item in db.get_items(limit=6, sort="discovered_desc"):
+        listed = _format_dashboard_timestamp(item[4])
+        discovered = _format_dashboard_timestamp(item[8])
+        if listed is None or discovered is None:
+            logger.warning(
+                "Could not format dashboard timestamps for item %s.",
+                item[0],
+            )
+            continue
+        parsed_query = urlparse(item[5])
+        formatted.append(
             {
                 "title": item[1],
                 "price": item[2],
                 "currency": item[3],
-                "timestamp": item_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-                "timestamp_iso": item_datetime.astimezone().isoformat(),
-                "timestamp_raw": item_timestamp,
+                "timestamp": discovered["text"],
+                "timestamp_iso": discovered["iso"],
+                "timestamp_raw": discovered["raw"],
+                "listed_timestamp": listed["text"],
+                "listed_timestamp_iso": listed["iso"],
+                "listed_timestamp_raw": listed["raw"],
                 "query": item[5],
                 "photo_url": item[6],
-                "url": f"{urlparse(item[5]).scheme}://{urlparse(item[5]).netloc}/items/{item[0]}",
+                "url": (
+                    f"{parsed_query.scheme}://{parsed_query.netloc}/items/{item[0]}"
+                ),
             }
         )
+    return formatted
 
-    # Get process status from the database
-    telegram_running = db.get_parameter("telegram_process_running") == "True"
-    rss_running = db.get_parameter("rss_process_running") == "True"
 
-    # Get statistics for the dashboard. Keep total and active query counts
-    # separate now that paused queries remain stored in the database.
+def _dashboard_stats(items=None):
+    """Return the dashboard counters and most recently alerted item."""
     enabled_map = db.get_query_enabled_map()
-    stats = {
+    recent_items = _format_dashboard_items() if items is None else items
+    return {
         "total_items": db.get_total_items_count(),
         "total_queries": len(enabled_map),
         "active_queries": sum(1 for enabled in enabled_map.values() if enabled),
         "paused_queries": sum(1 for enabled in enabled_map.values() if not enabled),
         "items_per_day": db.get_items_per_day(),
+        "last_item": recent_items[0] if recent_items else None,
     }
 
-    # Get the last found item
-    last_item = db.get_last_found_item()
-    if last_item:
-        last_item_timestamp = float(last_item[4])
-        last_item_datetime = datetime.fromtimestamp(last_item_timestamp)
-        stats["last_item"] = {
-            "title": last_item[1],
-            "price": last_item[2],
-            "currency": last_item[3],
-            "timestamp": last_item_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-            "timestamp_iso": last_item_datetime.astimezone().isoformat(),
-            "timestamp_raw": last_item_timestamp,
-            "query": last_item[5],
-            "photo_url": last_item[6],
-            "url": f"{urlparse(last_item[5]).scheme}://{urlparse(last_item[5]).netloc}/items/{last_item[0]}",
-        }
-    else:
-        stats["last_item"] = None
+
+@app.route("/")
+def index():
+    # Get parameters
+    params = db.get_all_parameters()
+    formatted_queries = _format_dashboard_queries()
+    formatted_items = _format_dashboard_items()
+
+    # Get process status from the database
+    telegram_running = db.get_parameter("telegram_process_running") == "True"
+    rss_running = db.get_parameter("rss_process_running") == "True"
+    stats = _dashboard_stats(formatted_items)
 
     return render_template(
         "index.html",
@@ -450,6 +459,39 @@ def index():
         telegram_running=telegram_running,
         rss_running=rss_running,
         stats=stats,
+    )
+
+
+@app.route("/api/dashboard/feed")
+def dashboard_feed():
+    """Return escaped dashboard fragments for non-disruptive live refresh."""
+    formatted_queries = _format_dashboard_queries()
+    formatted_items = _format_dashboard_items()
+    stats = _dashboard_stats(formatted_items)
+    return _no_store_json(
+        {
+            "recent_item_cards_html": render_template(
+                "_dashboard_recent_item_cards.html",
+                items=formatted_items,
+            ),
+            "recent_item_rows_html": render_template(
+                "_dashboard_recent_item_rows.html",
+                items=formatted_items,
+            ),
+            "query_rows_html": render_template(
+                "_dashboard_query_rows.html",
+                queries=formatted_queries,
+            ),
+            "last_item_html": render_template(
+                "_dashboard_last_item.html",
+                item=stats["last_item"],
+            ),
+            "total_items": stats["total_items"],
+            "active_queries": stats["active_queries"],
+            "paused_queries": stats["paused_queries"],
+            "items_per_day": stats["items_per_day"],
+            "query_count": len(formatted_queries),
+        }
     )
 
 

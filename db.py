@@ -70,6 +70,43 @@ def create_or_update_sqlite_db(db_path):
             conn.close()
 
 
+def migrate_item_discovery_schema():
+    """Add durable local discovery times used by the live dashboard."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(items)").fetchall()
+        }
+        if "discovered_at" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN discovered_at REAL")
+
+        conn.execute("""
+            UPDATE items
+            SET discovered_at=CASE
+                WHEN timestamp IS NULL OR CAST(timestamp AS REAL) <= 0
+                    THEN CAST(strftime('%s', 'now') AS REAL)
+                ELSE CAST(timestamp AS REAL)
+            END
+            WHERE discovered_at IS NULL OR discovered_at <= 0
+            """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_items_discovered_at
+            ON items (discovered_at DESC)
+            """)
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
 def next_database_migration(current_version, migration_files):
     """Select the one migration whose source version matches exactly."""
     prefix = f"{current_version}_"
@@ -140,15 +177,43 @@ def update_last_timestamp(query_id, timestamp):
             conn.close()
 
 
-def add_item_to_db(id, title, query_id, price, timestamp, photo_url, currency="EUR"):
+def add_item_to_db(
+    id,
+    title,
+    query_id,
+    price,
+    timestamp,
+    photo_url,
+    currency="EUR",
+    discovered_at=None,
+):
     conn = None
     try:
+        discovery_timestamp = (
+            time.time() if discovered_at is None else float(discovered_at)
+        )
         conn = get_db_connection()
         cursor = conn.cursor()
         # Insert into db the id and the query_id related to the item
         cursor.execute(
-            "INSERT INTO items (item, title, price, currency, timestamp, photo_url, query_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (id, title, price, currency, timestamp, photo_url, query_id),
+            """
+            INSERT INTO items
+                (
+                    item, title, price, currency, timestamp, photo_url,
+                    query_id, discovered_at
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                id,
+                title,
+                price,
+                currency,
+                timestamp,
+                photo_url,
+                query_id,
+                discovery_timestamp,
+            ),
         )
         # Update the last item for the query
         cursor.execute(
@@ -346,6 +411,7 @@ def get_all_parameters():
 _ITEM_SORTS = {
     "date_desc": "i.timestamp DESC",
     "date_asc": "i.timestamp ASC",
+    "discovered_desc": ("COALESCE(i.discovered_at, i.timestamp) DESC, i.rowid DESC"),
     "price_asc": "CAST(i.price AS REAL) ASC",
     "price_desc": "CAST(i.price AS REAL) DESC",
     "title_asc": "i.title COLLATE NOCASE ASC",
@@ -401,7 +467,8 @@ def get_items(
         cursor.execute(
             f"""
             SELECT i.item, i.title, i.price, i.currency, i.timestamp,
-                   q.query, i.photo_url, q.query_name
+                   q.query, i.photo_url, q.query_name,
+                   COALESCE(i.discovered_at, i.timestamp) AS discovered_at
             FROM items i JOIN queries q ON i.query_id = q.id
             {where}
             ORDER BY {order_by}
@@ -413,6 +480,27 @@ def get_items(
     except Exception:
         print_exc()
         return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_query_last_discovery_map():
+    """Return the newest local discovery/alert time for every query."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT query_id, MAX(COALESCE(discovered_at, timestamp))
+            FROM items
+            WHERE query_id IS NOT NULL
+            GROUP BY query_id
+            """)
+        return {int(row[0]): row[1] for row in cursor.fetchall()}
+    except Exception:
+        print_exc()
+        return {}
     finally:
         if conn:
             conn.close()
@@ -1737,6 +1825,7 @@ def persist_item_and_notification(
     button_text,
     ai_evaluation=None,
     execution_id=None,
+    discovered_at=None,
 ):
     """Atomically mark an item seen and queue its Telegram notification.
 
@@ -1748,6 +1837,9 @@ def persist_item_and_notification(
     """
     conn = None
     try:
+        discovery_timestamp = (
+            time.time() if discovered_at is None else float(discovered_at)
+        )
         conn = get_db_connection()
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
@@ -1777,10 +1869,22 @@ def persist_item_and_notification(
         cursor.execute(
             """
             INSERT INTO items
-                (item, title, price, currency, timestamp, photo_url, query_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (
+                    item, title, price, currency, timestamp, photo_url,
+                    query_id, discovered_at
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (id, title, price, currency, timestamp, photo_url, query_id),
+            (
+                id,
+                title,
+                price,
+                currency,
+                timestamp,
+                photo_url,
+                query_id,
+                discovery_timestamp,
+            ),
         )
         parent_notification_id = None
         if recipients:

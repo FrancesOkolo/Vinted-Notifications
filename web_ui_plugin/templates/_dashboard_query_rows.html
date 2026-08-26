@@ -1,0 +1,19 @@
+{% for query in queries %}
+<tr data-query-row data-query="{{ query.display|e }}"
+    data-last-found="{{ query.last_found_timestamp if query.last_found_timestamp is not none else '' }}">
+    <td data-row-number>{{ query.id }}</td>
+    <td>{{ query.display }}</td>
+    <td class="last-found-cell">
+        {% if query.last_found_timestamp is not none %}
+        <time datetime="{{ query.last_found_item|replace(' ', 'T') }}"
+              data-relative-time="{{ query.last_found_timestamp }}"
+              title="{{ query.last_found_item }}">{{ query.last_found_item }}</time>
+        {% else %}
+        Never
+        {% endif %}
+    </td>
+</tr>
+{% endfor %}
+<tr id="queryNoResultsRow" {% if queries %}hidden{% endif %}>
+    <td colspan="3" class="text-center">No queries found</td>
+</tr>

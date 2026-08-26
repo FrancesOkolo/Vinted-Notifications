@@ -3567,10 +3567,18 @@ def test_configuration_collapses_and_warns_about_unsaved_changes():
 
 def test_dashboard_stat_cards_are_links_and_images_have_fallbacks():
     template = (ROOT / "web_ui_plugin/templates/index.html").read_text(encoding="utf-8")
+    partials = "".join(
+        (ROOT / "web_ui_plugin/templates" / name).read_text(encoding="utf-8")
+        for name in (
+            "_dashboard_last_item.html",
+            "_dashboard_recent_item_cards.html",
+            "_dashboard_recent_item_rows.html",
+        )
+    )
     assert 'href="/items"' in template
     assert 'href="/queries?status=active"' in template
     assert template.count("dashboard-stat-link") == 3
-    assert template.count("data-image-fallback") >= 3
+    assert partials.count("data-image-fallback") >= 3
     assert "stats.active_queries" in template
     assert "stats.paused_queries" in template
 
@@ -3606,7 +3614,8 @@ def test_dashboard_has_search_pagination_relative_times_and_collapsible_sections
     assert "vintedDashboardSection:" in template
     assert "data-relative-time" in template
     assert "Intl.RelativeTimeFormat" in template
-    assert "items = db.get_items(limit=6)" in web_source
+    assert 'db.get_items(limit=6, sort="discovered_desc")' in web_source
+    assert "fetch('/api/dashboard/feed'" in template
 
 
 def test_dashboard_has_live_system_health_summary():

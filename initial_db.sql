@@ -44,15 +44,19 @@ END;
 -- Items table
 CREATE TABLE IF NOT EXISTS items
 (
-    item      NUMERIC,
-    title     TEXT,
-    price     NUMERIC,
-    currency  TEXT,
-    timestamp NUMERIC,
-    photo_url TEXT,
-    query_id  INTEGER,
+    item          NUMERIC,
+    title         TEXT,
+    price         NUMERIC,
+    currency      TEXT,
+    timestamp     NUMERIC,
+    photo_url     TEXT,
+    query_id      INTEGER,
+    discovered_at REAL,
     FOREIGN KEY (query_id) REFERENCES queries (id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_items_discovered_at
+    ON items (discovered_at DESC);
 
 -- Allowlist table
 CREATE TABLE IF NOT EXISTS allowlist
