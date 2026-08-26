@@ -1271,7 +1271,7 @@ def test_403_circuit_breaker_stops_cycle_and_escalates_cooldown(
     assert len(search_calls) == 1
     cooldown = core.get_scraper_cooldown(now=clock[0])
     assert cooldown["active"]
-    assert cooldown["remaining"] == 5 * 60
+    assert cooldown["remaining"] == 10 * 60
     assert cooldown["level"] == 1
     assert cooldown["status_code"] == 403
 
@@ -1281,7 +1281,7 @@ def test_403_circuit_breaker_stops_cycle_and_escalates_cooldown(
 
     # An expired cooldown is a recovery probe. Its first confirmed 403
     # immediately reopens the breaker.
-    clock[0] += 5 * 60 + 1
+    clock[0] += 10 * 60 + 1
     core.process_items(queue.Queue())
     assert len(search_calls) == 2
     cooldown = core.get_scraper_cooldown(now=clock[0])

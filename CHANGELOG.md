@@ -54,7 +54,7 @@
 - Treat one HTTP 403 that remains after a fresh-session retry as a confirmed
   block and open protection immediately without testing more queries.
 - After an expired HTTP 403 cooldown, make one recovery probe and escalate
-  repeated rejection from 5 minutes to 30 minutes, 2 hours, then 8 hours.
+  repeated rejection from 10 minutes to 30 minutes, 2 hours, then 8 hours.
 - Log one warning per open cooldown instead of repeating it on every dispatcher
   tick.
 - Route all Windows child-process logs through one parent-owned rotating file
