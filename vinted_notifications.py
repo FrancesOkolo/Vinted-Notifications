@@ -207,6 +207,7 @@ def initialise_database():
         (db.migrate_query_uniqueness, "query uniqueness"),
         (db.migrate_quiet_hours_schema, "quiet-hours configuration"),
         (db.migrate_query_preferences_schema, "per-query monitoring preferences"),
+        (db.migrate_scraper_safety_parameters, "global scraper safety controls"),
         (db.migrate_item_discovery_schema, "item discovery timestamps"),
         (
             query_observability.migrate_schema,
@@ -249,6 +250,17 @@ def _scraper_request_spacing_seconds():
         )
         configured = None
     return scraper_rate.bounded_request_spacing(configured)
+
+
+def _initial_vinted_request_next_allowed(now_monotonic=None):
+    """Seed a full safety gap after every whole-application restart.
+
+    The previous process may have completed a request immediately before it
+    exited. Waiting one complete configured gap in the replacement process is
+    conservative and avoids needing to trust an unclean-shutdown timestamp.
+    """
+    current = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    return current + _scraper_request_spacing_seconds()
 
 
 def _query_preference(preferences, query_id):
@@ -528,6 +540,9 @@ def _dispatch_due_query(scheduler, items_queue, now=None):
     now_timestamp = _timestamp(now)
     cooldown = core.get_scraper_cooldown(now=int(now_timestamp))
     if cooldown["active"]:
+        return None
+    pause = core.get_scraper_pause(now=int(now_timestamp))
+    if pause["active"]:
         return None
 
     quiet_active = core._quiet_hours_active()
@@ -984,7 +999,22 @@ def dispatcher_function(input_queue, rss_queue, telegram_queue):
         logger.error(f"Error in dispatcher process: {e}", exc_info=True)
 
 
-def telegram_bot_process(queue, polling_enabled=True):
+def telegram_bot_process(
+    queue,
+    polling_enabled=True,
+    request_gate_lock=None,
+    request_next_allowed=None,
+    request_lease_until=None,
+    request_owner_counter=None,
+    request_current_owner=None,
+):
+    _configure_vinted_request_gate(
+        request_gate_lock,
+        request_next_allowed,
+        request_lease_until,
+        request_owner_counter,
+        request_current_owner,
+    )
     mode = "polling" if polling_enabled else "send-only"
     logger.info("Telegram bot process started in %s mode", mode)
     try:
@@ -1004,7 +1034,20 @@ def rss_feed_process_entry(queue):
     rss_feed_process(queue)
 
 
-def web_ui_process_entry():
+def web_ui_process_entry(
+    request_gate_lock=None,
+    request_next_allowed=None,
+    request_lease_until=None,
+    request_owner_counter=None,
+    request_current_owner=None,
+):
+    _configure_vinted_request_gate(
+        request_gate_lock,
+        request_next_allowed,
+        request_lease_until,
+        request_owner_counter,
+        request_current_owner,
+    )
     from web_ui_plugin.web_ui import web_ui_process
 
     web_ui_process()
@@ -1217,7 +1260,15 @@ def monitor_processes(items_queue, new_items_queue, telegram_queue, rss_queue):
         logger.info("Starting Telegram process in %s mode.", mode)
         telegram_process = _create_process(
             target=telegram_bot_process,
-            args=(telegram_queue, polling_enabled),
+            args=(
+                telegram_queue,
+                polling_enabled,
+                vinted_request_gate_lock,
+                vinted_request_next_allowed,
+                vinted_request_lease_until,
+                vinted_request_owner_counter,
+                vinted_request_current_owner,
+            ),
         )
         telegram_process.start()
     elif not telegram_should_run and telegram_is_running:
@@ -1293,7 +1344,11 @@ if __name__ == "__main__":
     # All application processes that contact Vinted share this conservative
     # start/completion gate. The value uses the system-wide monotonic clock.
     vinted_request_gate_lock = multiprocessing.Lock()
-    vinted_request_next_allowed = multiprocessing.Value("d", 0.0, lock=False)
+    vinted_request_next_allowed = multiprocessing.Value(
+        "d",
+        _initial_vinted_request_next_allowed(),
+        lock=False,
+    )
     vinted_request_lease_until = multiprocessing.Value("d", 0.0, lock=False)
     vinted_request_owner_counter = multiprocessing.Value("Q", 0, lock=False)
     vinted_request_current_owner = multiprocessing.Value("Q", 0, lock=False)
@@ -1367,7 +1422,16 @@ if __name__ == "__main__":
 
     # 6. Create and start the Web UI process
     # This process will provide a web interface to control the application
-    web_ui_process_instance = _create_process(target=web_ui_process_entry)
+    web_ui_process_instance = _create_process(
+        target=web_ui_process_entry,
+        args=(
+            vinted_request_gate_lock,
+            vinted_request_next_allowed,
+            vinted_request_lease_until,
+            vinted_request_owner_counter,
+            vinted_request_current_owner,
+        ),
+    )
     web_ui_process_instance.start()
 
     try:

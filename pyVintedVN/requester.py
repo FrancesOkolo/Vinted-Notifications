@@ -39,6 +39,10 @@ _SHARED_REQUEST_OWNER_COUNTER = None
 _SHARED_REQUEST_CURRENT_OWNER = None
 
 
+class VintedRequestCancelled(requests.exceptions.RequestException):
+    """Raised when a safety control cancels a Vinted request before HTTP."""
+
+
 def catalogue_request_spacing_seconds():
     """Read the process-wide catalogue gap without allowing unsafe values."""
     try:
@@ -104,12 +108,44 @@ def _cancel_requested(cancel_if):
         return True
 
 
+def _vinted_cancel_check(cancel_if):
+    """Combine a caller check with the durable global scraper pause."""
+
+    def cancelled():
+        if cancel_if is not None and cancel_if():
+            return True
+        state = db.get_scraper_pause_state()
+        if state is None:
+            raise RuntimeError("scraper pause state is unavailable")
+        return bool(state["active"])
+
+    return cancelled
+
+
+def _wait_with_cancel(delay, cancel_if):
+    """Sleep in bounded increments so Pause can interrupt a queued request."""
+    deadline = time.monotonic() + max(0.0, delay)
+    while True:
+        if _cancel_requested(cancel_if):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(SHARED_REQUEST_GATE_POLL_SECONDS, remaining))
+
+
 def _wait_for_shared_request_slot(cancel_if=None):
     """Acquire one expiring owner lease without holding the lock over HTTP."""
     while True:
         if _cancel_requested(cancel_if):
             return None
         with _SHARED_REQUEST_GATE_LOCK:
+            # Close the race between the check above and ownership reservation.
+            # A Web/Telegram pause commits to SQLite before waiting for the
+            # current owner to drain, so no post-pause caller may reserve a new
+            # request while holding this same cross-process lock.
+            if _cancel_requested(cancel_if):
+                return None
             now = time.monotonic()
             current_owner = int(_SHARED_REQUEST_CURRENT_OWNER.value or 0)
             lease_until = float(_SHARED_REQUEST_LEASE_UNTIL.value or 0.0)
@@ -136,6 +172,43 @@ def _wait_for_shared_request_slot(cancel_if=None):
                 0.001,
                 min(SHARED_REQUEST_GATE_POLL_SECONDS, max(0.0, target - now)),
             )
+        time.sleep(delay)
+
+
+def wait_for_shared_request_idle(timeout=None):
+    """Wait until a previously reserved/in-flight Vinted request has drained.
+
+    Pause controls call this only after persisting the pause. New reservations
+    then fail their database check, while an owner that crossed the final check
+    just before the pause is allowed to finish before the control reports
+    success. Expired owners are recovered using the existing lease.
+    """
+    if not _shared_gate_configured():
+        # Unit-level/single-process callers still get a linearizable boundary.
+        with _CATALOGUE_REQUEST_GATE_LOCK:
+            return True
+
+    if timeout is None:
+        timeout = SHARED_REQUEST_LEASE_SECONDS + SHARED_REQUEST_GATE_POLL_SECONDS
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        with _SHARED_REQUEST_GATE_LOCK:
+            now = time.monotonic()
+            current_owner = int(_SHARED_REQUEST_CURRENT_OWNER.value or 0)
+            lease_until = float(_SHARED_REQUEST_LEASE_UNTIL.value or 0.0)
+            if current_owner and lease_until <= now:
+                _SHARED_REQUEST_CURRENT_OWNER.value = 0
+                _SHARED_REQUEST_LEASE_UNTIL.value = 0.0
+                current_owner = 0
+            if not current_owner:
+                return True
+            delay = min(
+                SHARED_REQUEST_GATE_POLL_SECONDS,
+                max(0.001, lease_until - now),
+            )
+        if time.monotonic() >= deadline:
+            logger.error("Timed out waiting for the active Vinted request to drain.")
+            return False
         time.sleep(delay)
 
 
@@ -190,8 +263,10 @@ def _session_request(
     global _CATALOGUE_LAST_COMPLETED_AT
 
     request = getattr(session, method)
-    if not force_gate and not _is_vinted_request(url):
+    vinted_request = force_gate or _is_vinted_request(url)
+    if not vinted_request:
         return request(url, params=params, timeout=REQUEST_TIMEOUT)
+    cancel_if = _vinted_cancel_check(cancel_if)
 
     with _CATALOGUE_REQUEST_GATE_LOCK:
         if _cancel_requested(cancel_if):
@@ -208,13 +283,29 @@ def _session_request(
                 + random.uniform(0.0, REQUEST_JITTER_MAX_SECONDS)
             )
             delay = max(0.0, earliest - time.monotonic())
-            if delay:
-                time.sleep(delay)
+            if delay and not _wait_with_cancel(delay, cancel_if):
+                return None
         if _cancel_requested(cancel_if):
             _cancel_shared_request_slot(shared_token)
             return None
         try:
-            return request(url, params=params, timeout=REQUEST_TIMEOUT)
+            response = request(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=False,
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if 300 <= status_code < 400:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                raise requests.exceptions.TooManyRedirects(
+                    "Automatic Vinted redirect suppressed by the request safety gate",
+                    response=response,
+                )
+            return response
         finally:
             _CATALOGUE_LAST_COMPLETED_AT = time.monotonic()
             _mark_shared_request_completed(shared_token)
@@ -346,6 +437,10 @@ class Requester:
         while True:
             try:
                 response = _session_request(self.session, "get", url, params=params)
+                if response is None:
+                    raise VintedRequestCancelled(
+                        "Vinted request cancelled by scraper safety control"
+                    )
             except requests.exceptions.ConnectionError as error:
                 # Almost always a stale keep-alive socket being reused on the
                 # first request of a cycle (Vinted drops idle sockets between
@@ -464,6 +559,10 @@ class Requester:
             params=params,
             force_gate=_is_vinted_request(url),
         )
+        if response is None:
+            raise VintedRequestCancelled(
+                "Vinted request cancelled by scraper safety control"
+            )
         response.raise_for_status()
         return response
 

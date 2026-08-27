@@ -14,6 +14,10 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from email.utils import parsedate_to_datetime
 from pyVintedVN import Vinted, requester
+from pyVintedVN.requester import (
+    VintedRequestCancelled,
+    wait_for_shared_request_idle,
+)
 from urllib.parse import urlparse, parse_qs
 from logger import get_logger
 from url_normalizer import normalise_vinted_url
@@ -49,6 +53,8 @@ _SCRAPER_LOCAL_COOLDOWN = {
     "status_code": None,
     "skip_logged_until": 0,
 }
+_SCRAPER_LOCAL_PAUSE_LOCK = threading.Lock()
+_SCRAPER_LOCAL_PAUSE_SIGNATURE = None
 _ITEM_PAGE_NAVIGATION_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -233,7 +239,11 @@ def process_remove_country(country):
 
 def get_user_country(profile_id):
     """Get one seller country with one paced request and no auth retry."""
-    if not profile_id or get_scraper_cooldown()["active"]:
+    if (
+        not profile_id
+        or get_scraper_pause()["active"]
+        or get_scraper_cooldown()["active"]
+    ):
         return "XX"
 
     # Users are shared between all Vinted platforms, so we can use whatever locale we want.
@@ -242,7 +252,9 @@ def get_user_country(profile_id):
     try:
         response = requester.get_once(
             url,
-            cancel_if=lambda: get_scraper_cooldown()["active"],
+            cancel_if=lambda: (
+                get_scraper_pause()["active"] or get_scraper_cooldown()["active"]
+            ),
         )
     except requests.exceptions.RequestException:
         logger.warning(
@@ -533,6 +545,98 @@ def _parameter_int(key, default=0):
         return default
 
 
+def get_scraper_pause(now=None):
+    """Return the durable user-controlled global scraper pause.
+
+    A failed state read is reported as an unavailable, active pause. The HTTP
+    requester independently applies the same fail-closed rule, so a transient
+    database problem cannot turn a safety-control failure into Vinted traffic.
+    """
+    state = db.get_scraper_pause_state(now=now)
+    if state is None:
+        return {
+            "active": True,
+            "available": False,
+            "until": 0,
+            "remaining": None,
+            "reason": "Scraper safety state unavailable",
+            "started_at": 0,
+        }
+    return {**state, "available": True}
+
+
+def pause_scraper(duration_seconds=None, reason="manual", now=None):
+    """Persist an indefinite or timed global scraper pause."""
+    state = db.set_scraper_pause(
+        duration_seconds=duration_seconds,
+        reason=reason,
+        now=now,
+    )
+    if state is None:
+        return None
+    if not wait_for_shared_request_idle():
+        logger.error(
+            "Scraper pause was persisted, but the active Vinted request did not "
+            "drain before the safety deadline."
+        )
+        return None
+    # A concurrent Resume must not let this caller report a successful pause.
+    # Re-read only after every request that crossed the pre-pause boundary has
+    # drained, making the control response a reliable no-new-requests boundary.
+    state = db.get_scraper_pause_state(now=now)
+    if state is None or not state.get("active"):
+        return None
+    logger.warning(
+        "Vinted scraping paused%s: %s.",
+        (
+            " indefinitely"
+            if state["until"] == 0
+            else f" for {max(1, (state['remaining'] + 59) // 60)} minute(s)"
+        ),
+        state["reason"],
+    )
+    return {**state, "available": True}
+
+
+def resume_scraper():
+    """Clear only the user-controlled pause; block cooldowns remain intact."""
+    resumed = db.clear_scraper_pause()
+    if resumed:
+        global _SCRAPER_LOCAL_PAUSE_SIGNATURE
+        with _SCRAPER_LOCAL_PAUSE_LOCK:
+            _SCRAPER_LOCAL_PAUSE_SIGNATURE = None
+        logger.warning("Vinted scraping resumed after a manual/timed pause.")
+    return bool(resumed)
+
+
+def _log_scraper_pause_skip(pause):
+    """Log a deliberate pause once, then keep recurring dispatch noise quiet."""
+    global _SCRAPER_LOCAL_PAUSE_SIGNATURE
+    signature = (
+        pause.get("available"),
+        pause.get("started_at"),
+        pause.get("until"),
+        pause.get("reason"),
+    )
+    with _SCRAPER_LOCAL_PAUSE_LOCK:
+        already_logged = _SCRAPER_LOCAL_PAUSE_SIGNATURE == signature
+        _SCRAPER_LOCAL_PAUSE_SIGNATURE = signature
+    log = logger.debug if already_logged else logger.warning
+    if not pause.get("available", True):
+        log("Scraper safety state is unavailable; suppressing Vinted requests.")
+    elif pause["until"] == 0:
+        log(
+            "Vinted scraping is manually paused indefinitely (%s).",
+            pause["reason"] or "manual",
+        )
+    else:
+        log(
+            "Vinted scraping is paused for approximately %s more minute(s) (%s).",
+            max(1, (pause["remaining"] + 59) // 60),
+            pause["reason"] or "manual",
+        )
+
+
 def get_scraper_cooldown(now=None):
     """Return the persisted Vinted-block cooldown state."""
     now = int(now if now is not None else time.time())
@@ -742,6 +846,7 @@ def get_scraper_health(now=None):
     except (TypeError, ValueError):
         failed_cycles = 0
     cooldown = get_scraper_cooldown(now=now)
+    pause = get_scraper_pause(now=now)
 
     return {
         "heartbeat_age": heartbeat_age,
@@ -756,6 +861,11 @@ def get_scraper_health(now=None):
         "cooldown_remaining": cooldown["remaining"],
         "cooldown_level": cooldown["level"],
         "last_block_status": cooldown["status_code"],
+        "pause_active": pause["active"],
+        "pause_available": pause["available"],
+        "pause_until": pause["until"],
+        "pause_remaining": pause["remaining"],
+        "pause_reason": pause["reason"],
     }
 
 
@@ -774,6 +884,11 @@ def process_items(
     searches remain silent overnight, while an opted-in priority search can
     still be scraped and delivered immediately.
     """
+
+    pause = get_scraper_pause()
+    if pause["active"]:
+        _log_scraper_pause_skip(pause)
+        return
 
     quiet_active, quiet_start, quiet_end, quiet_timezone = get_quiet_hours_status()
     if quiet_active and not monitor_during_quiet_hours:
@@ -839,8 +954,14 @@ def process_items(
     successful_fetches = 0
     consecutive_403s = _parameter_int("scraper_consecutive_403s")
     cycle_block_status = None
+    cancelled_for_pause = False
 
     for position, query in enumerate(all_queries, start=1):
+        pause = get_scraper_pause()
+        if pause["active"]:
+            cancelled_for_pause = True
+            _log_scraper_pause_skip(pause)
+            break
         if _quiet_hours_active() and not monitor_during_quiet_hours:
             logger.info(
                 "Quiet hours began during the scrape. Stopping after %s/%s queries.",
@@ -970,6 +1091,28 @@ def process_items(
                     query_url,
                     exc_info=True,
                 )
+        except VintedRequestCancelled:
+            cancelled_for_pause = True
+            if execution_id is not None:
+                try:
+                    query_observability.record_failure(
+                        execution_id,
+                        "cancelled_scraper_pause",
+                        duration_ms=(time.monotonic() - request_started_monotonic)
+                        * 1000,
+                    )
+                except Exception:
+                    logger.error(
+                        "Could not finish cancelled catalogue telemetry for query %s.",
+                        query_id,
+                        exc_info=True,
+                    )
+            logger.info(
+                "Stopped query %s/%s because Vinted scraping was paused.",
+                position,
+                query_count,
+            )
+            break
         except requests.exceptions.RequestException:
             if execution_id is not None:
                 try:
@@ -1126,7 +1269,7 @@ def process_items(
         successful_fetches,
         query_count,
         blocked_status=cycle_block_status,
-        count_failed_cycle=query_ids is None,
+        count_failed_cycle=query_ids is None and not cancelled_for_pause,
     )
 
 

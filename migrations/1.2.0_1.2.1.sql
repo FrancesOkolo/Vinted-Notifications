@@ -31,7 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_ai_evaluations_due
     ON pending_ai_evaluations (next_attempt_at, locked_until, id);
 
 INSERT OR IGNORE INTO parameters (key, value)
-VALUES ('catalogue_request_spacing_seconds', '12');
+VALUES ('catalogue_request_spacing_seconds', '60');
 
 UPDATE parameters
 SET value = '1.2.1'

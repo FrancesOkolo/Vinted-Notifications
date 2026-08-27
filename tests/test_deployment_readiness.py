@@ -624,6 +624,7 @@ def test_remove_description_migration_repairs_stored_template(database):
 def requester_clock(database, monkeypatch):
     """Make the process-wide requester gate instant and deterministic."""
     import importlib
+    from types import SimpleNamespace
 
     requester_module = importlib.import_module("pyVintedVN.requester")
     clock = [0.0]
@@ -633,11 +634,16 @@ def requester_clock(database, monkeypatch):
         waits.append(seconds)
         clock[0] += seconds
 
+    requester_module.configure_shared_request_gate(None, None)
     requester_module._reset_catalogue_request_gate()
-    monkeypatch.setattr(requester_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(requester_module.time, "sleep", sleep)
+    monkeypatch.setattr(
+        requester_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep),
+    )
     monkeypatch.setattr(requester_module.random, "uniform", lambda low, high: 0.0)
     yield waits
+    requester_module.configure_shared_request_gate(None, None)
     requester_module._reset_catalogue_request_gate()
 
 
@@ -688,7 +694,7 @@ def test_requester_uses_one_bounded_retry_for_block_responses(
     assert response.status_code == status_code
     assert client.session.calls == expected_calls
     assert requester_clock == (
-        [requester_module.FORBIDDEN_RETRY_DELAY_SECONDS, 9.0]
+        [requester_module.FORBIDDEN_RETRY_DELAY_SECONDS] + [1.0] * 57
         if status_code == 403
         else []
     )

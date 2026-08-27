@@ -24,6 +24,7 @@ QUERY_PREFERENCE_DEFAULTS = {
 }
 _QUERY_POLL_MODES = {"normal", "fast"}
 MAX_ACTIVE_FAST_QUERIES = 5
+MIN_CATALOGUE_REQUEST_SPACING_SECONDS = 60
 
 
 def get_db_connection():
@@ -406,6 +407,169 @@ def get_all_parameters():
     finally:
         if conn:
             conn.close()
+
+
+# ============================================================
+# Global scraper safety controls
+# ============================================================
+
+
+def migrate_scraper_safety_parameters():
+    """Add durable pause state and upgrade unsafe request-spacing values.
+
+    This runtime migration deliberately runs on every startup. Existing
+    catalogue gaps of at least one minute are retained unchanged in the
+    database, while missing, malformed, or faster values are raised to the
+    safety floor. Runtime pacing still applies its documented 120-second
+    upper bound to configured values.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        defaults = {
+            "scraper_pause_active": "False",
+            "scraper_pause_until": "0",
+            "scraper_pause_reason": "",
+            "scraper_pause_started_at": "0",
+        }
+        cursor.executemany(
+            "INSERT OR IGNORE INTO parameters (key, value) VALUES (?, ?)",
+            list(defaults.items()),
+        )
+
+        row = cursor.execute(
+            "SELECT value FROM parameters "
+            "WHERE key='catalogue_request_spacing_seconds'"
+        ).fetchone()
+        configured = row[0] if row else None
+        try:
+            spacing = Decimal(str(configured))
+        except (InvalidOperation, TypeError, ValueError):
+            spacing = None
+        if (
+            spacing is None
+            or not spacing.is_finite()
+            or spacing < MIN_CATALOGUE_REQUEST_SPACING_SECONDS
+        ):
+            cursor.execute(
+                """
+                INSERT INTO parameters (key, value)
+                VALUES ('catalogue_request_spacing_seconds', ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (str(MIN_CATALOGUE_REQUEST_SPACING_SECONDS),),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        print_exc()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_scraper_pause_state(now=None):
+    """Return the persisted global scraper pause, or None on read failure.
+
+    until=0 represents an indefinite manual pause. Timed pauses expire
+    automatically from the caller's perspective without requiring a process
+    restart or a cleanup write.
+    """
+    conn = None
+    try:
+        current = int(time.time() if now is None else now)
+        conn = get_db_connection()
+        rows = conn.execute("""
+            SELECT key, value
+            FROM parameters
+            WHERE key IN (
+                'scraper_pause_active', 'scraper_pause_until',
+                'scraper_pause_reason', 'scraper_pause_started_at'
+            )
+            """).fetchall()
+        values = {key: value for key, value in rows}
+        required_keys = {
+            "scraper_pause_active",
+            "scraper_pause_until",
+            "scraper_pause_reason",
+            "scraper_pause_started_at",
+        }
+        if set(values) != required_keys:
+            return None
+
+        enabled_text = str(values["scraper_pause_active"]).strip().lower()
+        if enabled_text in {"1", "true", "yes", "on"}:
+            enabled = True
+        elif enabled_text in {"0", "false", "no", "off"}:
+            enabled = False
+        else:
+            return None
+
+        try:
+            until = int(str(values["scraper_pause_until"]).strip())
+            started_at = int(str(values["scraper_pause_started_at"]).strip())
+        except (TypeError, ValueError):
+            return None
+        if until < 0 or started_at < 0:
+            return None
+
+        active = enabled and (until == 0 or until > current)
+        remaining = None if active and until == 0 else max(0, until - current)
+        return {
+            "active": active,
+            "until": until,
+            "remaining": remaining,
+            "reason": str(values["scraper_pause_reason"] or "").strip(),
+            "started_at": started_at,
+        }
+    except Exception:
+        print_exc()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def set_scraper_pause(duration_seconds=None, reason="manual", now=None):
+    """Persist an indefinite or timed global scraper pause atomically."""
+    try:
+        current = int(time.time() if now is None else now)
+        if duration_seconds is None:
+            until = 0
+        else:
+            duration = int(duration_seconds)
+            if duration <= 0:
+                return None
+            until = current + duration
+        reason = str(reason or "manual").strip()[:200] or "manual"
+        if not set_parameters(
+            {
+                "scraper_pause_active": "True",
+                "scraper_pause_until": str(until),
+                "scraper_pause_reason": reason,
+                "scraper_pause_started_at": str(current),
+            }
+        ):
+            return None
+        return get_scraper_pause_state(now=current)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def clear_scraper_pause():
+    """Resume Vinted requests without altering circuit-breaker history."""
+    return set_parameters(
+        {
+            "scraper_pause_active": "False",
+            "scraper_pause_until": "0",
+            "scraper_pause_reason": "",
+            "scraper_pause_started_at": "0",
+        }
+    )
 
 
 _ITEM_SORTS = {
@@ -2668,7 +2832,7 @@ def migrate_query_preferences_schema():
         # migration file. INSERT OR IGNORE preserves any configured value.
         cursor.execute(
             "INSERT OR IGNORE INTO parameters (key, value) VALUES (?, ?)",
-            ("catalogue_request_spacing_seconds", "12"),
+            ("catalogue_request_spacing_seconds", "60"),
         )
         conn.commit()
         return True

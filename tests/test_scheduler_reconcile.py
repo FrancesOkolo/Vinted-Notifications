@@ -28,7 +28,7 @@ def _patch_reconcile_dependencies(monkeypatch, preferences, query_count=1):
     )
     monkeypatch.setattr(app, "_get_query_preferences", preferences)
     monkeypatch.setattr(app, "_scrape_intervals", lambda: (180, 90))
-    monkeypatch.setattr(app, "_scraper_request_spacing_seconds", lambda: 12)
+    monkeypatch.setattr(app, "_scraper_request_spacing_seconds", lambda: 60)
     monkeypatch.setattr(core, "record_scraper_heartbeat", lambda: None)
     monkeypatch.setattr(app.logger, "info", lambda *args, **kwargs: None)
     monkeypatch.setattr(app.logger, "warning", lambda *args, **kwargs: None)
@@ -39,21 +39,21 @@ def _job_ids(scheduler):
 
 
 def test_shared_budget_preserves_fast_priority_and_reserves_normal_capacity():
-    normal_only = scraper_rate.build_cadence_plan(40, 0, 180, 90, 12)
-    assert normal_only["effective_normal_seconds"] == 600
-    assert normal_only["scheduled_requests_per_minute"] <= 4
+    normal_only = scraper_rate.build_cadence_plan(40, 0, 180, 90, 60)
+    assert normal_only["effective_normal_seconds"] == 3000
+    assert normal_only["scheduled_requests_per_minute"] <= 0.8
 
-    typical_mix = scraper_rate.build_cadence_plan(38, 2, 180, 90, 12)
-    assert typical_mix["effective_fast_seconds"] == 90
-    assert 855 <= typical_mix["effective_normal_seconds"] <= 856
+    typical_mix = scraper_rate.build_cadence_plan(38, 2, 180, 90, 60)
+    assert typical_mix["effective_fast_seconds"] == 200
+    assert typical_mix["effective_normal_seconds"] == 11400
     assert (
         typical_mix["scheduled_requests_per_minute"]
         <= typical_mix["scheduled_capacity_per_minute"] + 1e-12
     )
 
-    overloaded_mix = scraper_rate.build_cadence_plan(120, 5, 180, 90, 12)
-    assert overloaded_mix["effective_fast_seconds"] == 100
-    assert overloaded_mix["effective_normal_seconds"] >= 7200
+    overloaded_mix = scraper_rate.build_cadence_plan(120, 5, 180, 90, 60)
+    assert overloaded_mix["effective_fast_seconds"] == 500
+    assert overloaded_mix["effective_normal_seconds"] >= 36000
     assert (
         overloaded_mix["effective_fast_seconds"]
         < overloaded_mix["effective_normal_seconds"]
@@ -65,11 +65,18 @@ def test_shared_budget_preserves_fast_priority_and_reserves_normal_capacity():
 
 
 def test_request_spacing_is_bounded_to_safe_values():
-    assert scraper_rate.bounded_request_spacing(None) == 12
-    assert scraper_rate.bounded_request_spacing("invalid") == 12
-    assert scraper_rate.bounded_request_spacing(1) == 12
-    assert scraper_rate.bounded_request_spacing(30) == 30
+    assert scraper_rate.bounded_request_spacing(None) == 60
+    assert scraper_rate.bounded_request_spacing("invalid") == 60
+    assert scraper_rate.bounded_request_spacing(1) == 60
+    assert scraper_rate.bounded_request_spacing(30) == 60
+    assert scraper_rate.bounded_request_spacing(90) == 90
     assert scraper_rate.bounded_request_spacing(999) == 120
+
+
+def test_whole_app_restart_seeds_one_complete_request_gap(monkeypatch):
+    monkeypatch.setattr(app, "_scraper_request_spacing_seconds", lambda: 60)
+
+    assert app._initial_vinted_request_next_allowed(now_monotonic=123.5) == 183.5
 
 
 def test_reconcile_applies_poll_mode_changes_without_per_query_jobs(monkeypatch):
@@ -89,7 +96,7 @@ def test_reconcile_applies_poll_mode_changes_without_per_query_jobs(monkeypatch)
         assert _job_ids(scheduler) == [app._SCRAPER_DISPATCH_JOB_ID]
         assert (
             app._job_interval_seconds(scheduler.get_job(app._SCRAPER_DISPATCH_JOB_ID))
-            == 12
+            == 60
         )
 
         preferences[1]["poll_mode"] = "fast"
@@ -114,6 +121,7 @@ def test_initial_preference_failure_keeps_retry_heartbeat_then_recovers(
     monkeypatch.setattr(
         core, "get_scraper_cooldown", lambda now=None: {"active": False}
     )
+    monkeypatch.setattr(core, "get_scraper_pause", lambda now=None: {"active": False})
     monkeypatch.setattr(core, "_quiet_hours_active", lambda: False)
     calls = []
     monkeypatch.setattr(
@@ -148,11 +156,12 @@ def test_transient_query_read_failure_keeps_plan_and_suppresses_dispatch(
     preferences = {1: {"poll_mode": "normal"}}
     _patch_reconcile_dependencies(
         monkeypatch,
-        lambda query_ids: {
-            query_id: preferences[query_id] for query_id in query_ids
-        },
+        lambda query_ids: {query_id: preferences[query_id] for query_id in query_ids},
     )
-    monkeypatch.setattr(core, "get_scraper_cooldown", lambda now=None: {"active": False})
+    monkeypatch.setattr(
+        core, "get_scraper_cooldown", lambda now=None: {"active": False}
+    )
+    monkeypatch.setattr(core, "get_scraper_pause", lambda now=None: {"active": False})
     monkeypatch.setattr(core, "_quiet_hours_active", lambda: False)
     calls = []
     monkeypatch.setattr(
@@ -212,6 +221,7 @@ def test_dispatch_coalesces_overdue_work_and_prevents_normal_starvation(monkeypa
     monkeypatch.setattr(
         core, "get_scraper_cooldown", lambda now=None: {"active": False}
     )
+    monkeypatch.setattr(core, "get_scraper_pause", lambda now=None: {"active": False})
     monkeypatch.setattr(core, "_quiet_hours_active", lambda: False)
     calls = []
     monkeypatch.setattr(
@@ -254,7 +264,9 @@ def test_dispatch_respects_cooldown_and_quiet_hours_without_backlog(monkeypatch)
     }
     setattr(scheduler, app._SCRAPER_PLAN_ATTRIBUTE, plan)
     cooldown = {"active": True}
+    pause = {"active": False}
     monkeypatch.setattr(core, "get_scraper_cooldown", lambda now=None: cooldown)
+    monkeypatch.setattr(core, "get_scraper_pause", lambda now=None: pause)
     monkeypatch.setattr(core, "_quiet_hours_active", lambda: True)
     calls = []
     monkeypatch.setattr(
@@ -269,6 +281,13 @@ def test_dispatch_respects_cooldown_and_quiet_hours_without_backlog(monkeypatch)
     assert plan["queries"][2]["next_due"] == 0
 
     cooldown["active"] = False
+    pause["active"] = True
+    assert app._dispatch_due_query(scheduler, object(), now=1000) is None
+    assert calls == []
+    assert plan["queries"][1]["next_due"] == 0
+    assert plan["queries"][2]["next_due"] == 0
+
+    pause["active"] = False
     assert app._dispatch_due_query(scheduler, object(), now=1000) == 2
     assert calls == [{"query_ids": [2], "monitor_during_quiet_hours": True}]
     assert plan["queries"][1]["next_due"] == 1600
@@ -371,9 +390,11 @@ def test_monitor_processes_monitors_item_extractor_queue_path(monkeypatch):
     monkeypatch.setattr(
         app.db,
         "get_parameter",
-        lambda name: "False"
-        if name in {"telegram_process_running", "rss_process_running"}
-        else None,
+        lambda name: (
+            "False"
+            if name in {"telegram_process_running", "rss_process_running"}
+            else None
+        ),
     )
 
     app.monitor_processes(

@@ -6,6 +6,7 @@ from telegram.ext import ContextTypes
 from telegram.error import RetryAfter, NetworkError, BadRequest, Conflict
 import db
 import core
+import scraper_rate
 import asyncio
 import time
 import json
@@ -268,6 +269,10 @@ class LeRobot:
             self.app.add_handler(
                 CommandHandler("copy_my_queries", self.copy_my_queries)
             )
+            self.app.add_handler(CommandHandler("pause_scraper", self.pause_scraper))
+            self.app.add_handler(CommandHandler("vinted_blocked", self.vinted_blocked))
+            self.app.add_handler(CommandHandler("resume_scraper", self.resume_scraper))
+            self.app.add_handler(CommandHandler("scraper_status", self.scraper_status))
             # Allowlist handlers
             self.app.add_handler(
                 CommandHandler("clear_allowlist", self.clear_allowlist)
@@ -385,6 +390,138 @@ class LeRobot:
             "This command is restricted to the administrator."
         )
         return False
+
+    @staticmethod
+    def _pause_duration_text(seconds):
+        seconds = max(0, int(seconds or 0))
+        if seconds >= 3600 and seconds % 3600 == 0:
+            hours = seconds // 3600
+            suffix = "" if hours == 1 else "s"
+            return f"{hours} hour{suffix}"
+        minutes = max(1, (seconds + 59) // 60)
+        suffix = "" if minutes == 1 else "s"
+        return f"{minutes} minute{suffix}"
+
+    async def pause_scraper(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Pause only Vinted traffic for one of the supported safe periods."""
+        if not await self.require_admin(update):
+            return
+
+        requested = str(context.args[0] if context.args else "").strip().lower()
+        durations = {"1h": 60 * 60, "6h": 6 * 60 * 60, "24h": 24 * 60 * 60}
+        duration = durations.get(requested)
+        if duration is None:
+            await update.message.reply_text(
+                "Usage: /pause_scraper 1h, /pause_scraper 6h, or " "/pause_scraper 24h"
+            )
+            return
+
+        state = core.pause_scraper(
+            duration_seconds=duration,
+            reason=f"telegram_{requested}",
+        )
+        if not state or not state.get("available", True) or not state.get("active"):
+            await update.message.reply_text(
+                "The scraper could not be paused safely. Please try again."
+            )
+            return
+
+        await update.message.reply_text(
+            "Scraping paused for "
+            f"{self._pause_duration_text(duration)}. Telegram, the dashboard, "
+            "and queued alert delivery remain active."
+        )
+
+    async def vinted_blocked(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Open an indefinite circuit when the phone app reports a block."""
+        if not await self.require_admin(update):
+            return
+
+        state = core.pause_scraper(
+            duration_seconds=None,
+            reason="phone_blocked",
+        )
+        if not state or not state.get("available", True) or not state.get("active"):
+            await update.message.reply_text(
+                "The phone-block pause could not be saved. Please try again."
+            )
+            return
+
+        await update.message.reply_text(
+            "Vinted traffic is paused until you manually resume it. No recovery "
+            "probe will run; Telegram, the dashboard, and queued alerts remain active."
+        )
+
+    async def resume_scraper(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Clear only the manual pause; the HTTP block cooldown remains intact."""
+        if not await self.require_admin(update):
+            return
+
+        if not core.resume_scraper():
+            await update.message.reply_text(
+                "The scraper could not be resumed. Please try again."
+            )
+            return
+
+        await update.message.reply_text(
+            "Manual scraper pause cleared. The global request limit and any "
+            "Vinted HTTP cooldown still apply."
+        )
+
+    async def scraper_status(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Show the manual pause, HTTP circuit, and hard request gap."""
+        if not await self.require_admin(update):
+            return
+
+        pause = core.get_scraper_pause()
+        cooldown = core.get_scraper_cooldown()
+        if not pause.get("available", True):
+            pause_text = "unavailable (requests fail closed)"
+        elif pause.get("active"):
+            if pause.get("remaining") is None:
+                pause_text = "paused until manual resume"
+            else:
+                duration = self._pause_duration_text(pause.get("remaining"))
+                pause_text = f"paused for about {duration}"
+            reason = str(pause.get("reason") or "manual").replace("_", " ")
+            pause_text += f" ({reason})"
+        else:
+            pause_text = "running"
+
+        if cooldown.get("active"):
+            duration = self._pause_duration_text(cooldown["remaining"])
+            status_code = cooldown.get("status_code") or "error"
+            cooldown_text = f"active for about {duration} after HTTP {status_code}"
+        elif cooldown.get("level"):
+            cooldown_text = "awaiting a successful recovery check"
+        else:
+            cooldown_text = "ready"
+
+        spacing = scraper_rate.bounded_request_spacing(
+            db.get_parameter("catalogue_request_spacing_seconds")
+        )
+        await update.message.reply_text(
+            "Scraper status\n"
+            f"Manual pause: {pause_text}\n"
+            f"HTTP protection: {cooldown_text}\n"
+            f"Minimum Vinted request gap: {int(spacing)} seconds"
+        )
 
     async def my_id(
         self,
@@ -1307,6 +1444,10 @@ class LeRobot:
                     ("revoke_user", "Admin: revoke an account"),
                     ("users", "Admin: list bot accounts"),
                     ("copy_my_queries", "Admin: share your searches"),
+                    ("pause_scraper", "Admin: pause Vinted requests"),
+                    ("vinted_blocked", "Admin: report a Wi-Fi block"),
+                    ("resume_scraper", "Admin: resume Vinted requests"),
+                    ("scraper_status", "Admin: show scraper protection"),
                     ("clear_allowlist", "Admin: clear country allowlist"),
                     ("add_country", "Admin: add an allowed country"),
                     ("remove_country", "Admin: remove an allowed country"),

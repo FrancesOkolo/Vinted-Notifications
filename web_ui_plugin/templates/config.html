@@ -40,6 +40,38 @@
                         <div id="healthQueries" class="fs-5 fw-bold">…</div>
                     </div>
                 </div>
+                <hr class="my-4">
+                <div class="d-flex flex-column flex-lg-row align-items-lg-center justify-content-between gap-3"
+                     id="scraperPauseControls">
+                    <div>
+                        <div class="fw-semibold">Scraper safety pause</div>
+                        <div class="small text-muted" id="configScraperPauseStatus" role="status"
+                             aria-live="polite">Checking pause status…</div>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2 align-items-center">
+                        <div class="d-flex flex-wrap gap-2" id="configScraperPauseOptions">
+                            <button type="button" class="btn btn-sm btn-danger"
+                                    data-config-scraper-pause="phone_blocked">
+                                <i class="bi bi-phone me-1" aria-hidden="true"></i>
+                                Phone blocked
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-warning"
+                                    data-config-scraper-pause="1h">Pause 1h</button>
+                            <button type="button" class="btn btn-sm btn-outline-warning"
+                                    data-config-scraper-pause="6h">Pause 6h</button>
+                            <button type="button" class="btn btn-sm btn-outline-warning"
+                                    data-config-scraper-pause="24h">Pause 24h</button>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-success d-none"
+                                id="configScraperResumeBtn">
+                            <i class="bi bi-play-fill me-1" aria-hidden="true"></i>Resume scraping
+                        </button>
+                    </div>
+                </div>
+                <div class="form-text mt-2">
+                    “Phone blocked” stops Vinted requests until you manually resume. Telegram, the
+                    dashboard, AI checks, and queued alert delivery keep running.
+                </div>
             </div>
         </div>
     </div>
@@ -104,10 +136,10 @@
                                                 <input type="number" class="form-control"
                                                        id="catalogue_request_spacing_seconds"
                                                        name="catalogue_request_spacing_seconds"
-                                                       value="{{ params.catalogue_request_spacing_seconds or 12 }}"
-                                                       min="12" max="120">
+                                                       value="{{ params.catalogue_request_spacing_seconds or 60 }}"
+                                                       min="60" max="120">
                                                 <small class="form-text text-muted">
-                                                    Hard completion-to-next-start gap (12–120s), plus 0–3s jitter.
+                                                    Hard completion-to-next-start gap (60–120s), plus 0–3s jitter.
                                                     Current plan: {{ query_health.fast_count }} Fast at
                                                     {{ query_health.effective_fast_seconds }}s effective
                                                     ({{ query_health.requested_fast_seconds }}s requested) and
@@ -804,6 +836,94 @@
         }
 
         // --- System Health panel ---
+        const configPauseButtons = Array.from(
+            document.querySelectorAll('[data-config-scraper-pause]')
+        );
+        const configPauseOptions = document.getElementById('configScraperPauseOptions');
+        const configResumeButton = document.getElementById('configScraperResumeBtn');
+        const configPauseStatus = document.getElementById('configScraperPauseStatus');
+
+        const formatPauseRemaining = function (seconds) {
+            const total = Math.max(0, Number(seconds || 0));
+            if (total < 3600) return Math.max(1, Math.ceil(total / 60)) + 'm remaining';
+            if (total < 86400) return Math.ceil(total / 3600) + 'h remaining';
+            return Math.ceil(total / 86400) + 'd remaining';
+        };
+
+        const updateConfigPauseState = function (pause) {
+            pause = pause || {};
+            const available = pause.available === true;
+            const active = available && Boolean(pause.active);
+            configPauseButtons.forEach(button => {
+                button.disabled = !available || active;
+            });
+            if (configResumeButton) {
+                configResumeButton.disabled = !available;
+                configResumeButton.classList.toggle('d-none', !active);
+            }
+            if (configPauseOptions) configPauseOptions.classList.toggle('d-none', active);
+            if (!configPauseStatus) return;
+
+            if (!available) {
+                configPauseStatus.textContent =
+                    'Pause status is unavailable. Vinted requests are being suppressed safely.';
+                configPauseStatus.className = 'small text-danger';
+            } else if (!active) {
+                configPauseStatus.textContent = 'Not manually paused.';
+                configPauseStatus.className = 'small text-success';
+            } else if (pause.reason === 'phone_blocked') {
+                configPauseStatus.textContent =
+                    'Paused until manually resumed — home Wi-Fi / phone block reported.';
+                configPauseStatus.className = 'small text-warning';
+            } else if (pause.remaining === null) {
+                configPauseStatus.textContent = 'Paused until manually resumed.';
+                configPauseStatus.className = 'small text-warning';
+            } else {
+                configPauseStatus.textContent =
+                    'Paused — ' + formatPauseRemaining(pause.remaining) + '.';
+                configPauseStatus.className = 'small text-warning';
+            }
+        };
+
+        const sendScraperControl = function (url, preset) {
+            [...configPauseButtons, configResumeButton].filter(Boolean).forEach(button => {
+                button.disabled = true;
+            });
+            const options = {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': '{{ csrf_token() }}'
+                },
+                body: JSON.stringify(preset ? {preset: preset} : {})
+            };
+            return fetch(url, options)
+                .then(response => response.json().then(data => ({ok: response.ok, data})))
+                .then(({ok, data}) => {
+                    const category = !ok
+                        ? 'danger'
+                        : (data.status === 'warning' ? 'warning' : 'success');
+                    showConfigFlash(
+                        data.message || (ok ? 'Scraper control updated.' : 'Scraper control failed.'),
+                        category
+                    );
+                    if (data.pause) updateConfigPauseState(data.pause);
+                })
+                .catch(() => showConfigFlash('Could not reach the server.', 'danger'))
+                .finally(() => loadHealth());
+        };
+
+        configPauseButtons.forEach(button => {
+            button.addEventListener('click', function () {
+                sendScraperControl('/scraper/pause', this.dataset.configScraperPause);
+            });
+        });
+        if (configResumeButton) {
+            configResumeButton.addEventListener('click', function () {
+                sendScraperControl('/scraper/resume');
+            });
+        }
+
         const formatHealthAge = function (seconds) {
             if (seconds === null || seconds === undefined) return 'never';
             if (seconds < 90) return Math.round(seconds) + 's ago';
@@ -816,13 +936,24 @@
                 .then(response => response.json())
                 .then(data => {
                     const scraper = document.getElementById('healthScraper');
+                    const manualPause = data.scraper.manual_pause || {};
+                    const pauseAvailable = manualPause.available === true;
+                    const manuallyPaused = pauseAvailable && Boolean(manualPause.active);
                     const map = {
                         ok: ['OK', 'text-success'],
                         stalled: ['Stalled', 'text-danger'],
-                        blocked: ['Blocked', 'text-warning']
+                        blocked: ['Blocked', 'text-warning'],
+                        paused: ['Paused', 'text-warning'],
+                        safety_stop: ['Safety stop', 'text-danger']
                     };
                     let [text, cls] = map[data.scraper.status] || ['Unknown', 'text-muted'];
-                    if (data.scraper.cooldown_active) {
+                    if (!pauseAvailable) {
+                        text = 'Safety stop';
+                        cls = 'text-danger';
+                    } else if (manuallyPaused) {
+                        text = 'Paused';
+                        cls = 'text-warning';
+                    } else if (data.scraper.cooldown_active) {
                         const minutes = Math.max(
                             1,
                             Math.ceil(data.scraper.cooldown_remaining / 60)
@@ -840,9 +971,11 @@
                     document.getElementById('healthQueries').textContent =
                         data.queries.active + ' active' +
                         (data.queries.paused ? ' / ' + data.queries.paused + ' paused' : '');
+                    updateConfigPauseState(manualPause);
                 })
                 .catch(error => {
                     console.error('Health load failed:', error);
+                    updateConfigPauseState({available: false});
                 });
         };
         const refreshHealthBtn = document.getElementById('refreshHealthBtn');

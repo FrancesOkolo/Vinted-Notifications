@@ -54,6 +54,32 @@ _QUERY_PREFERENCE_DEFAULTS = {
     "deal_currency": "GBP",
 }
 
+_SCRAPER_PAUSE_PRESETS = {
+    "phone_blocked": {
+        "duration_seconds": None,
+        "reason": "phone_blocked",
+        "message": (
+            "Scraping paused until you resume it. Telegram, the dashboard, and "
+            "queued alert delivery remain available."
+        ),
+    },
+    "1h": {
+        "duration_seconds": 60 * 60,
+        "reason": "manual_1h",
+        "message": "Scraping paused for one hour.",
+    },
+    "6h": {
+        "duration_seconds": 6 * 60 * 60,
+        "reason": "manual_6h",
+        "message": "Scraping paused for six hours.",
+    },
+    "24h": {
+        "duration_seconds": 24 * 60 * 60,
+        "reason": "manual_24h",
+        "message": "Scraping paused for 24 hours.",
+    },
+}
+
 # Create Flask app
 app = Flask(
     __name__,
@@ -1551,7 +1577,22 @@ def test_telegram():
 @app.route("/config/health", methods=["GET"])
 def config_health():
     health = core.get_scraper_health()
-    if health["stalled"]:
+    pause_available = health.get("pause_available") is True
+    manual_pause = {
+        "active": bool(health.get("pause_active", not pause_available)),
+        "available": pause_available,
+        "until": health.get("pause_until", 0),
+        "remaining": health.get("pause_remaining"),
+        "reason": str(health.get("pause_reason") or ""),
+        # Keep the response shape stable if the core health snapshot grows this
+        # field later. The controls do not depend on the timestamp.
+        "started_at": health.get("pause_started_at", 0),
+    }
+    if not pause_available:
+        status = "safety_stop"
+    elif manual_pause["active"]:
+        status = "paused"
+    elif health["stalled"]:
         status = "stalled"
     elif health["blocked"]:
         status = "blocked"
@@ -1578,6 +1619,7 @@ def config_health():
                 "cooldown_remaining": health["cooldown_remaining"],
                 "cooldown_level": health["cooldown_level"],
                 "last_block_status": health["last_block_status"],
+                "manual_pause": manual_pause,
             },
             "queries": {
                 "total": len(enabled_map),
@@ -1591,6 +1633,119 @@ def config_health():
                 "end": quiet_end,
                 "timezone": quiet_timezone,
             },
+        }
+    )
+
+
+@app.route("/scraper/pause", methods=["POST"])
+def pause_scraper():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    preset_name = str(payload.get("preset") or request.form.get("preset") or "").strip()
+    preset = _SCRAPER_PAUSE_PRESETS.get(preset_name)
+    if preset is None:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Choose Phone blocked, 1 hour, 6 hours, or 24 hours.",
+                }
+            ),
+            400,
+        )
+
+    try:
+        pause_state = core.pause_scraper(
+            duration_seconds=preset["duration_seconds"],
+            reason=preset["reason"],
+        )
+    except Exception:
+        logger.exception("Could not persist scraper pause requested from Web UI")
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "The scraper could not be paused safely. Try again.",
+                }
+            ),
+            503,
+        )
+
+    if (
+        not pause_state
+        or pause_state.get("available") is not True
+        or not pause_state.get("active")
+    ):
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "The scraper pause state could not be saved. Try again.",
+                }
+            ),
+            503,
+        )
+
+    logger.warning("Scraper paused from Web UI (%s)", preset["reason"])
+    return jsonify(
+        {
+            "status": "success",
+            "message": preset["message"],
+            "pause": pause_state,
+        }
+    )
+
+
+@app.route("/scraper/resume", methods=["POST"])
+def resume_scraper():
+    try:
+        resumed = core.resume_scraper()
+    except Exception:
+        logger.exception("Could not clear scraper pause requested from Web UI")
+        resumed = False
+
+    if not resumed:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "The scraper could not be resumed. Try again.",
+                }
+            ),
+            503,
+        )
+
+    logger.info("Scraper resumed from Web UI")
+    try:
+        pause_state = core.get_scraper_pause()
+    except Exception:
+        logger.exception("Could not verify scraper pause state after Web UI resume")
+        pause_state = None
+
+    if not pause_state or pause_state.get("available") is not True:
+        pause_state = {
+            "active": True,
+            "available": False,
+            "until": 0,
+            "remaining": None,
+            "reason": "Scraper safety state unavailable",
+            "started_at": 0,
+        }
+        message = (
+            "Manual pause cleared, but the safety state could not be verified. "
+            "Vinted requests remain suppressed until it is readable."
+        )
+        response_status = "warning"
+    else:
+        message = "Scraping resumed. The safety request limit still applies."
+        response_status = "success"
+
+    return jsonify(
+        {
+            "status": response_status,
+            "message": message,
+            "pause": pause_state,
         }
     )
 
@@ -1648,8 +1803,8 @@ def update_config():
         )
         catalogue_request_spacing = _validated_int(
             "catalogue_request_spacing_seconds",
-            12,
-            12,
+            60,
+            60,
             120,
         )
         rss_port = _validated_int("rss_port", 8080, 1024, 65535)

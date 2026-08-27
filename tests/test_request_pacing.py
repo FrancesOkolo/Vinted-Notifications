@@ -1,6 +1,7 @@
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -93,8 +94,11 @@ def test_403_rebuild_head_and_retry_share_one_process_wide_gate(
         "configure_proxy",
         lambda session: False,
     )
-    monkeypatch.setattr(requester_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(requester_module.time, "sleep", sleep)
+    monkeypatch.setattr(
+        requester_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep),
+    )
     monkeypatch.setattr(requester_module.random, "uniform", lambda low, high: 0.0)
 
     client = requester_module.Requester()
@@ -119,14 +123,11 @@ def test_403_rebuild_head_and_retry_share_one_process_wide_gate(
     assert rejected.closed is True
     assert events == [
         ("rejected.get", 0.0),
-        ("fresh.head", 12.0),
-        ("fresh.get", 24.0),
+        ("fresh.head", 60.0),
+        ("fresh.get", 120.0),
     ]
-    assert waits == [
-        12.0,
-        requester_module.FORBIDDEN_RETRY_DELAY_SECONDS,
-        9.0,
-    ]
+    assert requester_module.FORBIDDEN_RETRY_DELAY_SECONDS in waits
+    assert sum(waits) == 120.0
 
 
 @pytest.mark.parametrize(
@@ -169,8 +170,11 @@ def test_catalogue_and_profile_calls_share_parent_owned_gate(
     def sleep(seconds):
         clock[0] += seconds
 
-    monkeypatch.setattr(requester_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(requester_module.time, "sleep", sleep)
+    monkeypatch.setattr(
+        requester_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep),
+    )
     monkeypatch.setattr(requester_module.random, "uniform", lambda low, high: 0.0)
     monkeypatch.setattr(
         requester_module,
@@ -240,7 +244,11 @@ def test_shared_multiprocessing_lock_is_not_held_during_http(
             assert lock.held is False
             return Response()
 
-    monkeypatch.setattr(requester_module.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        requester_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: 100.0, sleep=time.sleep),
+    )
     monkeypatch.setattr(requester_module.random, "uniform", lambda low, high: 0.0)
     monkeypatch.setattr(
         requester_module,
@@ -318,8 +326,11 @@ def test_expired_lease_recovers_and_late_completion_cannot_clear_new_owner(
 
     requester_module = importlib.import_module("pyVintedVN.requester")
     clock = [0.0]
-    monkeypatch.setattr(requester_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(requester_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        requester_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda seconds: None),
+    )
     monkeypatch.setattr(requester_module.random, "uniform", lambda low, high: 0.0)
     monkeypatch.setattr(
         requester_module,
@@ -362,10 +373,14 @@ def test_cancel_after_acquisition_releases_only_its_lease_without_gap(
 
     requester_module = importlib.import_module("pyVintedVN.requester")
     clock = [0.0]
-    monkeypatch.setattr(requester_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        requester_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=time.sleep),
+    )
     monkeypatch.setattr(requester_module.random, "uniform", lambda low, high: 0.0)
     state = _configure_test_shared_gate(requester_module)
-    checks = iter([False, False, True])
+    checks = iter([False, False, False, True])
 
     class Session:
         def get(self, *args, **kwargs):
@@ -386,6 +401,79 @@ def test_cancel_after_acquisition_releases_only_its_lease_without_gap(
     finally:
         requester_module.configure_shared_request_gate(None, None)
         requester_module._reset_catalogue_request_gate()
+
+
+def test_pause_boundary_waits_for_previously_reserved_request(database, monkeypatch):
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+    monkeypatch.setattr(
+        requester_module,
+        "SHARED_REQUEST_GATE_POLL_SECONDS",
+        0.005,
+    )
+    state = _configure_test_shared_gate(requester_module)
+    token = requester_module._wait_for_shared_request_slot()
+    outcome = {}
+
+    try:
+        waiter = threading.Thread(
+            target=lambda: outcome.setdefault(
+                "drained",
+                requester_module.wait_for_shared_request_idle(timeout=1),
+            )
+        )
+        waiter.start()
+        time.sleep(0.02)
+        assert waiter.is_alive()
+        assert state["current_owner"].value == token
+
+        assert requester_module._mark_shared_request_completed(token) is True
+        waiter.join(timeout=1)
+        assert waiter.is_alive() is False
+        assert outcome == {"drained": True}
+    finally:
+        requester_module.configure_shared_request_gate(None, None)
+        requester_module._reset_catalogue_request_gate()
+
+
+def test_vinted_redirect_is_never_followed_automatically(database):
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+    calls = []
+
+    class Response:
+        status_code = 302
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return response
+
+    requester_module.configure_shared_request_gate(None, None)
+    requester_module._reset_catalogue_request_gate()
+    try:
+        with pytest.raises(requester_module.requests.exceptions.TooManyRedirects):
+            requester_module._session_request(
+                Session(),
+                "get",
+                "https://www.vinted.co.uk/api/v2/catalog/items",
+            )
+    finally:
+        requester_module._reset_catalogue_request_gate()
+
+    assert len(calls) == 1
+    assert calls[0][1]["allow_redirects"] is False
+    assert response.closed is True
 
 
 def test_cancel_callback_failure_fails_closed_before_http(database, monkeypatch):
@@ -465,4 +553,4 @@ def test_request_spacing_reader_falls_back_safely_on_db_failure(monkeypatch):
         lambda key: (_ for _ in ()).throw(RuntimeError("temporary DB failure")),
     )
 
-    assert requester_module.catalogue_request_spacing_seconds() == 12
+    assert requester_module.catalogue_request_spacing_seconds() == 60

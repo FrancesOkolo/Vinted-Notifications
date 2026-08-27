@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Home-connection scraper safety
+
+- Raise the hard, cross-process completion-to-next-start gap for every Vinted
+  catalogue, cookie, session-refresh, retry, and supporting request from 12 to
+  60 seconds. The existing Fast/Normal priority allocation and
+  items-per-query result window are unchanged.
+- Upgrade existing installations to the one-minute floor at startup while
+  preserving any slower configured gap.
+- Add a durable manual scraper pause that survives restarts and stops all
+  Vinted traffic without stopping Telegram, the dashboard, AI processing, or
+  queued alert delivery.
+- Add one-hour, six-hour, 24-hour, and indefinite “Phone blocked” controls to
+  the Dashboard and Configuration pages, protected by the existing Basic Auth
+  and CSRF checks.
+- Add admin-only Telegram commands for pausing, reporting a home-Wi-Fi block,
+  resuming, and viewing the active pause/cooldown/request-gap status.
+- Fail closed when the persistent pause state cannot be read, and allow a
+  newly requested pause to interrupt a process waiting for the shared request
+  slot.
+- Suppress automatic Vinted redirects so one gated operation can never produce
+  hidden back-to-back HTTP requests.
+- Seed a complete safety gap after every application restart, and make Pause
+  wait for any request already crossing the start boundary before reporting
+  success.
+
 ### Durable catalogue discovery and query-efficiency evidence
 
 - Record every catalogue execution durably, including outcome, HTTP status,
@@ -25,9 +50,9 @@
   mutate scheduler/query settings or create Vinted requests.
 - Prune execution-detail evidence older than 90 days at startup while retaining
   the durable progress and per-query item observations needed for correctness.
-- Keep the scheduler, shared request gate, Fast/Normal allocation, and default
-  result window of 20 unchanged until representative evidence supports a
-  separate recommendation.
+- Keep the Fast/Normal allocation and default result window of 20 unchanged;
+  the shared request gate was subsequently tightened only after a confirmed
+  home-connection safety incident.
 
 ### Telegram item sharing
 
@@ -42,7 +67,7 @@
   and a shared capacity plan. Fast searches receive priority without starving
   Normal searches, while requested cadences are lengthened when necessary to
   fit the safe aggregate budget.
-- Enforce at least 12 seconds from completion of one catalogue/authentication
+- Enforce at least 60 seconds from completion of one catalogue/authentication
   request to the start of the next, plus positive jitter; retries and cookie
   refreshes consume the same gate.
 - Rebuild an expired Vinted catalogue session once after HTTP 401, then open

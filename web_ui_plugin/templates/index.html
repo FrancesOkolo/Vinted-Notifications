@@ -106,9 +106,36 @@
                         <strong id="dashboardHealthQuiet">Checking…</strong>
                     </div>
                 </div>
-                <a href="/config#system-health" class="btn btn-sm btn-outline-primary dashboard-health-details">
-                    Details <i class="bi bi-chevron-right ms-1" aria-hidden="true"></i>
-                </a>
+                <div class="dashboard-health-controls">
+                    <div class="dropdown" id="dashboardScraperPauseMenu">
+                        <button type="button" class="btn btn-sm btn-outline-warning dropdown-toggle"
+                                data-bs-toggle="dropdown" aria-expanded="false">
+                            <i class="bi bi-pause-fill me-1" aria-hidden="true"></i>Pause scraper
+                        </button>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li>
+                                <button type="button" class="dropdown-item text-danger"
+                                        data-dashboard-scraper-pause="phone_blocked">
+                                    <i class="bi bi-phone me-2" aria-hidden="true"></i>Phone blocked — pause until resumed
+                                </button>
+                            </li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li><button type="button" class="dropdown-item"
+                                        data-dashboard-scraper-pause="1h">Pause for 1 hour</button></li>
+                            <li><button type="button" class="dropdown-item"
+                                        data-dashboard-scraper-pause="6h">Pause for 6 hours</button></li>
+                            <li><button type="button" class="dropdown-item"
+                                        data-dashboard-scraper-pause="24h">Pause for 24 hours</button></li>
+                        </ul>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-success d-none"
+                            id="dashboardScraperResumeBtn">
+                        <i class="bi bi-play-fill me-1" aria-hidden="true"></i>Resume
+                    </button>
+                    <a href="/config#system-health" class="btn btn-sm btn-outline-primary dashboard-health-details">
+                        Details <i class="bi bi-chevron-right ms-1" aria-hidden="true"></i>
+                    </a>
+                </div>
             </div>
         </section>
     </div>
@@ -413,6 +440,87 @@
         const dashboardHealthPending = document.getElementById('dashboardHealthPending');
         const dashboardHealthProtection = document.getElementById('dashboardHealthProtection');
         const dashboardHealthQuiet = document.getElementById('dashboardHealthQuiet');
+        const dashboardPauseMenu = document.getElementById('dashboardScraperPauseMenu');
+        const dashboardPauseToggle = dashboardPauseMenu
+            ? dashboardPauseMenu.querySelector('[data-bs-toggle="dropdown"]')
+            : null;
+        const dashboardPauseButtons = Array.from(
+            document.querySelectorAll('[data-dashboard-scraper-pause]')
+        );
+        const dashboardResumeButton = document.getElementById('dashboardScraperResumeBtn');
+
+        function showDashboardControlFlash(message, category) {
+            const safeCategory = ['success', 'warning', 'danger', 'info'].includes(category)
+                ? category : 'info';
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert alert-${safeCategory} alert-dismissible fade show flash-message`;
+            alertDiv.setAttribute('role', 'alert');
+            alertDiv.appendChild(document.createTextNode(String(message)));
+            const closeButton = document.createElement('button');
+            closeButton.type = 'button';
+            closeButton.className = 'btn-close';
+            closeButton.setAttribute('data-bs-dismiss', 'alert');
+            closeButton.setAttribute('aria-label', 'Close');
+            alertDiv.appendChild(closeButton);
+            document.querySelector('.flash-messages').appendChild(alertDiv);
+            window.setTimeout(() => new bootstrap.Alert(alertDiv).close(), 5000);
+        }
+
+        function setDashboardPauseControls(pause) {
+            pause = pause || {};
+            const available = pause.available === true;
+            const active = available && Boolean(pause.active);
+            dashboardPauseButtons.forEach(button => {
+                button.disabled = !available || active;
+            });
+            if (dashboardPauseToggle) dashboardPauseToggle.disabled = !available || active;
+            if (dashboardPauseMenu) dashboardPauseMenu.classList.toggle('d-none', active);
+            if (dashboardResumeButton) {
+                dashboardResumeButton.disabled = !available;
+                dashboardResumeButton.classList.toggle('d-none', !active);
+            }
+        }
+
+        function sendDashboardScraperControl(url, preset) {
+            [...dashboardPauseButtons, dashboardResumeButton].filter(Boolean).forEach(button => {
+                button.disabled = true;
+            });
+            return fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': '{{ csrf_token() }}'
+                },
+                body: JSON.stringify(preset ? {preset: preset} : {})
+            })
+                .then(response => response.json().then(data => ({ok: response.ok, data})))
+                .then(({ok, data}) => {
+                    const category = !ok
+                        ? 'danger'
+                        : (data.status === 'warning' ? 'warning' : 'success');
+                    showDashboardControlFlash(
+                        data.message || (ok ? 'Scraper control updated.' : 'Scraper control failed.'),
+                        category
+                    );
+                    if (data.pause) setDashboardPauseControls(data.pause);
+                })
+                .catch(() => showDashboardControlFlash('Could not reach the server.', 'danger'))
+                .finally(() => loadDashboardHealth());
+        }
+
+        dashboardPauseButtons.forEach(button => {
+            button.addEventListener('click', function () {
+                sendDashboardScraperControl(
+                    '/scraper/pause',
+                    this.dataset.dashboardScraperPause
+                );
+            });
+        });
+        if (dashboardResumeButton) {
+            dashboardResumeButton.addEventListener('click', function () {
+                sendDashboardScraperControl('/scraper/resume');
+            });
+        }
 
         function formatDashboardHealthAge(seconds) {
             if (seconds === null || seconds === undefined) return 'Never';
@@ -452,13 +560,37 @@
                         1,
                         Math.ceil(Number(scraper.cooldown_remaining || 0) / 60)
                     );
+                    const manualPause = scraper.manual_pause || {};
+                    const pauseAvailable = manualPause.available === true;
+                    const manuallyPaused = pauseAvailable && Boolean(manualPause.active);
 
                     let state = 'ok';
                     let scraperText = 'Healthy';
                     let summary = 'Scraper and notification delivery are operating normally.';
                     let iconClass = 'bi bi-check-circle-fill';
 
-                    if (scraper.status === 'stalled') {
+                    if (!pauseAvailable) {
+                        state = 'danger';
+                        scraperText = 'Safety stop';
+                        summary = 'Pause state is unavailable — Vinted requests are being suppressed safely.';
+                        iconClass = 'bi bi-exclamation-octagon-fill';
+                    } else if (manuallyPaused) {
+                        state = 'warning';
+                        scraperText = 'Paused';
+                        if (manualPause.reason === 'phone_blocked') {
+                            summary = 'Home Wi-Fi / phone block reported — paused until manually resumed.';
+                        } else if (manualPause.remaining === null) {
+                            summary = 'Scraping is paused until manually resumed.';
+                        } else {
+                            const minutes = Math.max(
+                                1,
+                                Math.ceil(Number(manualPause.remaining || 0) / 60)
+                            );
+                            summary = 'Scraping is manually paused for about ' + minutes + ' more minute' +
+                                (minutes === 1 ? '.' : 's.');
+                        }
+                        iconClass = 'bi bi-pause-circle-fill';
+                    } else if (scraper.status === 'stalled') {
                         state = 'danger';
                         scraperText = 'Stalled';
                         summary = 'No recent scraper heartbeat has been recorded.';
@@ -508,7 +640,14 @@
                     dashboardHealthPending.className =
                         pendingAlerts > 0 ? 'text-warning' : 'text-success';
 
-                    if (cooldownActive) {
+                    if (!pauseAvailable) {
+                        dashboardHealthProtection.textContent = 'Fail-safe active';
+                    } else if (manuallyPaused) {
+                        dashboardHealthProtection.textContent = manualPause.remaining === null
+                            ? 'Until resumed'
+                            : Math.max(1, Math.ceil(Number(manualPause.remaining || 0) / 60)) +
+                                'm remaining';
+                    } else if (cooldownActive) {
                         dashboardHealthProtection.textContent =
                             cooldownMinutes + 'm remaining';
                     } else if (Number(scraper.cooldown_level || 0) > 0) {
@@ -516,6 +655,7 @@
                     } else {
                         dashboardHealthProtection.textContent = 'Ready';
                     }
+                    setDashboardPauseControls(manualPause);
                 })
                 .catch(error => {
                     console.error('Dashboard health load failed:', error);
@@ -529,6 +669,7 @@
                     dashboardHealthPending.className = '';
                     dashboardHealthProtection.textContent = 'Unknown';
                     if (dashboardHealthQuiet) dashboardHealthQuiet.textContent = '—';
+                    setDashboardPauseControls({available: false});
                 });
         }
 
