@@ -1159,7 +1159,7 @@ def test_unknown_country_keeps_existing_allowlist_fail_open_semantics(
 def test_ai_deal_evaluator_formats_verdicts():
     import ai_deal_evaluator as ai
 
-    assert "AI: EXCELLENT DEAL" in ai.format_verdict(
+    assert "AI: GREAT DEAL" in ai.format_verdict(
         '{"verdict":"excellent","reason":"well under value"}'
     )
     assert "AI: GOOD DEAL" in ai.format_verdict('{"verdict":"good","reason":"fair"}')

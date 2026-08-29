@@ -100,6 +100,13 @@
   entities into malformed Telegram messages.
 - Document the optional OpenAI environment settings and the listing metadata
   sent for evaluation.
+- Make AI deal tiers deterministic from an independently estimated,
+  condition-aware benchmark: under 50% saving is Don't Buy, 50% through exactly
+  65% is Good, and strictly over 65% is Great. The asking price is withheld
+  from OpenAI to avoid anchoring its benchmark estimate.
+- Ground AI benchmarks in required UK web search and include up to three safe,
+  clickable comparison-source links in each Telegram AI follow-up. The target
+  Vinted URL remains withheld so it cannot anchor the benchmark.
 
 ### Live editing safeguards
 
