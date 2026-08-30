@@ -176,3 +176,20 @@ def test_dashboard_feed_uses_alert_order_and_refreshes_live(web_client):
     assert queries.index("Recent alert query") < queries.index("Older alert query")
     assert payload["total_items"] == 2
     assert payload["active_queries"] == 2
+
+    items_page = web_client.get("/items")
+    assert items_page.status_code == 200
+    items_html = items_page.get_data(as_text=True)
+    assert items_html.index("Old listing that just alerted") < items_html.index(
+        "New listing that alerted earlier"
+    )
+    assert 'value="discovered_desc" selected' in items_html
+    assert "Found:" in items_html
+    assert "Listed:" in items_html
+
+    listed_page = web_client.get("/items?sort=date_desc")
+    listed_html = listed_page.get_data(as_text=True)
+    assert listed_html.index("New listing that alerted earlier") < listed_html.index(
+        "Old listing that just alerted"
+    )
+    assert 'value="date_desc" selected' in listed_html

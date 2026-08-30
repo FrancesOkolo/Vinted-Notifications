@@ -1188,6 +1188,7 @@ def update_query(query_id):
 
 
 _VALID_ITEM_SORTS = {
+    "discovered_desc",
     "date_desc",
     "date_asc",
     "price_asc",
@@ -1201,9 +1202,9 @@ _ITEMS_PAGE_SIZE = 24
 def items():
     query_id = request.args.get("query", "").strip()
     search = request.args.get("search", "").strip()
-    sort = request.args.get("sort", "date_desc")
+    sort = request.args.get("sort", "discovered_desc")
     if sort not in _VALID_ITEM_SORTS:
-        sort = "date_desc"
+        sort = "discovered_desc"
 
     def _parse_price(name):
         raw = request.args.get(name, "").strip()
@@ -1253,15 +1254,19 @@ def items():
     formatted_items = []
     for item in items_data:
         search_text = parse_qs(urlparse(item[5]).query).get("search_text", [None])[0]
+        listed_timestamp = datetime.fromtimestamp(item[4]).strftime("%Y-%m-%d %H:%M:%S")
+        discovered_timestamp = datetime.fromtimestamp(item[8]).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         formatted_items.append(
             {
                 "title": item[1],
                 "price": item[2],
                 "currency": item[3],
-                "timestamp": datetime.fromtimestamp(item[4]).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "timestamp_raw": item[4],
+                "timestamp": discovered_timestamp,
+                "timestamp_raw": item[8],
+                "listed_timestamp": listed_timestamp,
+                "listed_timestamp_raw": item[4],
                 "query": item[7] or search_text or item[5],
                 "url": (
                     f"{urlparse(item[5]).scheme}://{urlparse(item[5]).netloc}"
@@ -1296,7 +1301,7 @@ def items():
         filter_args["price_min"] = request.args.get("price_min").strip()
     if request.args.get("price_max", "").strip():
         filter_args["price_max"] = request.args.get("price_max").strip()
-    if sort != "date_desc":
+    if sort != "discovered_desc":
         filter_args["sort"] = sort
     prev_url = url_for("items", page=page - 1, **filter_args) if page > 1 else None
     next_url = (

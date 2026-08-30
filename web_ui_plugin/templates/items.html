@@ -46,8 +46,9 @@
                     <div class="col-md-2">
                         <label for="sort" class="form-label fw-semibold">Sort</label>
                         <select class="form-select" id="sort" name="sort">
-                            <option value="date_desc" {% if sort == 'date_desc' %}selected{% endif %}>Newest first</option>
-                            <option value="date_asc" {% if sort == 'date_asc' %}selected{% endif %}>Oldest first</option>
+                            <option value="discovered_desc" {% if sort == 'discovered_desc' %}selected{% endif %}>Recently found</option>
+                            <option value="date_desc" {% if sort == 'date_desc' %}selected{% endif %}>Newest listed on Vinted</option>
+                            <option value="date_asc" {% if sort == 'date_asc' %}selected{% endif %}>Oldest listed on Vinted</option>
                             <option value="price_asc" {% if sort == 'price_asc' %}selected{% endif %}>Price: low to high</option>
                             <option value="price_desc" {% if sort == 'price_desc' %}selected{% endif %}>Price: high to low</option>
                             <option value="title_asc" {% if sort == 'title_asc' %}selected{% endif %}>Title A–Z</option>
@@ -120,9 +121,12 @@
                                     <span class="fw-bold text-dark" style="font-size: 1.1rem;">{{ item.price }} {{ item.currency }}</span>
                                 </p>
                                 <p class="card-text small text-muted mb-0">
-                                    <i class="bi bi-calendar me-1"></i>
+                                    <i class="bi bi-bell me-1"></i>Found:
                                     <time data-relative-time="{{ item.timestamp_raw }}"
-                                          title="{{ item.timestamp }}">{{ item.timestamp }}</time>
+                                          title="{{ item.timestamp }}">{{ item.timestamp }}</time><br>
+                                    <i class="bi bi-calendar me-1"></i>Listed:
+                                    <time data-relative-time="{{ item.listed_timestamp_raw }}"
+                                          title="{{ item.listed_timestamp }}">{{ item.listed_timestamp }}</time>
                                 </p>
                             </div>
                             <div class="card-footer bg-white p-3">
@@ -152,7 +156,8 @@
                             <th>Title</th>
                             <th>Price</th>
                             <th>Query</th>
-                            <th>Date</th>
+                            <th>Found</th>
+                            <th>Listed</th>
                             <th>Actions</th>
                         </tr>
                         </thead>
@@ -182,6 +187,10 @@
                                       title="{{ item.timestamp }}">{{ item.timestamp }}</time>
                             </td>
                             <td>
+                                <time data-relative-time="{{ item.listed_timestamp_raw }}"
+                                      title="{{ item.listed_timestamp }}">{{ item.listed_timestamp }}</time>
+                            </td>
+                            <td>
                                 <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer"
                                    class="btn btn-sm btn-primary">
                                     <i class="bi bi-box-arrow-up-right me-1"></i> View on Vinted
@@ -190,7 +199,7 @@
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="6" class="text-center">No items match your filters.</td>
+                            <td colspan="7" class="text-center">No items match your filters.</td>
                         </tr>
                         {% endfor %}
                         </tbody>
