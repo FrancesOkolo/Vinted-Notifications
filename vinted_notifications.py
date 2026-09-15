@@ -75,10 +75,12 @@ vinted_request_next_allowed = None
 vinted_request_lease_until = None
 vinted_request_owner_counter = None
 vinted_request_current_owner = None
+_scraper_watchdog_stall_first_seen_at = None
 
 _SCRAPER_JOB_PREFIX = "scrape_query_"
 _SCRAPER_DISPATCH_JOB_ID = "scraper_dispatch"
 _SCRAPER_PLAN_ATTRIBUTE = "_vinted_scraper_plan"
+_WATCHDOG_STALL_CONFIRMATION_SECONDS = 90
 _AI_JOB_FIELDS = (
     "job_id",
     "item_id",
@@ -1145,14 +1147,44 @@ def check_scraper_watchdog():
     The alert state is persisted in the database, so a sustained problem
     produces a single notification rather than one on every monitor tick.
     """
+    global _scraper_watchdog_stall_first_seen_at
+
     try:
         import core
 
-        health = core.get_scraper_health()
-        problem = bool(health["stalled"] or health["blocked"])
-        already_alerted = db.get_parameter("scraper_watchdog_alerted") == "True"
-
         now = int(time.time())
+        health = core.get_scraper_health()
+        already_alerted = db.get_parameter("scraper_watchdog_alerted") == "True"
+        stalled = bool(health["stalled"])
+        blocked = bool(health["blocked"])
+
+        # Windows suspends both schedulers while the home PC sleeps. On wake,
+        # the five-second process monitor can run before the first resumed
+        # scraper job and briefly see an hours-old heartbeat. Confirm a lone
+        # stale heartbeat before alarming; a real Vinted block/cooldown remains
+        # immediate, and a genuinely wedged scraper still alerts shortly after.
+        if stalled and not blocked and not already_alerted:
+            first_seen = _scraper_watchdog_stall_first_seen_at
+            if first_seen is None or now < first_seen:
+                _scraper_watchdog_stall_first_seen_at = now
+                logger.info(
+                    "Scraper watchdog: stale heartbeat detected; waiting %s "
+                    "seconds for scrape activity before alerting.",
+                    _WATCHDOG_STALL_CONFIRMATION_SECONDS,
+                )
+                return
+            if now - first_seen < _WATCHDOG_STALL_CONFIRMATION_SECONDS:
+                return
+        else:
+            if _scraper_watchdog_stall_first_seen_at is not None and not stalled:
+                logger.info(
+                    "Scraper watchdog: scrape activity resumed before a stall "
+                    "was confirmed."
+                )
+            _scraper_watchdog_stall_first_seen_at = None
+
+        problem = bool(stalled or blocked)
+
         try:
             recovery_started = int(
                 db.get_parameter("scraper_watchdog_recovery_started") or 0
@@ -1168,9 +1200,7 @@ def check_scraper_watchdog():
                 db.set_parameter("scraper_watchdog_recovery_started", "0")
             if already_alerted:
                 return
-            if health["stalled"]:
-                reason = "has stalled with no recent scrape activity"
-            elif health["cooldown_active"]:
+            if health.get("cooldown_active"):
                 minutes = max(
                     1,
                     (health["cooldown_remaining"] + 59) // 60,
@@ -1180,16 +1210,19 @@ def check_scraper_watchdog():
                     f"{health['last_block_status'] or 403}; retrying in "
                     f"about {minutes} minute(s)"
                 )
-            elif health["cooldown_level"] > 0:
+            elif health.get("cooldown_level", 0) > 0:
                 reason = (
                     "is waiting for a successful Vinted scrape after HTTP "
                     f"{health['last_block_status'] or 403}"
                 )
-            else:
+            elif blocked:
                 reason = (
-                    "appears to be blocked by Vinted "
-                    f"({health['failed_cycles']} consecutive cycles found nothing)"
+                    "is repeatedly failing to fetch listings "
+                    f"({health.get('failed_queries', 0)} consecutive query failures; "
+                    f"{health['failed_cycles']} failed full cycles)"
                 )
+            else:
+                reason = "has stalled with no recent scrape activity"
             logger.error("Scraper watchdog: the scraper %s.", reason)
             content = (
                 "⚠️ Vinted Notifications: the scraper "
@@ -1308,16 +1341,45 @@ def reset_scraper_watchdog_baseline(now=None):
     scheduled scrape. The last successful-cycle timestamp is intentionally
     preserved for health reporting.
     """
+    global _scraper_watchdog_stall_first_seen_at
+
     baseline = int(now if now is not None else time.time())
     if not db.set_parameters(
         {
             "scraper_heartbeat": str(baseline),
             "scraper_failed_cycles": "0",
+            "scraper_failed_queries": "0",
             "scraper_watchdog_recovery_started": "0",
         }
     ):
         raise RuntimeError("Failed to reset the scraper watchdog baseline.")
+    _scraper_watchdog_stall_first_seen_at = None
     logger.info("Scraper watchdog baseline reset at %s.", baseline)
+
+
+def announce_application_startup():
+    """Queue an accurate lifecycle notice for the Telegram administrator."""
+    try:
+        admin_chat_id = db.get_parameter("telegram_chat_id")
+        telegram_enabled = db.get_parameter("telegram_enabled") == "True"
+        if not telegram_enabled or not admin_chat_id:
+            return False
+
+        notification_id = db.enqueue_notification(
+            "🔄 Vinted Notifications is starting up. The scraper and Telegram "
+            "alerts will begin automatically.",
+            None,
+            None,
+            [admin_chat_id],
+        )
+        if notification_id is None:
+            logger.error("Could not queue application startup notification.")
+            return False
+        logger.info("Queued application startup notification.")
+        return True
+    except Exception:
+        logger.error("Could not queue application startup notification.", exc_info=True)
+        return False
 
 
 def plugin_checker():
@@ -1340,6 +1402,7 @@ if __name__ == "__main__":
 
     # Plugin checker
     plugin_checker()
+    announce_application_startup()
 
     # All application processes that contact Vinted share this conservative
     # start/completion gate. The value uses the system-wide monotonic clock.

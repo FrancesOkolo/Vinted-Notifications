@@ -56,10 +56,12 @@ class Item:
             + "transaction/buy/new?source_screen=item&transaction%5Bitem_id%5D="
             + str(data["id"])
         )
-        self.created_at_ts = datetime.fromtimestamp(
-            data["photo"]["high_resolution"]["timestamp"], tz=timezone.utc
+        self.raw_timestamp = data["photo"]["high_resolution"].get("timestamp")
+        self.created_at_ts = (
+            datetime.fromtimestamp(self.raw_timestamp, tz=timezone.utc)
+            if self.raw_timestamp is not None
+            else None
         )
-        self.raw_timestamp = data["photo"]["high_resolution"]["timestamp"]
 
     def __eq__(self, other):
         """
@@ -103,6 +105,11 @@ class Item:
         Returns:
             bool: True if the item is new, False otherwise.
         """
+        if self.created_at_ts is None:
+            # Server-rendered catalogue cards no longer expose listing time.
+            # Durable per-query anchors decide freshness for those responses;
+            # treating an unknown timestamp as new would flood a new query.
+            return False
         delta = datetime.now(timezone.utc) - self.created_at_ts
         return delta.total_seconds() < minutes * 60
 

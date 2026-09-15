@@ -83,7 +83,9 @@ def _record_success(query_id, url, items, *, started_at=None):
         url,
         [_snapshot(item.id, item.raw_timestamp, title=item.title) for item in items],
         duration_ms=25,
-        finished_at=started_at + 0.025,
+        # Keep the pending work eligible for immediate draining in tests.
+        # A fabricated future finish can race a fast machine's next statement.
+        finished_at=started_at,
     )
     return execution_id, result
 
@@ -326,6 +328,138 @@ def test_local_rejection_finalizes_pending_and_updates_metrics(database):
         )
     assert _execution(execution_id)[5:9] == (0, 1, 0, 1)
     assert destination.empty()
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Tom Holt Earth, Fire and Custard",
+        "Christmas cross stitch book",
+        "Tom Gates Spectacular",
+        "A Boggle at Bewilderwood",
+        "Hogfather decoration",
+    ],
+)
+def test_raffield_rejection_is_durable(database, title):
+    query_id, url = _query("Tom Raffield")
+    execution_id, _ = _record_success(
+        query_id, url, [_item(901, time.time() - 1, title=title)]
+    )
+    destination = queue.Queue()
+    core.clear_item_queue(queue.Queue(), destination)
+    assert not db.is_item_in_db_by_id(901)
+    assert destination.empty()
+    with closing(db.get_db_connection()) as connection:
+        assert (
+            connection.execute(
+                "SELECT status FROM pending_query_items WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()[0]
+            == "locally_rejected"
+        )
+
+
+@pytest.mark.parametrize(
+    "search,title,brand,expected",
+    [
+        ("Tom+Raffield", "RAFFIELD pendant", None, True),
+        ("Tom%20Raffield", "Wooden pendant", "Tom Raffield", True),
+        ("Tom+Raffield", "NotRaffield lamp", None, False),
+        ("Tom+Raffield", None, None, False),
+        ("Tom+Gates", "Tom Gates book", None, True),
+        ("Pooky", "Wooden lamp", None, True),
+    ],
+)
+def test_raffield_filter_scope(search, title, brand, expected):
+    item = SimpleNamespace(title=title, brand_title=brand)
+    assert (
+        core.matches_query_relevance(
+            "https://www.vinted.co.uk/catalog?search_text=" + search, item
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "search,title,brand,expected",
+    [
+        ("original BTC", "Lionel Messi Mug", "", False),
+        ("original BTC", "Vintage ornate camel plate, hand paint", "", False),
+        ("original BTC", "Orginal BTC Light", "", True),
+        ("original BTC", "Mast Light", "Original BTC", True),
+        ("original BTC", "BTCish mug", "", False),
+        ("cloche smoking", "Hand bell", "Crystal", False),
+        ("cloche smoking", "Glass clock dome", "", False),
+        ("cloche smoking", "Cake cloche", "", False),
+        ("cloche smoking", "Cocktail smoking cloche", "", True),
+        ("cloche smoking", "Glass smoke dome", "", True),
+        ("cloche smoking", "Cocktail dome", "", True),
+        ("hand bell", "Crystal hand bell", "", True),
+        ("Drummonds", "Pair of Ty Wilson", "Ty Wilson", False),
+        ("Drummonds", "Glenda Turley Art", "Art", False),
+        ("Drummonds", "Drummond Ranch cookie jar", "The Pioneer Woman", False),
+        ("Drummonds", "Brass bath taps", "Drummonds", True),
+        ("Drummonds", "DRUMMONDS shower", "", True),
+        (
+            "Colefax%20%26%20Fowler",
+            "Vintage Myott Chelsea bird pattern ceramic jug",
+            "Myott",
+            False,
+        ),
+        (
+            "Colefax%20%26%20Fowler",
+            "Alfred Meakin Country Life 4 Side Plates Rustic Home Cottagecore",
+            "Alfred Meakin",
+            False,
+        ),
+        ("Colefax%20%26%20Fowler", "Curtains", "Colefax & Fowler", True),
+        ("Colefax%20%26%20Fowler", "Colefax fabric remnant", "", True),
+        ("Colefax and Fowler", "Colefax cushion", "", True),
+        ("Ty Wilson", "Pair of Ty Wilson", "", True),
+    ],
+)
+def test_targeted_relevance_rules(search, title, brand, expected):
+    item = SimpleNamespace(title=title, brand_title=brand)
+    assert (
+        core.matches_query_relevance(
+            "https://www.vinted.co.uk/catalog?search_text=" + search, item
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "search,title",
+    [
+        ("original BTC", "Official FC Barcelona Lionel Messi Ceramic Mug New In Box"),
+        ("original BTC", "Vintage ornate camel plate, hand paint"),
+        ("cloche smoking", "Hand bell"),
+        ("Drummonds", "Pair of Ty Wilson"),
+        ("Drummonds", "Glenda Turley Art"),
+        ("Colefax%20%26%20Fowler", "Vintage Myott Chelsea bird pattern ceramic jug"),
+        (
+            "Colefax%20%26%20Fowler",
+            "Alfred Meakin Country Life 4 Side Plates Rustic Home Cottagecore",
+        ),
+    ],
+)
+def test_targeted_rejection_prevents_storage_and_delivery(database, search, title):
+    query_id, url = _query(search)
+    execution_id, _ = _record_success(
+        query_id, url, [_item(902, time.time() - 1, title=title)]
+    )
+    destination = queue.Queue()
+    core.clear_item_queue(queue.Queue(), destination)
+    assert destination.empty()
+    assert not db.is_item_in_db_by_id(902)
+    with closing(db.get_db_connection()) as connection:
+        assert (
+            connection.execute(
+                "SELECT status FROM pending_query_items WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()[0]
+            == "locally_rejected"
+        )
 
 
 def _save_query_edit(query_id, *, url=None, name=None):

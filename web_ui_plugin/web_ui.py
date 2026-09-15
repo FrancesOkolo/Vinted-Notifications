@@ -423,13 +423,14 @@ def _format_dashboard_items():
     for item in db.get_items(limit=6, sort="discovered_desc"):
         listed = _format_dashboard_timestamp(item[4])
         discovered = _format_dashboard_timestamp(item[8])
-        if listed is None or discovered is None:
+        if discovered is None:
             logger.warning(
                 "Could not format dashboard timestamps for item %s.",
                 item[0],
             )
             continue
         parsed_query = urlparse(item[5])
+        listed = listed or {"text": "Unavailable", "iso": "", "raw": ""}
         formatted.append(
             {
                 "title": item[1],
@@ -1254,7 +1255,8 @@ def items():
     formatted_items = []
     for item in items_data:
         search_text = parse_qs(urlparse(item[5]).query).get("search_text", [None])[0]
-        listed_timestamp = datetime.fromtimestamp(item[4]).strftime("%Y-%m-%d %H:%M:%S")
+        listed = _format_dashboard_timestamp(item[4])
+        listed_timestamp = listed["text"] if listed else "Unavailable"
         discovered_timestamp = datetime.fromtimestamp(item[8]).strftime(
             "%Y-%m-%d %H:%M:%S"
         )

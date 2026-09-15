@@ -251,6 +251,7 @@ def _session_request(
     method,
     url,
     params=None,
+    headers=None,
     force_gate=False,
     cancel_if=None,
 ):
@@ -265,7 +266,10 @@ def _session_request(
     request = getattr(session, method)
     vinted_request = force_gate or _is_vinted_request(url)
     if not vinted_request:
-        return request(url, params=params, timeout=REQUEST_TIMEOUT)
+        request_kwargs = {"params": params, "timeout": REQUEST_TIMEOUT}
+        if headers is not None:
+            request_kwargs["headers"] = headers
+        return request(url, **request_kwargs)
     cancel_if = _vinted_cancel_check(cancel_if)
 
     with _CATALOGUE_REQUEST_GATE_LOCK:
@@ -292,6 +296,7 @@ def _session_request(
             response = request(
                 url,
                 params=params,
+                headers=headers,
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=False,
             )
@@ -344,12 +349,20 @@ class Requester:
             json.loads(default_headers_json) if default_headers_json else {}
         )
 
-        self.HEADER = {
-            # Grabs a user agent from the database
-            "User-Agent": random.choice(user_agents) if user_agents else "Mozilla/5.0",
-            **(default_headers or {}),
-            "Host": "www.vinted.fr",
+        # Keep one browser identity for the lifetime of the requester. Rotating
+        # the User-Agent while retaining the same cookies makes an otherwise
+        # valid anonymous session look internally inconsistent to Vinted.
+        self._user_agent = random.choice(user_agents) if user_agents else "Mozilla/5.0"
+        self._default_headers = {
+            key: value
+            for key, value in (default_headers or {}).items()
+            if key.lower() not in {"host", "cookie", "authorization"}
         }
+        self.HEADER = {
+            **self._default_headers,
+            "User-Agent": self._user_agent,
+        }
+        self._locale = "www.vinted.fr"
         self.VINTED_AUTH_URL = "https://www.vinted.fr/"
         self.MAX_RETRIES = 3
         self.session = requests.Session()
@@ -368,27 +381,21 @@ class Requester:
         Args:
             locale (str): The locale domain to use (e.g., 'www.vinted.fr', 'www.vinted.de')
         """
+        locale = str(locale or "").strip().lower().rstrip(".")
+        if not locale:
+            raise ValueError("Vinted locale cannot be empty")
+
         self.VINTED_AUTH_URL = f"https://{locale}/"
-        # Get user agents and default headers from the database
-        user_agents_json = db.get_parameter("user_agents")
-        default_headers_json = db.get_parameter("default_headers")
+        if locale == self._locale:
+            return
 
-        # Parse JSON strings
-        user_agents = json.loads(user_agents_json) if user_agents_json else []
-        default_headers = (
-            json.loads(default_headers_json) if default_headers_json else {}
-        )
-
-        self.HEADER = {
-            "User-Agent": random.choice(user_agents) if user_agents else "Mozilla/5.0",
-            **(default_headers or {}),
-            "Host": f"{locale}",
-        }
+        self._locale = locale
+        # Let requests derive Host from the URL. A manually retained Host can
+        # mismatch a changed locale, and the session's UA must remain stable.
+        self.session.headers.pop("Host", None)
         self.session.headers.update(self.HEADER)
         if self.debug:
-            logger.debug(
-                f"Locale set to {locale} with User-Agent: {self.HEADER['User-Agent']}"
-            )
+            logger.debug("Locale set to %s using the existing session identity", locale)
 
     def get_once(self, url, params=None, cancel_if=None):
         """Make exactly one paced GET without cookie/authentication retries."""
@@ -400,11 +407,15 @@ class Requester:
             "get",
             url,
             params=params,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": f"{self.VINTED_AUTH_URL.rstrip('/')}/catalog",
+            },
             force_gate=_is_vinted_request(url),
             cancel_if=cancel_if,
         )
 
-    def get(self, url, params=None):
+    def get(self, url, params=None, headers=None):
         """
         Make a GET request with retry logic.
 
@@ -416,6 +427,8 @@ class Requester:
         Args:
             url (str): The URL to request
             params (dict, optional): Query parameters for the request
+            headers (dict, optional): Per-request headers. API-oriented
+                defaults are used when omitted.
 
         Returns:
             requests.Response: The response object if successful
@@ -431,12 +444,21 @@ class Requester:
 
         forbidden_retry_used = False
         unauthorized_retry_used = False
-        authentication_attempt = 1
         connection_retry = 0
+        request_headers = headers or {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"{self.VINTED_AUTH_URL.rstrip('/')}/catalog",
+        }
 
         while True:
             try:
-                response = _session_request(self.session, "get", url, params=params)
+                response = _session_request(
+                    self.session,
+                    "get",
+                    url,
+                    params=params,
+                    headers=request_headers,
+                )
                 if response is None:
                     raise VintedRequestCancelled(
                         "Vinted request cancelled by scraper safety control"
@@ -472,7 +494,12 @@ class Requester:
                         "Vinted returned HTTP 403; refreshing the session and "
                         "retrying this query once."
                     )
-                    self._rebuild_session()
+                    if self._rebuild_session() is False:
+                        logger.warning(
+                            "Vinted session bootstrap failed; returning the "
+                            "original HTTP 403 to the scraper circuit breaker."
+                        )
+                        return response
                     time.sleep(FORBIDDEN_RETRY_DELAY_SECONDS)
                     continue
 
@@ -488,7 +515,12 @@ class Requester:
                         "Vinted returned HTTP 401; rebuilding the session and "
                         "retrying this query once."
                     )
-                    self._rebuild_session()
+                    if self._rebuild_session() is False:
+                        logger.warning(
+                            "Vinted session bootstrap failed; returning the "
+                            "original HTTP 401 to the scraper circuit breaker."
+                        )
+                        return response
                     continue
 
                 if response.status_code in (403, 429):
@@ -499,28 +531,23 @@ class Requester:
                     )
                     return response
 
-                if (
-                    response.status_code == 404
-                    and authentication_attempt < self.MAX_RETRIES
-                ):
-                    print(
-                        "Cookies invalid, retrying "
-                        f"{authentication_attempt}/{self.MAX_RETRIES}"
-                    )
-                    if self.debug:
-                        logger.debug(
-                            "Cookies invalid retrying %s/%s",
-                            authentication_attempt,
-                            self.MAX_RETRIES,
-                        )
-                    authentication_attempt += 1
-                    self.set_cookies()
-                    continue
-
                 return response
 
+    def get_catalogue_page(self, url):
+        """Fetch one public catalogue page through the shared safety gate."""
+        return self.get(
+            url,
+            headers={
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8"
+                ),
+                "Referer": self.VINTED_AUTH_URL,
+            },
+        )
+
     def _rebuild_session(self):
-        """Replace the HTTP session and obtain new cookies for one 403 retry."""
+        """Replace the HTTP session and establish a new anonymous web session."""
         old_session = self.session
         try:
             old_session.close()
@@ -531,7 +558,7 @@ class Requester:
         self.session = requests.Session()
         self.session.headers.update(self.HEADER)
         proxies.configure_proxy(self.session)
-        self.set_cookies()
+        return self.set_cookies()
 
     def post(self, url, params=None):
         """
@@ -557,6 +584,10 @@ class Requester:
             "post",
             url,
             params=params,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": f"{self.VINTED_AUTH_URL.rstrip('/')}/catalog",
+            },
             force_gate=_is_vinted_request(url),
         )
         if response is None:
@@ -568,26 +599,97 @@ class Requester:
 
     def set_cookies(self):
         """
-        Reset and fetch new cookies for authentication.
+        Establish and validate a fresh anonymous Vinted browser session.
 
-        Clears the current session cookies and makes a HEAD request to
-        the Vinted authentication URL to get new cookies.
+        Vinted now expects the catalogue API request to carry an anonymous web
+        access token. A HEAD request to the home page can return successfully
+        without issuing that token, so bootstrap with an ordinary catalogue
+        page GET and verify the cookie jar before retrying the API.
         """
-        self.session.cookies.clear_session_cookies()
         try:
-            _session_request(
+            self.session.cookies.clear()
+        except (AttributeError, NotImplementedError):
+            self.session.cookies.clear_session_cookies()
+
+        bootstrap_url = f"{self.VINTED_AUTH_URL.rstrip('/')}/catalog"
+        try:
+            response = _session_request(
                 self.session,
-                "head",
-                self.VINTED_AUTH_URL,
+                "get",
+                bootstrap_url,
+                headers={
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "image/avif,image/webp,*/*;q=0.8"
+                    ),
+                    "Referer": self.VINTED_AUTH_URL,
+                },
                 force_gate=True,
             )
-            if self.debug:
-                logger.debug("Cookies set!")
-        except Exception:
-            if self.debug:
-                logger.error(
-                    "There was an error fetching cookies for vinted", exc_info=True
+            if response is None:
+                raise VintedRequestCancelled(
+                    "Vinted session bootstrap cancelled by scraper safety control"
                 )
+
+            with response:
+                response_headers = getattr(response, "headers", {}) or {}
+                content_type = response_headers.get("Content-Type", "")
+                cf_mitigated = response_headers.get("cf-mitigated", "")
+                request_id = response_headers.get(
+                    "x-request-id", response_headers.get("x-vinted-request-id", "")
+                )
+                try:
+                    cookie_names = sorted(
+                        {
+                            cookie.name
+                            for cookie in self.session.cookies
+                            if getattr(cookie, "name", None)
+                        }
+                    )
+                except TypeError:
+                    cookie_names = sorted(
+                        str(name)
+                        for name in getattr(self.session.cookies, "keys", lambda: [])()
+                    )
+
+                token_present = "access_token_web" in cookie_names
+                if response.status_code == 200 and token_present and not cf_mitigated:
+                    logger.info(
+                        "Vinted anonymous session established (cookie names: %s).",
+                        ", ".join(cookie_names),
+                    )
+                    return True
+
+                message_code = ""
+                if "json" in content_type.lower():
+                    try:
+                        payload = response.json()
+                        if isinstance(payload, dict):
+                            message_code = str(payload.get("message_code", ""))
+                    except (TypeError, ValueError):
+                        pass
+                logger.warning(
+                    "Vinted session bootstrap did not yield an anonymous access "
+                    "token: HTTP %s, content_type=%s, cf_mitigated=%s, "
+                    "message_code=%s, request_id=%s, cookie_names=%s.",
+                    response.status_code,
+                    content_type or "unknown",
+                    cf_mitigated or "none",
+                    message_code or "none",
+                    request_id or "none",
+                    ",".join(cookie_names) or "none",
+                )
+                return False
+        except VintedRequestCancelled:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Vinted session bootstrap failed before validation (%s).",
+                error.__class__.__name__,
+            )
+            if self.debug:
+                logger.debug("Session bootstrap exception", exc_info=True)
+            return False
 
     def update_cookies(self, cookies: dict):
         """

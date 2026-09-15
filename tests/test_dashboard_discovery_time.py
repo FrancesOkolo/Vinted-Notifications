@@ -88,6 +88,25 @@ def test_item_discovery_migration_is_idempotent_and_backfills_legacy_rows(
     assert discovered_at == pytest.approx(1700000000.5)
 
 
+def test_unknown_listing_time_still_renders_on_items_and_dashboard(web_client):
+    query_id = _add_query("https://www.vinted.co.uk/catalog?search_text=lamp", "Lamp")
+    db.add_item_to_db(
+        9001,
+        "Timestamp-free lamp",
+        query_id,
+        20,
+        None,
+        "",
+        "GBP",
+        discovered_at=1780000000,
+    )
+    for path in ("/", "/items"):
+        response = web_client.get(path)
+        assert response.status_code == 200
+        assert b"Timestamp-free lamp" in response.data
+        assert b"Unavailable" in response.data
+
+
 def test_items_and_queries_can_be_ordered_by_local_discovery_time(database):
     query_id = _add_query(
         "https://www.vinted.co.uk/catalog?search_text=lamps",

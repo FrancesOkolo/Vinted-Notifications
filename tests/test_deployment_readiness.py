@@ -649,7 +649,7 @@ def requester_clock(database, monkeypatch):
 
 @pytest.mark.parametrize(
     ("status_code", "expected_calls"),
-    [(403, 2), (429, 1)],
+    [(403, 2), (429, 1), (404, 1)],
 )
 def test_requester_uses_one_bounded_retry_for_block_responses(
     database,
@@ -698,6 +698,167 @@ def test_requester_uses_one_bounded_retry_for_block_responses(
         if status_code == 403
         else []
     )
+
+
+def test_requester_keeps_one_identity_across_locale_updates(
+    database,
+    monkeypatch,
+):
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+    choices = []
+
+    def configured_parameter(key):
+        if key == "user_agents":
+            return json.dumps(["stable-agent", "unused-agent"])
+        if key == "default_headers":
+            return json.dumps(
+                {
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Host": "stale.example",
+                    "Authorization": "must-not-survive",
+                    "Cookie": "must-not-survive",
+                }
+            )
+        return None
+
+    def choose(values):
+        choices.append(tuple(values))
+        return values[0]
+
+    monkeypatch.setattr(requester_module.db, "get_parameter", configured_parameter)
+    monkeypatch.setattr(requester_module.random, "choice", choose)
+
+    client = requester_module.Requester()
+    client.set_locale("www.vinted.co.uk")
+    client.set_locale("www.vinted.co.uk")
+
+    assert choices == [("stable-agent", "unused-agent")]
+    assert client.HEADER["User-Agent"] == "stable-agent"
+    assert client.session.headers["User-Agent"] == "stable-agent"
+    assert "Host" not in client.HEADER
+    assert "Authorization" not in client.HEADER
+    assert "Cookie" not in client.HEADER
+
+
+def test_requester_bootstraps_anonymous_session_with_catalogue_get(
+    database,
+    monkeypatch,
+):
+    import importlib
+    from types import SimpleNamespace
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+    calls = []
+
+    class Cookies:
+        def __init__(self):
+            self.names = []
+
+        def clear(self):
+            self.names.clear()
+
+        def __iter__(self):
+            return iter(SimpleNamespace(name=name) for name in self.names)
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def session_request(session, method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        session.cookies.names.extend(["anon_id", "access_token_web"])
+        return Response()
+
+    client = requester_module.Requester()
+    client.set_locale("www.vinted.co.uk")
+    client.session.cookies = Cookies()
+    monkeypatch.setattr(requester_module, "_session_request", session_request)
+
+    assert client.set_cookies() is True
+    assert calls[0][0:2] == ("get", "https://www.vinted.co.uk/catalog")
+    assert calls[0][2]["force_gate"] is True
+    assert calls[0][2]["headers"]["Referer"] == "https://www.vinted.co.uk/"
+
+
+def test_requester_rejects_bootstrap_without_anonymous_access_token(
+    database,
+    monkeypatch,
+):
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+
+    class Cookies:
+        def clear(self):
+            return None
+
+        def __iter__(self):
+            return iter(())
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    client = requester_module.Requester()
+    client.session.cookies = Cookies()
+    monkeypatch.setattr(
+        requester_module,
+        "_session_request",
+        lambda *args, **kwargs: Response(),
+    )
+
+    assert client.set_cookies() is False
+
+
+def test_requester_does_not_retry_api_when_session_bootstrap_fails(
+    database,
+    monkeypatch,
+    requester_clock,
+):
+    import importlib
+
+    requester_module = importlib.import_module("pyVintedVN.requester")
+
+    class Response:
+        status_code = 401
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            return Response()
+
+    monkeypatch.setattr(requester_module.proxies, "configure_proxy", lambda _: False)
+    client = requester_module.Requester()
+    client.session = Session()
+    monkeypatch.setattr(client, "_rebuild_session", lambda: False)
+
+    response = client.get("https://www.vinted.co.uk/api/v2/catalog/items")
+
+    assert response.status_code == 401
+    assert client.session.calls == 1
 
 
 def test_requester_recovers_from_transient_403_with_fresh_session(
@@ -1422,9 +1583,11 @@ def test_429_retry_after_is_bounded(database, retry_after, expected):
     assert core._get_bounded_retry_after_seconds(response) == expected
 
 
-def test_confirmed_401_opens_global_cooldown_after_one_scheduled_query(
+@pytest.mark.parametrize("status_code", [401, 404])
+def test_confirmed_http_failure_opens_global_cooldown_after_one_scheduled_query(
     database,
     monkeypatch,
+    status_code,
 ):
     import requests
 
@@ -1447,7 +1610,9 @@ def test_confirmed_401_opens_global_cooldown_after_one_scheduled_query(
     class Items:
         def search(self, url, nbr_items):
             search_calls.append(url)
-            response = type("Response", (), {"status_code": 401, "headers": {}})()
+            response = type(
+                "Response", (), {"status_code": status_code, "headers": {}}
+            )()
             raise requests.exceptions.HTTPError(
                 "401 Client Error",
                 response=response,
@@ -1469,7 +1634,7 @@ def test_confirmed_401_opens_global_cooldown_after_one_scheduled_query(
     cooldown = core.get_scraper_cooldown(now=1_000)
     assert cooldown["active"]
     assert cooldown["remaining"] == 5 * 60
-    assert cooldown["status_code"] == 401
+    assert cooldown["status_code"] == status_code
     assert db.get_parameter("scraper_failed_cycles") in (None, "0")
 
     core.process_items(queue.Queue(), query_ids=[query_id])
@@ -1563,6 +1728,15 @@ def test_scheduled_query_failure_is_not_counted_as_a_failed_full_cycle(
 
     core.process_items(queue.Queue(), query_ids=[query_id])
     assert db.get_parameter("scraper_failed_cycles") in (None, "0")
+
+    # Scheduled failures reach the watchdog without counting as full sweeps.
+    assert not core.get_scraper_health()["blocked"]
+    core.process_items(queue.Queue(), query_ids=[query_id])
+    core.process_items(queue.Queue(), query_ids=[query_id])
+    assert core.get_scraper_health()["failed_queries"] == 3
+    assert core.get_scraper_health()["blocked"]
+    core._finalize_scrape_cycle(1, 1, count_failed_cycle=False)
+    assert not core.get_scraper_health()["blocked"]
 
     # The legacy all-query entry point still represents one complete sweep.
     core.process_items(queue.Queue())
@@ -1690,6 +1864,111 @@ def test_startup_resets_stale_watchdog_without_false_alert(database, monkeypatch
     )
     app.check_scraper_watchdog()
     assert enqueued == []
+
+
+def test_startup_queues_an_informational_telegram_notice(database, monkeypatch):
+    import vinted_notifications as app
+
+    db.set_parameters(
+        {
+            "telegram_enabled": "True",
+            "telegram_chat_id": "111",
+        }
+    )
+    enqueued = []
+    monkeypatch.setattr(
+        app.db,
+        "enqueue_notification",
+        lambda *args, **kwargs: enqueued.append((args, kwargs)) or 1,
+    )
+
+    assert app.announce_application_startup()
+    assert len(enqueued) == 1
+    args, kwargs = enqueued[0]
+    assert "is starting up" in args[0]
+    assert "stalled" not in args[0]
+    assert args[3] == ["111"]
+    assert kwargs == {}
+
+
+def test_watchdog_allows_post_resume_scrape_to_refresh_heartbeat(database, monkeypatch):
+    import vinted_notifications as app
+
+    core = _core()
+    db.set_parameters(
+        {
+            "telegram_enabled": "True",
+            "telegram_chat_id": "111",
+            "scraper_watchdog_alerted": "False",
+            "scraper_watchdog_recovery_started": "0",
+        }
+    )
+    clock = [1_000]
+    health = [{"stalled": True, "blocked": False}]
+    enqueued = []
+    monkeypatch.setattr(app.time, "time", lambda: clock[0])
+    monkeypatch.setattr(app, "_scraper_watchdog_stall_first_seen_at", None)
+    monkeypatch.setattr(core, "get_scraper_health", lambda: health[0])
+    monkeypatch.setattr(
+        app.db,
+        "enqueue_notification",
+        lambda *args, **kwargs: enqueued.append((args, kwargs)),
+    )
+
+    app.check_scraper_watchdog()
+    assert enqueued == []
+    assert app._scraper_watchdog_stall_first_seen_at == 1_000
+
+    clock[0] += 30
+    health[0] = {"stalled": False, "blocked": False}
+    app.check_scraper_watchdog()
+    assert enqueued == []
+    assert app._scraper_watchdog_stall_first_seen_at is None
+
+
+def test_watchdog_alerts_once_after_stall_confirmation(database, monkeypatch):
+    import vinted_notifications as app
+
+    core = _core()
+    db.set_parameters(
+        {
+            "telegram_enabled": "True",
+            "telegram_chat_id": "111",
+            "scraper_watchdog_alerted": "False",
+            "scraper_watchdog_recovery_started": "0",
+        }
+    )
+    clock = [2_000]
+    health = {
+        "stalled": True,
+        "blocked": False,
+        "cooldown_active": False,
+        "cooldown_level": 0,
+        "failed_cycles": 0,
+    }
+    enqueued = []
+    monkeypatch.setattr(app.time, "time", lambda: clock[0])
+    monkeypatch.setattr(app, "_scraper_watchdog_stall_first_seen_at", None)
+    monkeypatch.setattr(core, "get_scraper_health", lambda: health)
+    monkeypatch.setattr(
+        app.db,
+        "enqueue_notification",
+        lambda *args, **kwargs: enqueued.append((args, kwargs)),
+    )
+
+    app.check_scraper_watchdog()
+    clock[0] += app._WATCHDOG_STALL_CONFIRMATION_SECONDS - 1
+    app.check_scraper_watchdog()
+    assert enqueued == []
+
+    clock[0] += 1
+    app.check_scraper_watchdog()
+    assert len(enqueued) == 1
+    assert "has stalled" in enqueued[0][0][0]
+
+    clock[0] += 5
+    app.check_scraper_watchdog()
+    assert len(enqueued) == 1
 
 
 def test_watchdog_requires_stable_recovery_before_rearming(database, monkeypatch):

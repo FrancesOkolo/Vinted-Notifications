@@ -195,6 +195,38 @@ def test_bootstrap_uses_twenty_minutes_then_anchor_accepts_older_listing(databas
     assert third.metrics["fresh_count"] == 0
 
 
+def test_page_source_baselines_then_detects_unseen_without_timestamps(database):
+    url = "https://www.vinted.co.uk/catalog?search_text=lamp&order=newest_first"
+    query_id = _add_query(url)
+    observation.migrate_schema()
+
+    def record(ids, moment):
+        execution = observation.start_execution(query_id, url, 20, started_at=moment)
+        return observation.record_success(
+            execution,
+            query_id,
+            url,
+            [_snapshot(i, None) for i in ids],
+            duration_ms=1,
+            finished_at=moment,
+            source="catalogue_page",
+        )
+
+    assert not record([3, 2, 1], 10000).candidate_ids
+    assert record([4, 3, 2], 11000).candidate_ids == frozenset({4})
+    # Entire old window has gone, including its anchor. New IDs still notify.
+    assert record([7, 6, 5], 12000).candidate_ids == frozenset({7, 6, 5})
+    observation.migrate_schema()
+    assert not record([7, 6, 5], 13000).candidate_ids
+    with closing(db.get_db_connection()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM query_item_observations WHERE listing_timestamp IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_pending_snapshots_are_sanitized_leased_and_finalized_once(database):
     url = "https://www.vinted.co.uk/catalog?search_text=shade"
     query_id = _add_query(url)

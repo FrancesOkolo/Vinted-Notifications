@@ -1,9 +1,136 @@
+import json as jsonlib
+import re
+
 from pyVintedVN.items.item import Item
 from pyVintedVN.requester import requester
-from urllib.parse import urlparse, parse_qsl
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 from requests.exceptions import HTTPError
 from typing import List, Dict, Optional
-from pyVintedVN.settings import Urls
+
+_NEXT_DATA_PUSH_PATTERN = re.compile(
+    r"self\.__next_f\.push\((\[.*?\])\)\s*;?\s*</script>",
+    re.DOTALL,
+)
+_CATALOGUE_ITEMS_MARKER = '"items":{"items":['
+
+
+class CataloguePageParseError(ValueError):
+    """Raised when a successful Vinted page lacks catalogue result data."""
+
+
+def _catalogue_page_url(url, page):
+    """Return the public catalogue URL while preserving all saved filters."""
+    parts = urlsplit(url)
+    path = parts.path
+    if path.rstrip("/") == "/api/v2/catalog/items":
+        path = "/catalog"
+    pairs = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key not in {"page", "_rsc"}
+    ]
+    if int(page or 1) > 1:
+        pairs.append(("page", str(int(page))))
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(pairs), ""))
+
+
+def _next_data_stream(page_html):
+    chunks = []
+    for match in _NEXT_DATA_PUSH_PATTERN.finditer(str(page_html or "")):
+        try:
+            payload = jsonlib.loads(match.group(1))
+        except (TypeError, ValueError, jsonlib.JSONDecodeError):
+            continue
+        if len(payload) > 1 and isinstance(payload[1], str):
+            chunks.append(payload[1])
+    return "".join(chunks)
+
+
+def _clean_product_text(value):
+    if value is None or str(value).startswith("$undefined"):
+        return ""
+    return str(value).strip()
+
+
+def _legacy_item_data(product, locale):
+    """Map Vinted's current page model to the established Item contract."""
+    item_box = product.get("itemBox")
+    item_box = item_box if isinstance(item_box, dict) else {}
+    price = product.get("price")
+    price = price if isinstance(price, dict) else {}
+    amount = price.get("amount")
+    currency = price.get("currencyCode")
+    item_id = product.get("id")
+    title = _clean_product_text(product.get("title"))
+    relative_url = _clean_product_text(product.get("url"))
+    if item_id in (None, "") or not title or amount is None or not currency:
+        return None
+
+    photo_url = _clean_product_text(product.get("thumbnailUrl")) or None
+    if not photo_url:
+        photos = product.get("photos")
+        if isinstance(photos, list):
+            for photo in photos:
+                if isinstance(photo, dict) and photo.get("url"):
+                    photo_url = str(photo["url"])
+                    break
+
+    return {
+        "id": item_id,
+        "title": title,
+        "brand_title": _clean_product_text(item_box.get("firstLine")),
+        "status_title": _clean_product_text(item_box.get("secondLine")),
+        "description": None,
+        "price": {
+            "amount": str(amount),
+            "currency_code": str(currency).upper(),
+        },
+        "photo": {
+            "url": photo_url,
+            # The new server-rendered catalogue model does not expose the old
+            # photo timestamp. None prevents a first observation from treating
+            # the whole result window as newly listed.
+            "high_resolution": {"timestamp": None},
+        },
+        "url": urljoin(f"https://{locale}/", relative_url),
+    }
+
+
+def parse_catalogue_page(page_html, locale, limit):
+    """Extract ordered listing cards from Vinted's server-rendered page data."""
+    stream = _next_data_stream(page_html)
+    if _CATALOGUE_ITEMS_MARKER not in stream:
+        raise CataloguePageParseError(
+            "Vinted catalogue page did not contain a recognisable items payload"
+        )
+
+    start = stream.index(_CATALOGUE_ITEMS_MARKER) + len('"items":')
+    try:
+        state, _ = jsonlib.JSONDecoder().raw_decode(stream, start)
+    except ValueError as error:
+        raise CataloguePageParseError("Incomplete catalogue payload") from error
+    if not isinstance(state, dict) or not isinstance(state.get("items"), list):
+        raise CataloguePageParseError("Invalid catalogue items array")
+    if state.get("uiState", "SUCCESS") != "SUCCESS":
+        raise CataloguePageParseError("Catalogue results are not ready")
+    maximum = max(1, int(limit or 1))
+    results = []
+    seen_ids = set()
+    for wrapper in state["items"]:
+        product = wrapper.get("productItem") if isinstance(wrapper, dict) else None
+        if not isinstance(product, dict):
+            raise CataloguePageParseError("Unexpected catalogue result type")
+        mapped = _legacy_item_data(product, locale)
+        if mapped is None:
+            raise CataloguePageParseError("Incomplete catalogue item")
+        if str(mapped["id"]) in seen_ids:
+            continue
+        seen_ids.add(str(mapped["id"]))
+        results.append(mapped)
+        if len(results) >= maximum:
+            break
+
+    return results
 
 
 class Items:
@@ -17,6 +144,8 @@ class Items:
         >>> items = Items()
         >>> results = items.search("https://www.vinted.fr/catalog?search_text=shoes")
     """
+
+    result_source = "catalogue_page"
 
     def search(
         self,
@@ -47,22 +176,13 @@ class Items:
         locale = urlparse(url).netloc
         requester.set_locale(locale)
 
-        # Parse the URL to get the API parameters
-        params = self.parse_url(url, nbr_items, page, time)
-
-        # Construct the API URL
-        api_url = (
-            f"https://{locale}{Urls.VINTED_API_URL}/{Urls.VINTED_PRODUCTS_ENDPOINT}"
-        )
-
         try:
-            # Make the request to the Vinted API
-            response = requester.get(url=api_url, params=params)
+            # Vinted retired the anonymous catalogue JSON route in September
+            # 2026. Its public catalogue page now contains the same ordered
+            # listing-card data in the server-rendered Next.js response.
+            response = requester.get_catalogue_page(_catalogue_page_url(url, page))
             response.raise_for_status()
-
-            # Parse the response
-            items = response.json()
-            items = items["items"]
+            items = parse_catalogue_page(response.text, locale, nbr_items)
 
             # Return either Item objects or raw JSON data
             if not json:

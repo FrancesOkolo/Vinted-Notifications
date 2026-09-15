@@ -4,6 +4,7 @@ import html
 import json
 import query_observability
 import random
+import re
 import requests
 import threading
 import time
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from email.utils import parsedate_to_datetime
 from pyVintedVN import Vinted, requester
+from pyVintedVN.items.items import CataloguePageParseError
 from pyVintedVN.requester import (
     VintedRequestCancelled,
     wait_for_shared_request_idle,
@@ -783,6 +785,7 @@ def _finalize_scrape_cycle(
     query_count,
     blocked_status=None,
     count_failed_cycle=True,
+    count_failed_query=False,
 ):
     """Update health counters after a complete cycle or scheduled query run.
 
@@ -799,12 +802,16 @@ def _finalize_scrape_cycle(
         elif successful_fetches > 0:
             db.set_parameter("scraper_last_ok", str(now))
             db.set_parameter("scraper_failed_cycles", "0")
+            db.set_parameter("scraper_failed_queries", "0")
             _clear_scraper_cooldown()
         elif query_count > 0 and count_failed_cycle:
             # A full cycle that reached nothing usually means Vinted is
             # blocking every request (403/429), not an empty marketplace.
             failed = _parameter_int("scraper_failed_cycles")
             db.set_parameter("scraper_failed_cycles", str(failed + 1))
+        if successful_fetches == 0 and query_count > 0 and count_failed_query:
+            failed = _parameter_int("scraper_failed_queries") + 1
+            db.set_parameter("scraper_failed_queries", str(failed))
     except Exception:
         logger.warning("Could not update scrape-cycle health.", exc_info=True)
 
@@ -853,7 +860,12 @@ def get_scraper_health(now=None):
         "stalled": heartbeat_age is not None and heartbeat_age > stale_after,
         # Keep reporting a block after the timer expires until a successful
         # cycle proves that Vinted is accepting requests again.
-        "blocked": cooldown["level"] > 0 or failed_cycles >= 3,
+        "blocked": (
+            cooldown["level"] > 0
+            or failed_cycles >= 3
+            or _parameter_int("scraper_failed_queries") >= 3
+        ),
+        "failed_queries": _parameter_int("scraper_failed_queries"),
         "failed_cycles": failed_cycles,
         "last_ok_age": last_ok_age,
         "stale_after": stale_after,
@@ -1009,6 +1021,19 @@ def process_items(
                 nbr_items=items_per_query,
             )
             consecutive_403s = 0
+        except CataloguePageParseError:
+            if execution_id is not None:
+                query_observability.record_failure(
+                    execution_id,
+                    "catalogue_format_changed",
+                    duration_ms=(time.monotonic() - request_started_monotonic) * 1000,
+                )
+            pause_scraper(reason="Vinted catalogue format changed; review required")
+            logger.error(
+                "Catalogue parsing failed; scraping paused for review.", exc_info=True
+            )
+            cancelled_for_pause = True
+            break
         except requests.exceptions.HTTPError as error:
             response = error.response
             status_code = response.status_code if response is not None else None
@@ -1028,13 +1053,14 @@ def process_items(
                         exc_info=True,
                     )
 
-            if status_code == 401:
-                cooldown = _activate_scraper_cooldown(401)
-                cycle_block_status = 401
+            if status_code in (401, 404):
+                cooldown = _activate_scraper_cooldown(status_code)
+                cycle_block_status = status_code
                 logger.error(
                     "Scraper circuit breaker opened after a confirmed "
-                    "HTTP 401 response. Stopping requests and cooling "
+                    "HTTP %s response. Stopping requests and cooling "
                     "down for %s minutes.",
+                    status_code,
                     max(1, (cooldown["remaining"] + 59) // 60),
                 )
             elif status_code == 403:
@@ -1177,6 +1203,7 @@ def process_items(
                             ],
                             duration_ms=(time.monotonic() - request_started_monotonic)
                             * 1000,
+                            source=getattr(vinted.items, "result_source", "api"),
                         )
                         candidate_ids = {
                             str(item_id) for item_id in observation.candidate_ids
@@ -1270,6 +1297,7 @@ def process_items(
         query_count,
         blocked_status=cycle_block_status,
         count_failed_cycle=query_ids is None and not cancelled_for_pause,
+        count_failed_query=query_ids is not None and not cancelled_for_pause,
     )
 
 
@@ -1493,6 +1521,7 @@ def clear_item_queue(items_queue, new_items_queue):
                 query_id,
             )
             return
+        query_url = next((row[1] for row in db.get_queries() if row[0] == query_id), "")
         banwords_str = db.get_parameter("banwords")
         allowlist = db.get_allowlist()
         for item in reversed(data):
@@ -1531,7 +1560,9 @@ def clear_item_queue(items_queue, new_items_queue):
                 db.update_last_timestamp(query_id, item.raw_timestamp)
                 pass
             # Reject local title exclusions before any optional seller lookup.
-            elif banwords_str and contains_banwords(item.title, banwords_str):
+            elif not matches_query_relevance(query_url, item) or (
+                banwords_str and contains_banwords(item.title, banwords_str)
+            ):
                 if execution_id is not None and not _classify_pending_safely(
                     execution_id,
                     query_id,
@@ -1685,6 +1716,38 @@ def clear_item_queue(items_queue, new_items_queue):
                         subscriber_chat_ids,
                     )
                 )
+
+
+def matches_query_relevance(query_url, item):
+    """Apply targeted relevance checks to searches with known broad matches.
+
+    Use listing title/brand, not description or additional network requests.
+    Other searches retain Vinted's existing matching behaviour.
+    """
+    search = parse_qs(urlparse(query_url).query).get("search_text", [""])[0]
+    search = " ".join(search.casefold().split())
+    fields = [
+        str(getattr(item, field, None) or "") for field in ("title", "brand_title")
+    ]
+    brand_terms = {
+        "tom raffield": "raffield",
+        "original btc": "btc",
+        "drummonds": "drummonds",
+        "colefax & fowler": "colefax",
+        "colefax and fowler": "colefax",
+    }
+    if search in brand_terms:
+        token = brand_terms[search]
+        return any(
+            re.search(r"\b" + token + r"\b", value, re.IGNORECASE) for value in fields
+        )
+    if search == "cloche smoking":
+        title = fields[0].casefold()
+        return bool(
+            re.search(r"\b(?:cloche|dome)s?\b", title)
+            and re.search(r"\b(?:smok(?:e|er|ers|ing)|cocktails?)\b", title)
+        )
+    return True
 
 
 def contains_banwords(title, banwords_str):

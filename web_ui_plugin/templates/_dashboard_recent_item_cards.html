@@ -22,7 +22,7 @@
                       title="{{ item.timestamp }}">{{ item.timestamp }}</time><br>
                 Listed:
                 <time datetime="{{ item.listed_timestamp_iso }}"
-                      data-relative-time="{{ item.listed_timestamp_raw }}"
+                      {% if item.listed_timestamp_raw %}data-relative-time="{{ item.listed_timestamp_raw }}"{% endif %}
                       title="{{ item.listed_timestamp }}">{{ item.listed_timestamp }}</time>
             </p>
         </div>

@@ -364,6 +364,8 @@ def migrate_schema(cursor=None):
         progress_columns = {
             row[1] for row in cur.execute("PRAGMA table_info(query_progress)")
         }
+        if "result_source" not in progress_columns:
+            cur.execute("ALTER TABLE query_progress ADD COLUMN result_source TEXT")
         if "last_success_started_at" not in progress_columns:
             cur.execute(
                 "ALTER TABLE query_progress ADD COLUMN last_success_started_at REAL"
@@ -586,6 +588,7 @@ def record_success(
     *,
     finished_at=None,
     cursor=None,
+    source="api",
 ):
     """Record one newest-first successful result and durably queue candidates.
 
@@ -660,7 +663,7 @@ def record_success(
         progress = cur.execute(
             """
             SELECT anchor_item_key, successful_observations,
-                   last_success_started_at
+                   last_success_started_at, result_source
             FROM query_progress
             WHERE query_id=?
             """,
@@ -677,9 +680,13 @@ def record_success(
                 (query_id, fingerprint, finished),
             )
             anchor_key, success_count, previous_success_started = None, 0, None
+            previous_source = None
         else:
-            anchor_key, success_count, previous_success_started = progress
+            anchor_key, success_count, previous_success_started, previous_source = (
+                progress
+            )
         bootstrap = int(success_count) == 0
+        source_changed = source == "catalogue_page" and previous_source != source
 
         keys = [entry[0] for entry in normalised]
         observed_keys = {
@@ -748,7 +755,11 @@ def record_success(
                 and listed_at
                 >= previous_success_started - TIMESTAMP_RESOLUTION_SLOP_SECONDS
             )
-            if bootstrap:
+            if source_changed:
+                # Establish the new source's window without calling existing
+                # listings new. Preserve all historical observations and claims.
+                considered_new = False
+            elif bootstrap:
                 considered_new = bool(
                     key not in observed_keys
                     and listed_at is not None
@@ -769,7 +780,11 @@ def record_success(
                 # window.  The last successful request start is the safe lower
                 # bound: an old tail item entering the page is not a new deal.
                 considered_new = bool(
-                    key not in observed_keys and since_previous_success
+                    key not in observed_keys
+                    and (
+                        since_previous_success
+                        or (source == "catalogue_page" and listed_at is None)
+                    )
                 )
 
             globally_known = str(snapshot["item_id"]) in known_raw
@@ -873,7 +888,7 @@ def record_success(
             UPDATE query_progress
             SET query_fingerprint=?, anchor_item_key=?, anchor_seen_at=?,
                 successful_observations=successful_observations + 1,
-                last_success_started_at=?, last_execution_id=?, updated_at=?
+                last_success_started_at=?, last_execution_id=?, updated_at=?, result_source=?
             WHERE query_id=?
             """,
             (
@@ -883,6 +898,7 @@ def record_success(
                 request_started,
                 execution_id,
                 finished,
+                source,
                 query_id,
             ),
         )
@@ -906,7 +922,7 @@ def record_success(
                 already_known_count,
                 len(overlap_keys),
                 pending_count,
-                int(bootstrap),
+                int(bootstrap or source_changed),
                 int(anchor_position is not None),
                 int(requested_limit > 0 and len(raw_snapshots) >= requested_limit),
                 execution_id,

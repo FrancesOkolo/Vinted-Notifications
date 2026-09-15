@@ -41,7 +41,7 @@ def database(tmp_path, monkeypatch):
     yield database_path
 
 
-def test_403_rebuild_head_and_retry_share_one_process_wide_gate(
+def test_403_rebuild_catalogue_bootstrap_and_retry_share_one_process_wide_gate(
     database,
     monkeypatch,
 ):
@@ -67,8 +67,14 @@ def test_403_rebuild_head_and_retry_share_one_process_wide_gate(
             return False
 
     class Cookies:
+        def clear(self):
+            return None
+
         def clear_session_cookies(self):
             return None
+
+        def __iter__(self):
+            return iter([SimpleNamespace(name="access_token_web")])
 
     class Session:
         def __init__(self, name, get_status):
@@ -81,10 +87,6 @@ def test_403_rebuild_head_and_retry_share_one_process_wide_gate(
         def get(self, *args, **kwargs):
             events.append((f"{self.name}.get", clock[0]))
             return Response(self.get_status)
-
-        def head(self, *args, **kwargs):
-            events.append((f"{self.name}.head", clock[0]))
-            return Response(200)
 
         def close(self):
             self.closed = True
@@ -123,7 +125,7 @@ def test_403_rebuild_head_and_retry_share_one_process_wide_gate(
     assert rejected.closed is True
     assert events == [
         ("rejected.get", 0.0),
-        ("fresh.head", 60.0),
+        ("fresh.get", 60.0),
         ("fresh.get", 120.0),
     ]
     assert requester_module.FORBIDDEN_RETRY_DELAY_SECONDS in waits

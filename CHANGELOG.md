@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### Catalogue compatibility
+
+- Read listing cards from Vinted's public catalogue page after the legacy JSON
+  route returned authenticated HTTP 404. Keep saved filters and the local item
+  limit; the HTML response is larger than the previous JSON response.
+- Scope decoding to the catalogue result array and pause for review if its
+  structure changes, without advancing successful discovery progress.
+- Keep session identity stable and validate anonymous tokens after a paced
+  catalogue-page GET instead of a blind homepage HEAD refresh.
+- Establish a baseline on each query's first page-source observation, then use
+  durable unseen IDs when listing timestamps are absent. Historical observations
+  remain intact. Items in that first baseline do not generate alerts.
+- Show unavailable listing times honestly while retaining local discovery times.
+  An unseen item entering the result window is a discovery, not proof of its age.
+
+### Scraper failure handling
+
+- Return catalogue HTTP 404 immediately instead of repeatedly refreshing cookies;
+  use the existing escalating cooldown and recovery probes after a 404.
+- Track consecutive failed scheduled queries separately from full scrape cycles,
+  so an active process cannot conceal repeated fetch failures from the watchdog.
+- Clear the scheduled-failure counter on a successful fetch and at startup.
+
+### Web dashboard
+
+- Refresh the Items page results, count, and pagination automatically every
+  20 seconds while the tab is visible, without disturbing active filters,
+  sort order, pagination, Card/List view, or scroll position.
+- Refresh immediately when returning to the tab and avoid rebuilding unchanged
+  item cards so their images are not repeatedly reloaded.
+
+### Application lifecycle
+
+- Send the Telegram administrator an informational notice when the application
+  starts instead of leaving startup to be inferred from watchdog messages.
+- Confirm a stale scraper heartbeat for 90 seconds before raising a stall alert,
+  preventing Windows sleep/resume from being misreported as a scraper failure
+  while keeping genuine Vinted block and cooldown alerts immediate.
+
 ### Home-connection scraper safety
 
 - Raise the hard, cross-process completion-to-next-start gap for every Vinted

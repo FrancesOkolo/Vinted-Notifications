@@ -78,7 +78,7 @@
                         {% else %}
                         All Items
                         {% endif %}
-                        <span class="badge bg-secondary ms-2">{{ total_items }}</span>
+                        <span class="badge bg-secondary ms-2" id="itemsResultsCount">{{ total_items }}</span>
                     </h5>
                 </div>
                 <div class="btn-group items-view-toggle" role="group" aria-label="View toggle">
@@ -125,7 +125,7 @@
                                     <time data-relative-time="{{ item.timestamp_raw }}"
                                           title="{{ item.timestamp }}">{{ item.timestamp }}</time><br>
                                     <i class="bi bi-calendar me-1"></i>Listed:
-                                    <time data-relative-time="{{ item.listed_timestamp_raw }}"
+                                    <time {% if item.listed_timestamp_raw %}data-relative-time="{{ item.listed_timestamp_raw }}"{% endif %}
                                           title="{{ item.listed_timestamp }}">{{ item.listed_timestamp }}</time>
                                 </p>
                             </div>
@@ -187,7 +187,7 @@
                                       title="{{ item.timestamp }}">{{ item.timestamp }}</time>
                             </td>
                             <td>
-                                <time data-relative-time="{{ item.listed_timestamp_raw }}"
+                                <time {% if item.listed_timestamp_raw %}data-relative-time="{{ item.listed_timestamp_raw }}"{% endif %}
                                       title="{{ item.listed_timestamp }}">{{ item.listed_timestamp }}</time>
                             </td>
                             <td>
@@ -206,7 +206,8 @@
                     </table>
                 </div>
             </div>
-            <div class="card-footer d-flex justify-content-between align-items-center items-pagination">
+            <div class="card-footer d-flex justify-content-between align-items-center items-pagination"
+                 id="itemsPagination">
                 <div class="btn-group">
                     {% if first_url %}
                     <a href="{{ first_url }}" class="btn btn-sm btn-outline-secondary" title="First page"
@@ -289,19 +290,95 @@
             return relativeTimeFormatter.format(Math.round(seconds / 31536000), 'year');
         }
 
-        document.querySelectorAll('[data-relative-time]').forEach(el => {
-            el.textContent = relativeTimeFromTimestamp(el.dataset.relativeTime);
-        });
+        function updateRelativeTimes(root = document) {
+            root.querySelectorAll('[data-relative-time]').forEach(el => {
+                el.textContent = relativeTimeFromTimestamp(el.dataset.relativeTime);
+            });
+        }
 
         // Flag items found within the last 12 hours as "New".
         const NEW_WINDOW_MS = 12 * 60 * 60 * 1000;
-        document.querySelectorAll('[data-item-ts]').forEach(el => {
-            const ts = Number(el.dataset.itemTs) * 1000;
-            if (ts && (Date.now() - ts) < NEW_WINDOW_MS) {
+        function updateNewBadges(root = document) {
+            root.querySelectorAll('[data-item-ts]').forEach(el => {
+                const ts = Number(el.dataset.itemTs) * 1000;
+                const isNew = Boolean(ts) && (Date.now() - ts) < NEW_WINDOW_MS;
                 el.querySelectorAll('.item-new-badge').forEach(badge => {
-                    badge.hidden = false;
+                    badge.hidden = !isNew;
                 });
-            }
+            });
+        }
+
+        updateRelativeTimes();
+        updateNewBadges();
+        window.setInterval(updateRelativeTimes, 60000);
+
+        // Refresh the result fragments every 20 seconds without reloading the
+        // page, disturbing filter inputs, changing the selected view, or
+        // moving the user's scroll position. The current URL retains the
+        // active filters, sort order, and page number.
+        const listViewBody = listView.querySelector('tbody');
+        const itemsResultsCount = document.getElementById('itemsResultsCount');
+        const itemsPagination = document.getElementById('itemsPagination');
+        let itemsFeedLoading = false;
+
+        function resultSignature(root) {
+            return Array.from(root.querySelectorAll('a[href]'))
+                .map(link => link.getAttribute('href'))
+                .join('\\n');
+        }
+
+        function loadItemsFeed() {
+            if (itemsFeedLoading || document.hidden) return;
+            itemsFeedLoading = true;
+
+            fetch(window.location.href, {
+                headers: {'Accept': 'text/html'},
+                cache: 'no-store'
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Items refresh returned ' + response.status);
+                    }
+                    return response.text();
+                })
+                .then(html => {
+                    const freshDocument = new DOMParser().parseFromString(html, 'text/html');
+                    const freshCardView = freshDocument.getElementById('cardView');
+                    const freshListViewBody = freshDocument.querySelector('#listView tbody');
+                    const freshResultsCount = freshDocument.getElementById('itemsResultsCount');
+                    const freshPagination = freshDocument.getElementById('itemsPagination');
+
+                    if (!freshCardView || !freshListViewBody || !freshResultsCount ||
+                            !freshPagination || !listViewBody || !itemsResultsCount ||
+                            !itemsPagination) {
+                        throw new Error('Items refresh response was incomplete');
+                    }
+
+                    // Avoid rebuilding cards (and reloading their images) when
+                    // the visible result set has not changed.
+                    if (resultSignature(cardView) !== resultSignature(freshCardView)) {
+                        const scrollX = window.scrollX;
+                        const scrollY = window.scrollY;
+                        cardView.innerHTML = freshCardView.innerHTML;
+                        listViewBody.innerHTML = freshListViewBody.innerHTML;
+                        window.scrollTo(scrollX, scrollY);
+                    }
+                    itemsResultsCount.textContent = freshResultsCount.textContent;
+                    itemsPagination.innerHTML = freshPagination.innerHTML;
+                    updateRelativeTimes();
+                    updateNewBadges();
+                })
+                .catch(error => {
+                    console.error('Items refresh failed:', error);
+                })
+                .finally(() => {
+                    itemsFeedLoading = false;
+                });
+        }
+
+        window.setInterval(loadItemsFeed, 20000);
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) loadItemsFeed();
         });
     });
 </script>
